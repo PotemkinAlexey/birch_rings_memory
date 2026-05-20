@@ -13,7 +13,7 @@ class FactPassport:
     predicate: str
     object: str
 
-    fact_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    fact_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     vector: list[float] = field(default_factory=list)
 
     gravity_score: float = 0.5      # starts neutral, drifts with usage
