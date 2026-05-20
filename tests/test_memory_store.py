@@ -125,6 +125,28 @@ def test_query_dedupes_attribution_within_session():
     assert mem._session_fact_ids.count(f.fact_id) == 1, "fact must appear at most once per session"
 
 
+def test_sqlite_save_facts_batches_in_one_transaction(tmp_path):
+    """save_facts must round-trip via SQLite in a single transaction."""
+    from birch.storage.sqlite import SQLiteBackend
+
+    db_path = tmp_path / "batch.db"
+    mem = MemoryStore(db_path=str(db_path))
+    f1 = mem.add_fact("alpha", "is", "first")
+    f2 = mem.add_fact("beta",  "is", "second")
+    f3 = mem.add_fact("gamma", "is", "third")
+
+    f1.gravity_score = 0.81
+    f2.gravity_score = 0.42
+    f3.gravity_score = 0.13
+    mem._storage.save_facts([f1, f2, f3])
+
+    reopened = SQLiteBackend(str(db_path))
+    by_id = {f.fact_id: f for f in reopened.load_facts()}
+    assert by_id[f1.fact_id].gravity_score == 0.81
+    assert by_id[f2.fact_id].gravity_score == 0.42
+    assert by_id[f3.fact_id].gravity_score == 0.13
+
+
 def test_add_fact_dedupes_identical_triples():
     """Re-adding the same SPO triple should not create a duplicate fact."""
     mem = MemoryStore()

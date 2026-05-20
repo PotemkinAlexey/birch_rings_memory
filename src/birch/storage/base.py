@@ -18,6 +18,15 @@ class StorageBackend(Protocol):
 
     def save_fact(self, fact: FactPassport) -> None: ...
 
+    def save_facts(self, facts: list[FactPassport]) -> None:
+        """Persist many facts inside a single transaction.
+
+        Default implementation loops save_fact; backends are encouraged
+        to override with a real batch insert.
+        """
+        for f in facts:
+            self.save_fact(f)
+
     def delete_fact(self, fact_id: str) -> None: ...
 
     def load_facts(self) -> list[FactPassport]: ...

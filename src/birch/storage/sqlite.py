@@ -64,19 +64,34 @@ class SQLiteBackend:
 
     # ── Facts ────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _fact_row(fact: FactPassport) -> tuple:
+        return (
+            fact.fact_id, fact.subject, fact.predicate, fact.object,
+            json.dumps(fact.vector),
+            fact.gravity_score, fact.layer, fact.created_at, fact.ttl,
+            fact.source_session, fact.deprecated_by,
+            fact.access_count, fact.last_accessed,
+            fact.resonance_sum, fact.resonance_count,
+        )
+
     def save_fact(self, fact: FactPassport) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                fact.fact_id, fact.subject, fact.predicate, fact.object,
-                json.dumps(fact.vector),
-                fact.gravity_score, fact.layer, fact.created_at, fact.ttl,
-                fact.source_session, fact.deprecated_by,
-                fact.access_count, fact.last_accessed,
-                fact.resonance_sum, fact.resonance_count,
-            ),
+            self._fact_row(fact),
         )
         self._conn.commit()
+
+    def save_facts(self, facts: list[FactPassport]) -> None:
+        """One transaction, one commit — orders of magnitude faster on bulk dumps."""
+        if not facts:
+            return
+        rows = [self._fact_row(f) for f in facts]
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
 
     def delete_fact(self, fact_id: str) -> None:
         self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))

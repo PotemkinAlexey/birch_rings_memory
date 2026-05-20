@@ -226,10 +226,9 @@ class MemoryStore:
         migrations = self._engine.tick()
         absorbed = self._absorb_dead()
 
-        # Persist updated gravity scores for all live facts
+        # Persist updated gravity scores for all live facts in one transaction.
         if self._storage:
-            for fact in self._facts.values():
-                self._storage.save_fact(fact)
+            self._storage.save_facts(list(self._facts.values()))
 
         summary = {
             "session_id": self._session_id,
@@ -363,9 +362,10 @@ class MemoryStore:
             penalized_fact_ids = list(result.fact_ids)
 
             if self._storage:
-                for fid in penalized_fact_ids:
-                    if fid in self._facts:
-                        self._storage.save_fact(self._facts[fid])
+                affected = [
+                    self._facts[fid] for fid in penalized_fact_ids if fid in self._facts
+                ]
+                self._storage.save_facts(affected)
                 # Persist the mutated echo session (r_score + echo_penalty).
                 past = self._echo.get(result.matched_session_id)
                 if past:
