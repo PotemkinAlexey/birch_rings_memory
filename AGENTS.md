@@ -1,253 +1,186 @@
-# AGENTS.md — Connecting BirchKM to AI Agents
+# BirchKM — Agent Contract
 
-BirchKM exposes itself as an MCP (Model Context Protocol) server. Any agent
-that supports MCP — Claude Desktop, Claude Code, or a custom agent built on
-the Anthropic SDK — can use it as a persistent, kinetic memory backend.
+## Principles
 
----
+**Not permitted** — do not store PII, credentials, secrets, or anything the user
+has not explicitly asked to remember.
 
-## How it works
+**Not certain** — do not present a retrieved fact as ground truth without citing
+its `gravity_score`. Low gravity means the system itself doubts it.
 
-The agent calls three tools during its lifecycle:
+**Storing** — use triples that capture a relationship, not prose. One fact per
+`record_fact` call.
 
-```
-query_memory(text)          ← before answering: retrieve relevant facts
-record_fact(s, p, o)        ← during session: store something worth remembering
-record_session(messages)    ← after session: score it, update gravity
-```
+**Changing** — if a fact is superseded, `record_fact` the new version and note
+the replacement. The old fact's gravity will naturally decay; do not delete
+manually.
 
-BirchKM does the rest automatically — resonance scoring, gravity migration,
-echo detection, Hawking emission. The agent doesn't need to manage any of that.
-
----
-
-## Setup
-
-### 1. Install
-
-```bash
-git clone https://github.com/PotemkinAlexey/birch_rings_memory.git
-cd birch_rings_memory
-python -m pip install -e .
-```
-
-Ollama must be running with `nomic-embed-text`:
-
-```bash
-ollama pull nomic-embed-text
-```
-
-### 2. Configure Claude Desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
-(macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
-
-```json
-{
-  "mcpServers": {
-    "birch-km": {
-      "command": "/absolute/path/to/venv/bin/python",
-      "args": ["-m", "birch.server"],
-      "env": {
-        "BIRCH_DB": "/Users/you/.birch/memory.db"
-      }
-    }
-  }
-}
-```
-
-Replace `/absolute/path/to/venv/bin/python` with the Python interpreter from
-your virtual environment (e.g. `/Users/alexpotemkin/birch_rings_memory/bin/python`).
-
-Restart Claude Desktop. You should see `birch-km` listed in the MCP servers panel.
-
-### 3. Configure Claude Code
-
-Add to `~/.claude/mcp_servers.json`:
-
-```json
-{
-  "birch-km": {
-    "command": "/absolute/path/to/venv/bin/python",
-    "args": ["-m", "birch.server"],
-    "env": {
-      "BIRCH_DB": "/Users/you/.birch/memory.db"
-    }
-  }
-}
-```
+**Deleting** — only on explicit user order. The black hole handles decay; you
+handle intent.
 
 ---
 
-## Available tools
+## Session lifecycle
 
-### `query_memory(text, top_k=5)`
+Call `query_memory` before composing your first response. No exceptions.
+If it fails, tell the user and stop — do not respond from training data alone.
 
-Search memory for facts relevant to the given text. Call this before
-composing an answer to retrieve context from past sessions.
+Call `record_session` at the end of every session that produced an answer or
+attempted to solve a problem. If nothing worth persisting happened, tell the
+user: **"No durable memory was created this session."**
 
-**Returns** — list of facts, each with:
+Do not save everything for session end. If a fact is confirmed mid-session,
+call `record_fact` immediately.
 
-| Field | Type | Description |
+---
+
+## Reading memory
+
+### query_memory
+
+Call with the user's first message or the core question of the session.
+Do not paraphrase — pass the user's text as close to verbatim as possible;
+the embedding does the semantic work.
+
+Interpret the response by `source`:
+
+| source | meaning | action |
 |---|---|---|
-| `fact_id` | str | Unique identifier |
-| `subject` | str | Subject of the triple |
-| `predicate` | str | Relationship |
-| `object` | str | Object of the triple |
-| `similarity` | float | Cosine similarity to the query |
-| `layer` | int | 0=surface, 1=kinetic, 2=core |
-| `gravity_score` | float | Current gravity (0–1) |
-| `source` | str | `"surface"`, `"kinetic"`, `"core"`, or `"hawking"` |
+| `surface` | hot fact, used often, high gravity | trust, cite directly |
+| `kinetic` | working memory, moderate use | use, but check relevance |
+| `core` | cold archive, rarely used | verify before relying on it |
+| `hawking` | returned from black hole | treat with suspicion; it sank for a reason |
 
-**Example:**
-```
-query_memory("how does the mailer service connect to the database")
-→ [
-    {subject: "mailer service", predicate: "runs on", object: "Go", similarity: 0.91, layer: 0},
-    {subject: "database", predicate: "uses", object: "PostgreSQL", similarity: 0.87, layer: 1}
-  ]
-```
+Interpret the response by `gravity_score`:
+
+- `> 0.70` — system considers it reliable
+- `0.30–0.70` — neutral; weight it accordingly
+- `< 0.30` — weak signal; corroborate or discard
+
+`similarity < 0.60` — do not use the fact in your answer; it is noise.
+
+Do not summarize retrieved facts without stating the source layer and gravity.
 
 ---
 
-### `record_fact(subject, predicate, object)`
+## Writing facts
 
-Store a new fact as a subject–predicate–object triple. The fact is immediately
-embedded and registered in the gravity engine.
+### record_fact
 
-Use triples that capture relationships, not prose:
+Use subject–predicate–object triples that are:
 
-| Good | Avoid |
-|---|---|
-| `("mailer", "runs on", "Go")` | `("mailer runs on Go", "is", "true")` |
-| `("user", "prefers", "dark mode")` | `("the user said they like dark mode")` |
-| `("auth service", "uses", "JWT")` | `("JWT auth")` |
+- **Atomic** — one fact per call, independently meaningful
+- **Relational** — captures a connection, not a description
+- **Durable** — still true next session, not session-specific observations
 
-**Returns:**
-```json
-{"fact_id": "a3f7c1b2", "layer": 1, "gravity_score": 0.5}
+Good triples:
+
 ```
+("auth service",    "uses",         "JWT")
+("user",            "prefers",      "dark mode")
+("mailer",          "connects to",  "PostgreSQL on port 5432")
+("deploy pipeline", "fails when",   "migrations run before health check")
+```
+
+Bad triples:
+
+```
+("user asked", "about", "authentication")    ← session artifact, not a fact
+("JWT is",     "good",  "for stateless auth") ← opinion, not a relationship
+("service",    "info",  "mailer runs on Go")  ← predicate is not a relationship
+```
+
+Search before writing. If `query_memory` returns a fact with `similarity > 0.85`
+covering the same ground — do not duplicate. Facts compete by gravity; duplicates
+dilute the signal.
 
 ---
 
-### `record_session(messages, agent_id="default")`
+## Session scoring
 
-Score a completed session and update memory gravity. Pass all user messages
-in order. The system will:
+### record_session
 
-- Compute R score (resonant / neutral / toxic) from behavioral + semantic + repetition signals
-- Propagate R to all facts touched during the session
-- Detect echo if this session returns to an unresolved past problem
-- Trigger gravity migration and absorb dead facts into the black hole
+Pass **all user messages** from the session in order. Do not include your own
+responses — the resonance engine scores user-side signals only.
 
-**Returns:**
-```json
-{
-  "session_id": "default-1716200000-a3f7",
-  "label": "resonant",
-  "r_score": 0.71,
-  "migrations": 2,
-  "absorbed": 0,
-  "stats": {"surface": 1, "kinetic": 3, "core": 0, "black_hole_mass": 0}
-}
-```
+Call once per session, at the end. Multiple calls for the same session corrupt
+the gravity signal.
 
-Call this **at the end of every session**, not after every message.
+Interpret the response:
 
----
-
-### `memory_stats()`
-
-Return current memory state — layer distribution and black hole status.
-
-```json
-{
-  "surface": 2,
-  "kinetic": 5,
-  "core": 1,
-  "black_hole_mass": 3,
-  "hawking_emissions": 1,
-  "total_live": 8
-}
-```
-
-Useful for monitoring and debugging.
-
----
-
-## Recommended agent workflow
-
-```
-┌─ Session starts ─────────────────────────────────────────┐
-│  1. query_memory(user's first message)                   │
-│     → inject top facts into system prompt as context     │
-├─ During session ─────────────────────────────────────────┤
-│  2. record_fact(...) for each new piece of information   │
-│     worth remembering across sessions                    │
-├─ Session ends ───────────────────────────────────────────┤
-│  3. record_session(all_user_messages)                    │
-│     → BirchKM scores and updates gravity automatically   │
-└──────────────────────────────────────────────────────────┘
-```
-
----
-
-## Custom backend
-
-BirchKM's persistence layer is pluggable. `MemoryStore` accepts any object
-that satisfies the `StorageBackend` protocol — no inheritance required:
-
-```python
-from birch.storage import StorageBackend   # Protocol for type-checking
-from birch.memory_store import MemoryStore
-
-class MyRedisBackend:
-    def save_fact(self, fact): ...
-    def delete_fact(self, fact_id): ...
-    def load_facts(self): ...
-    def save_edge(self, from_id, to_id): ...
-    def load_edges(self): ...
-    def save_echo_session(self, session_id, centroids, r_score, recorded_at): ...
-    def load_echo_sessions(self): ...
-    def close(self): ...
-
-mem = MemoryStore(storage=MyRedisBackend(...))
-```
-
-Then use `mem` directly in your agent code, or point the MCP server at it
-by replacing `_store` in `server.py`.
-
----
-
-## Environment variables
-
-| Variable | Default | Description |
+| label | meaning | implication |
 |---|---|---|
-| `BIRCH_DB` | `~/.birch/memory.db` | Path to the SQLite database file |
+| `resonant` | session produced value | facts used will gain gravity |
+| `neutral` | unclear outcome | no gravity change |
+| `toxic` | session was circular or stuck | facts used will lose gravity; check for echo |
+
+If `label` is `toxic` — consider calling `query_memory` on the opening message
+of the next session with the same topic before responding. A recurring toxic
+pattern means the memory itself may be misleading you.
 
 ---
 
-## Multi-agent memory (experimental)
+## Echo signal
 
-Multiple agents can share one `MemoryStore` by pointing to the same database:
+The system detects when a user returns to an unresolved problem. When
+`record_session` returns a `toxic` label on a topic you have seen before,
+treat it as an echo:
 
-```json
-{
-  "mcpServers": {
-    "birch-km": {
-      "command": "...",
-      "env": { "BIRCH_DB": "/shared/team.db" }
-    }
-  }
-}
-```
+- Do not repeat the same answer
+- Retrieve memory with `query_memory` and inspect `gravity_score`; low-gravity
+  facts near the topic are candidates for what misled the previous session
+- Acknowledge to the user that this problem has come up before and was not
+  resolved
 
-Facts that help one agent float up for all agents. Echo detection works
-cross-agent — if agent A failed to resolve a problem, agent B will see the
-warning when the same topic resurfaces.
+---
 
-`SQLiteBackend` uses `check_same_thread=False` and commit-per-write, so it
-is safe for multiple processes reading and writing to the same file, though
-write throughput under heavy concurrent load will be limited by SQLite's
-write lock. For high-concurrency scenarios, implement a `PostgresBackend` or
-`RedisBackend` using the `StorageBackend` protocol.
+## Hawking emission
+
+A fact returned with `source: "hawking"` was previously absorbed by the
+black hole — its gravity fell below the absorption floor. It returned only
+because your query matched it at `similarity ≥ 0.95`.
+
+Do not use a Hawking fact as primary evidence. Use it as a lead:
+- Present it to the user as a recovered memory
+- Ask whether it is still relevant
+- If confirmed, `record_fact` it again so it re-enters the live layers with
+  fresh gravity
+
+---
+
+## What not to store
+
+- Session-specific observations ("user seemed frustrated") — these are not
+  facts, they are session artifacts
+- Ephemeral values — URLs, tokens, timestamps, version numbers that will
+  change
+- Anything the user has not explicitly asked to remember
+- Redundant facts — if `query_memory` already has it at high similarity and
+  gravity, don't duplicate
+
+---
+
+## memory_stats
+
+Call at session start if you suspect memory is growing stale or the user
+asks about memory health.
+
+Interpret:
+
+- `black_hole_mass` rising steadily — facts are failing; review what is
+  being stored and whether sessions are being scored correctly
+- `surface` count dropping — active knowledge is declining; the system may
+  need fresh input
+- `hawking_emissions` non-zero — dead facts are being retrieved; the store
+  may contain outdated information that keeps resurfacing
+
+---
+
+## Failure modes
+
+| symptom | likely cause | action |
+|---|---|---|
+| All results have low similarity | query too vague, or memory is sparse | broaden query; prompt user for specifics |
+| All results from `core` or `hawking` | facts not being touched across sessions | check that `record_session` is being called |
+| `toxic` label on every session | same circular pattern repeating | inspect low-gravity facts near the topic; one may be wrong |
+| `gravity_score` never rises | `record_session` not called, or called with wrong messages | verify session scoring workflow |
