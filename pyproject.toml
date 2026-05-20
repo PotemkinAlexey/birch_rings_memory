@@ -9,7 +9,7 @@ description = "Kinetic AI memory system inspired by Paul Birch megastructure phy
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
-dependencies = ["mcp[cli]"]
+dependencies = ["mcp[cli]", "numpy>=1.21"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]

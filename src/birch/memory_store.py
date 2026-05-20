@@ -1,7 +1,6 @@
 """MemoryStore — unified entry point for the BirchKM memory system."""
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,23 +11,15 @@ from .gravity import GravityEngine
 from .black_hole import BlackHole
 from .resonance.detector import compute_resonance
 from .resonance.echo import EchoStore
-from .resonance.embeddings import embed, embed_batch
-from .resonance.cluster import bundle as _bundle, ClusterBundle
+from .resonance.embeddings import embed
+from .resonance.cluster import ClusterBundle
 from .resonance.echo import StoredSession
 from .storage import StorageBackend, SQLiteBackend
+from .vector_index import VectorIndex
 
 
 # Gravity floor — facts below this after tick fall into the black hole
 _ABSORPTION_THRESHOLD = 0.10
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
 
 
 @dataclass
@@ -61,6 +52,8 @@ class MemoryStore:
         self._facts: dict[str, FactPassport] = {}
         # Normalised SPO → fact_id, for cheap duplicate detection in add_fact.
         self._spo_index: dict[tuple[str, str, str], str] = {}
+        # Numpy-backed cosine index, kept in sync with live facts.
+        self._index = VectorIndex()
         if storage is not None:
             self._storage: Optional[StorageBackend] = storage
         elif db_path is not None:
@@ -91,6 +84,7 @@ class MemoryStore:
         for fact in self._storage.load_facts():
             self._facts[fact.fact_id] = fact
             self._engine.register(fact)
+            self._index.add(fact.fact_id, fact.vector)
             if not fact.is_deprecated:
                 key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
                 self._spo_index.setdefault(key, fact.fact_id)
@@ -146,6 +140,7 @@ class MemoryStore:
         fact.vector = embed(f"{subject} {predicate} {obj}")
         self._facts[fact.fact_id] = fact
         self._engine.register(fact)
+        self._index.add(fact.fact_id, fact.vector)
         self._spo_index[key] = fact.fact_id
         if self._storage:
             self._storage.save_fact(fact)
@@ -258,11 +253,13 @@ class MemoryStore:
             if fact.is_deprecated or fact.is_expired:
                 self._hole.absorb(fact)
                 del self._facts[fid]
+                self._index.remove(fid)
                 self._drop_from_spo_index(fact)
                 absorbed.append(fid)
             elif fact.gravity_score < _ABSORPTION_THRESHOLD:
                 self._hole.absorb(fact)
                 del self._facts[fid]
+                self._index.remove(fid)
                 self._drop_from_spo_index(fact)
                 if self._storage:
                     self._storage.delete_fact(fid)
@@ -298,14 +295,16 @@ class MemoryStore:
         vec = embed(text)
         results: list[QueryResult] = []
 
-        # Search live facts
+        # Search live facts via the numpy-backed index. Single matmul over
+        # the whole live store; layer filter applied afterwards.
         layer_labels = {0: "surface", 1: "kinetic", 2: "core"}
-        for fact in self._facts.values():
-            if not fact.vector:
+        sims = self._index.all_similarities(vec)
+        for fid, sim in sims.items():
+            fact = self._facts.get(fid)
+            if fact is None:
                 continue
             if not (min_layer <= fact.layer <= max_layer):
                 continue
-            sim = _cosine(vec, fact.vector)
             results.append(QueryResult(
                 fact=fact,
                 similarity=round(sim, 4),
@@ -318,14 +317,15 @@ class MemoryStore:
         if hawking:
             emitted = self._hole.hawking_emit(vec)
             for fact in emitted:
-                sim = _cosine(vec, fact.vector)
                 self._facts[fact.fact_id] = fact
                 self._engine.register(fact)
+                self._index.add(fact.fact_id, fact.vector)
                 if not fact.is_deprecated:
                     key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
                     self._spo_index.setdefault(key, fact.fact_id)
                 if self._storage:
                     self._storage.save_fact(fact)
+                sim = VectorIndex.similarity(vec, fact.vector)
                 results.append(QueryResult(
                     fact=fact,
                     similarity=round(sim, 4),
