@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from .fact import FactPassport
@@ -12,7 +13,9 @@ from .black_hole import BlackHole
 from .resonance.detector import compute_resonance
 from .resonance.echo import EchoStore
 from .resonance.embeddings import embed, embed_batch
-from .resonance.cluster import bundle as _bundle
+from .resonance.cluster import bundle as _bundle, ClusterBundle
+from .resonance.echo import StoredSession
+from .storage import Storage
 
 
 # Gravity floor — facts below this after tick fall into the black hole
@@ -46,17 +49,38 @@ class MemoryStore:
      -1 — black hole (gravity < 0.10 after tick, absorbed)
     """
 
-    def __init__(self, echo_k: int = 2) -> None:
+    def __init__(self, echo_k: int = 2, db_path: Optional[str | Path] = None) -> None:
         self._engine = GravityEngine()
         self._hole = BlackHole()
         self._echo = EchoStore(default_k=echo_k)
         self._facts: dict[str, FactPassport] = {}
+        self._storage: Optional[Storage] = Storage(db_path) if db_path else None
 
         # Active session tracking
         self._session_messages: list[str] = []
         self._session_vectors: list[list[float]] = []
         self._session_fact_ids: list[str] = []
         self._session_id: Optional[str] = None
+
+        if self._storage:
+            self._load_from_storage()
+
+    # ── Storage bootstrap ────────────────────────────────────────────────────
+
+    def _load_from_storage(self) -> None:
+        for fact in self._storage.load_facts():
+            self._facts[fact.fact_id] = fact
+            self._engine.register(fact)
+        for from_id, to_id in self._storage.load_edges():
+            self._engine.link(from_id, to_id)
+        for row in self._storage.load_echo_sessions():
+            centroids = row["centroids"]
+            cb = ClusterBundle(centroids=centroids, k=len(centroids), inertia=0.0)
+            self._echo._sessions[row["session_id"]] = StoredSession(
+                session_id=row["session_id"],
+                bundle=cb,
+                r_score=row["r_score"],
+            )
 
     # ── Fact management ─────────────────────────────────────────────────────
 
@@ -78,16 +102,22 @@ class MemoryStore:
         fact.vector = embed(f"{subject} {predicate} {obj}")
         self._facts[fact.fact_id] = fact
         self._engine.register(fact)
+        if self._storage:
+            self._storage.save_fact(fact)
         if self._session_id:
             self._session_fact_ids.append(fact.fact_id)
         return fact
 
     def link(self, from_id: str, to_id: str) -> None:
         self._engine.link(from_id, to_id)
+        if self._storage:
+            self._storage.save_edge(from_id, to_id)
 
     def deprecate(self, old_id: str, new_id: str) -> None:
         if old_id in self._facts:
             self._facts[old_id].deprecated_by = new_id
+            if self._storage:
+                self._storage.save_fact(self._facts[old_id])
 
     # ── Session lifecycle ────────────────────────────────────────────────────
 
@@ -129,10 +159,24 @@ class MemoryStore:
         # Register session in echo store
         if self._session_id and vecs:
             self._echo.record(self._session_id, vecs, result.r)
+            if self._storage:
+                session_obj = self._echo.get(self._session_id)
+                if session_obj:
+                    self._storage.save_echo_session(
+                        self._session_id,
+                        session_obj.bundle.centroids,
+                        session_obj.r_score,
+                        time.time(),
+                    )
 
         # Tick gravity and absorb dead facts
         migrations = self._engine.tick()
         absorbed = self._absorb_dead()
+
+        # Persist updated gravity scores for all live facts
+        if self._storage:
+            for fact in self._facts.values():
+                self._storage.save_fact(fact)
 
         summary = {
             "session_id": self._session_id,
@@ -160,6 +204,8 @@ class MemoryStore:
             elif fact.gravity_score < _ABSORPTION_THRESHOLD:
                 self._hole.absorb(fact)
                 del self._facts[fid]
+                if self._storage:
+                    self._storage.delete_fact(fid)
                 absorbed.append(fid)
         return absorbed
 
