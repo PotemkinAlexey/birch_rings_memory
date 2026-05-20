@@ -47,4 +47,17 @@ class StorageBackend(Protocol):
 
     def load_echo_sessions(self) -> list[dict]: ...
 
+    def save_open_session(
+        self,
+        session_id: str,
+        messages: list[str],
+        vectors: list[list[float]],
+        facts: dict[str, float],
+        started_at: float,
+    ) -> None: ...
+
+    def delete_open_session(self, session_id: str) -> None: ...
+
+    def load_open_sessions(self) -> list[dict]: ...
+
     def close(self) -> None: ...

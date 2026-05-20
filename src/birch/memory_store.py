@@ -183,6 +183,19 @@ class MemoryStore:
                 fact_weights=dict(row.get("fact_weights", {})),
                 echo_penalty=row.get("echo_penalty", 0.0),
             )
+        _SESSION_TTL = 86_400  # 24 h — discard crashed/orphaned sessions
+        if hasattr(self._storage, "load_open_sessions"):
+            now = time.time()
+            for row in self._storage.load_open_sessions():
+                if now - row["started_at"] > _SESSION_TTL:
+                    self._storage.delete_open_session(row["session_id"])
+                    continue
+                ctx = SessionContext(session_id=row["session_id"])
+                ctx.messages = row["messages"]
+                ctx.vectors = row["vectors"]
+                ctx.facts = {k: float(v) for k, v in row["facts"].items()}
+                self._sessions[row["session_id"]] = ctx
+                self._current_session_id = row["session_id"]
 
     # ── Fact management ─────────────────────────────────────────────────────
 
@@ -285,8 +298,13 @@ class MemoryStore:
     def session_start(self, session_id: str) -> None:
         """Open a session context. Safe to call concurrently."""
         with self._lock:
-            self._sessions[session_id] = SessionContext(session_id=session_id)
+            ctx = SessionContext(session_id=session_id)
+            self._sessions[session_id] = ctx
             self._current_session_id = session_id
+            if self._storage and hasattr(self._storage, "save_open_session"):
+                self._storage.save_open_session(
+                    session_id, ctx.messages, ctx.vectors, ctx.facts, time.time()
+                )
 
     def session_message(self, text: str, session_id: Optional[str] = None) -> None:
         """Record a user message in the named session (or the current one)."""
@@ -299,6 +317,10 @@ class MemoryStore:
             ctx = self._sessions[sid]
             ctx.messages.append(text)
             ctx.vectors.append(vec)
+            if self._storage and hasattr(self._storage, "save_open_session"):
+                self._storage.save_open_session(
+                    sid, ctx.messages, ctx.vectors, ctx.facts, time.time()
+                )
 
     def session_close(self, session_id: Optional[str] = None) -> dict:
         """
@@ -380,6 +402,8 @@ class MemoryStore:
             self._current_session_id = (
                 next(reversed(self._sessions)) if self._sessions else None
             )
+        if self._storage and hasattr(self._storage, "delete_open_session"):
+            self._storage.delete_open_session(sid)
 
     def _absorb_dead(self) -> list[str]:
         """Send facts with gravity below threshold into the black hole."""

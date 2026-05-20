@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS echo_sessions (
     fact_ids     TEXT,
     echo_penalty REAL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS open_sessions (
+    session_id  TEXT PRIMARY KEY,
+    messages    TEXT,
+    vectors     TEXT,
+    facts       TEXT,
+    started_at  REAL
+);
 """
 
 
@@ -181,6 +189,47 @@ class SQLiteBackend:
                 "echo_penalty": r["echo_penalty"] if "echo_penalty" in r.keys() else 0.0,
             })
         return out
+
+    # ── Open sessions ────────────────────────────────────────────────────────
+
+    def save_open_session(
+        self,
+        session_id: str,
+        messages: list[str],
+        vectors: list[list[float]],
+        facts: dict[str, float],
+        started_at: float,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO open_sessions VALUES (?,?,?,?,?)",
+            (
+                session_id,
+                json.dumps(messages),
+                json.dumps(vectors),
+                json.dumps(facts),
+                started_at,
+            ),
+        )
+        self._conn.commit()
+
+    def delete_open_session(self, session_id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM open_sessions WHERE session_id = ?", (session_id,)
+        )
+        self._conn.commit()
+
+    def load_open_sessions(self) -> list[dict]:
+        rows = self._conn.execute("SELECT * FROM open_sessions").fetchall()
+        return [
+            {
+                "session_id": r["session_id"],
+                "messages": json.loads(r["messages"]),
+                "vectors": json.loads(r["vectors"]),
+                "facts": json.loads(r["facts"]),
+                "started_at": r["started_at"],
+            }
+            for r in rows
+        ]
 
     def close(self) -> None:
         self._conn.close()
