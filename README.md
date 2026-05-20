@@ -311,6 +311,11 @@ Add to `~/.claude/claude_desktop_config.json`:
 
 Claude then has four tools: `query_memory`, `record_fact`, `record_session`, `memory_stats`.
 
+`query_memory` returns polymorphic hits. Every item has `kind`, `body_id`, `similarity`,
+`source`, `layer`, `gravity_score`. Fact hits (`kind: "fact"`) include `subject`,
+`predicate`, `object`. MetaFact hits (`kind: "meta"`, `source: "hawking_meta"`) include
+`weight`, `source_texts`, `source_fact_ids`, and `summary`. See [AGENTS.md](AGENTS.md).
+
 ---
 
 ## What makes this different from GraphRAG / Mem0

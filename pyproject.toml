@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "birch-km"
-version = "0.1.0"
+version = "0.2.0"
 description = "Kinetic AI memory system inspired by Paul Birch megastructure physics"
 readme = "README.md"
 license = { text = "Apache-2.0" }

@@ -28,32 +28,22 @@ def query_memory(
     """
     Search memory for facts relevant to the given text.
 
-    Returns up to top_k facts ranked by semantic similarity.
-    Each result has: subject, predicate, object, similarity, layer, gravity_score, source.
+    Returns up to top_k hits ranked by semantic similarity. Every item includes
+    kind, body_id, similarity, source, layer, gravity_score.
 
-    Pass session_id to attribute retrieved facts to an open session so their
+    kind == "fact" — also subject, predicate, object, fact_id (same as body_id).
+    kind == "meta" — also meta_id, weight, source_texts, source_fact_ids, summary.
+
+    Pass session_id to attribute retrieved bodies to an open session so their
     gravity is updated when the session closes. Omit for read-only lookups.
 
     source values:
-      "surface"  — hot fact, high gravity, trust directly
-      "kinetic"  — working memory, moderate use
-      "core"     — cold archive, verify before relying on it
-      "hawking"  — returned from black hole, treat with suspicion
+      "surface" / "kinetic" / "core" — live FactPassport layers
+      "hawking"      — single fact recovered from the black hole
+      "hawking_meta" — MetaFact bundle recovered from the black hole
     """
     results = _store.query(text, top_k=top_k, hawking=True, session_id=session_id)
-    return [
-        {
-            "fact_id": r.fact.fact_id,
-            "subject": r.fact.subject,
-            "predicate": r.fact.predicate,
-            "object": r.fact.object,
-            "similarity": r.similarity,
-            "layer": r.fact.layer,
-            "gravity_score": round(r.fact.gravity_score, 3),
-            "source": r.source,
-        }
-        for r in results
-    ]
+    return [r.to_mcp_dict() for r in results]
 
 
 @mcp.tool()

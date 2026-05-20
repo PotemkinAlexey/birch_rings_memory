@@ -57,6 +57,39 @@ class QueryResult:
             return self.fact.fact_id
         return ""
 
+    def to_mcp_dict(self) -> dict:
+        """JSON-serializable payload for MCP ``query_memory`` consumers."""
+        base: dict = {
+            "kind": self.kind,
+            "body_id": self.body_id,
+            "similarity": round(self.similarity, 4),
+            "source": self.source,
+        }
+        if self.meta is not None:
+            m = self.meta
+            base.update({
+                "meta_id": m.meta_id,
+                "weight": m.weight,
+                "source_texts": list(m.source_texts),
+                "source_fact_ids": list(m.source_fact_ids),
+                "summary": m.summary or "",
+                "layer": m.layer,
+                "gravity_score": round(m.gravity_score, 3),
+            })
+            return base
+        if self.fact is not None:
+            f = self.fact
+            base.update({
+                "fact_id": f.fact_id,
+                "subject": f.subject,
+                "predicate": f.predicate,
+                "object": f.object,
+                "layer": f.layer,
+                "gravity_score": round(f.gravity_score, 3),
+            })
+            return base
+        return base
+
 
 @dataclass
 class SessionContext:
