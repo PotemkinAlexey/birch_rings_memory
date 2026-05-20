@@ -59,6 +59,104 @@ def test_hawking_emission():
     assert results[0].similarity > 0.95
 
 
+def test_hawking_removes_fact_from_singularity_and_persists():
+    """Fix #3: emitted facts must exit the singularity and reappear as live."""
+    mem = MemoryStore()
+    f_dead = mem.add_fact("expired token", "expired at", "2024-01-01")
+    f_dead.gravity_score = 0.05
+    mem._absorb_dead()
+    assert mem.stats["black_hole_mass"] == 1
+    assert f_dead.fact_id not in mem._facts
+
+    first = mem.query("expired token expired at 2024-01-01", top_k=1, hawking=True)
+    assert first[0].source == "hawking"
+    assert mem.stats["black_hole_mass"] == 0, "singularity should release the emitted fact"
+    assert f_dead.fact_id in mem._facts, "emitted fact must be re-registered in live store"
+
+    second = mem.query("expired token expired at 2024-01-01", top_k=1, hawking=True)
+    assert second, "live fact should still be queryable on the second call"
+    assert second[0].source != "hawking", "live fact should not be double-emitted"
+    assert mem._hole.total_emissions == 1
+
+
+def test_query_attributes_facts_to_active_session():
+    """Fix #1: facts returned by query() must inherit the session's resonance."""
+    mem = MemoryStore()
+    f = mem.add_fact("mailer service", "runs on", "Go")
+    assert f.resonance_count == 0
+    initial_access = f.access_count
+
+    mem.session_start("s_attr")
+    mem.session_message("how does the mailer service work")
+    results = mem.query("mailer service Go", top_k=3)
+    assert results, "query should return at least one fact"
+    assert f.fact_id in mem._session_fact_ids, "queried fact must be attributed to the session"
+    assert f.access_count > initial_access, "query() must touch the returned fact"
+
+    mem.session_message("works, thanks!")
+    summary = mem.session_close()
+    assert summary["label"] == "resonant"
+    assert f.resonance_count == 1, "session R must propagate to the queried fact"
+    assert f.resonance_sum > 0
+
+
+def test_query_without_active_session_does_not_tag():
+    """Touching is fine outside a session, but attribution must stay scoped."""
+    mem = MemoryStore()
+    f = mem.add_fact("mailer service", "runs on", "Go")
+    initial_access = f.access_count
+
+    results = mem.query("mailer service Go", top_k=1)
+    assert results
+    assert mem._session_fact_ids == [], "no session active → no attribution"
+    assert f.access_count > initial_access, "touch should still happen on direct query"
+
+
+def test_query_dedupes_attribution_within_session():
+    """Repeated queries to the same fact must not double-count in resonance."""
+    mem = MemoryStore()
+    f = mem.add_fact("mailer service", "runs on", "Go")
+
+    mem.session_start("s_dedup")
+    mem.query("mailer service", top_k=1)
+    mem.query("mailer service Go", top_k=1)
+    mem.query("Go mailer", top_k=1)
+
+    assert mem._session_fact_ids.count(f.fact_id) == 1, "fact must appear at most once per session"
+
+
+def test_echo_drags_down_gravity_of_misleading_facts():
+    """Fix #2: when echo is detected, facts of the past session lose resonance."""
+    mem = MemoryStore()
+    f_misleading = mem.add_fact("legacy script", "written in", "Python")
+    assert f_misleading.resonance_count == 0
+
+    # Pretend a past session leaned on this fact and looked resonant at close.
+    mem.session_start("session_past")
+    mem.session_message("how does the legacy python script work")
+    mem.query("legacy script python", top_k=3)
+    assert f_misleading.fact_id in mem._session_fact_ids
+    mem.session_message("ok, got it!")
+    mem.session_close()
+
+    rcount_before = f_misleading.resonance_count
+    rsum_before = f_misleading.resonance_sum
+
+    # User comes back stuck — echo is triggered.
+    echo = mem.check_echo("legacy python script still not working")
+    assert echo["echo"] is True, "high-similarity follow-up must trigger echo"
+    assert f_misleading.fact_id in echo["penalized_fact_ids"]
+    assert f_misleading.resonance_count == rcount_before + 1
+    assert f_misleading.resonance_sum < rsum_before, "echo penalty must pull resonance down"
+
+    # Idempotency: a second check on the same topic must not stack penalties.
+    rsum_after_first = f_misleading.resonance_sum
+    echo2 = mem.check_echo("legacy python script still not working again")
+    assert echo2["echo"] is True
+    assert echo2["penalty"] == 0.0, "second echo on same session must not re-apply penalty"
+    assert f_misleading.resonance_sum == rsum_after_first
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -66,6 +164,11 @@ if __name__ == "__main__":
         test_query_returns_relevant_facts,
         test_echo_detected_after_toxic_session,
         test_hawking_emission,
+        test_hawking_removes_fact_from_singularity_and_persists,
+        test_query_attributes_facts_to_active_session,
+        test_query_without_active_session_does_not_tag,
+        test_query_dedupes_attribution_within_session,
+        test_echo_drags_down_gravity_of_misleading_facts,
     ]
     for t in tests:
         try:

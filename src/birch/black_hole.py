@@ -42,6 +42,7 @@ class BlackHole:
     def __init__(self, hawking_threshold: float = _HAWKING_THRESHOLD) -> None:
         self._singularity: dict[str, SingularityRecord] = {}
         self._hawking_threshold = hawking_threshold
+        self._total_emissions = 0   # cumulative, survives record removal
 
     def absorb(self, fact: "FactPassport") -> None:
         """Pull a fact across the event horizon. Irreversible."""
@@ -56,29 +57,34 @@ class BlackHole:
         Attempt Hawking emission: return facts similar enough to the query.
 
         Emitted facts are restored to layer=1 (kinetic) with gravity reset
-        to _HAWKING_GRAVITY. They remain in the singularity but are flagged
-        as emitted — the caller decides whether to re-register them.
+        to _HAWKING_GRAVITY and removed from the singularity. The caller
+        is responsible for re-registering them in the live store.
         """
-        emitted = []
-        for rec in self._singularity.values():
+        to_emit: list[str] = []
+        for fid, rec in self._singularity.items():
             if not rec.fact.vector:
                 continue
             sim = _cosine(query_vector, rec.fact.vector)
             if sim >= self._hawking_threshold:
-                rec.emission_count += 1
-                rec.fact.gravity_score = _HAWKING_GRAVITY
-                rec.fact.layer = 1
-                emitted.append(rec.fact)
+                to_emit.append(fid)
+
+        emitted: list["FactPassport"] = []
+        for fid in to_emit:
+            rec = self._singularity.pop(fid)
+            rec.fact.gravity_score = _HAWKING_GRAVITY
+            rec.fact.layer = 1
+            self._total_emissions += 1
+            emitted.append(rec.fact)
         return emitted
 
     @property
     def mass(self) -> int:
-        """Number of facts absorbed."""
+        """Number of facts currently inside the singularity."""
         return len(self._singularity)
 
     @property
     def total_emissions(self) -> int:
-        return sum(r.emission_count for r in self._singularity.values())
+        return self._total_emissions
 
     def __contains__(self, fact_id: str) -> bool:
         return fact_id in self._singularity

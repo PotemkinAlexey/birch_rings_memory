@@ -12,6 +12,7 @@ class StoredSession:
     session_id: str
     bundle: ClusterBundle           # K centroids representing session topics
     r_score: float                  # resonance at close time
+    fact_ids: list[str] = field(default_factory=list)   # facts touched by this session
     timestamp: float = field(default_factory=time.time)
     echo_penalty: float = 0.0      # applied retroactively if echo detected
 
@@ -22,6 +23,7 @@ class EchoResult:
     similarity: float
     penalty: float          # 0.0 or negative — applied to matched session
     label: str              # "echo" | "clean" | "no_history"
+    fact_ids: list[str] = field(default_factory=list)   # facts of the matched session
 
 
 # Similarity threshold above which we consider it a return to the same problem
@@ -41,6 +43,7 @@ class EchoStore:
         all_vectors: list[list[float]],
         r_score: float,
         k: int | None = None,
+        fact_ids: list[str] | None = None,
     ) -> ClusterBundle:
         """
         Store session as a bundle of K centroids.
@@ -53,6 +56,7 @@ class EchoStore:
             session_id=session_id,
             bundle=b,
             r_score=r_score,
+            fact_ids=list(fact_ids or []),
         )
         return b
 
@@ -78,6 +82,16 @@ class EchoStore:
 
         past = self._sessions[best_id]
 
+        # Idempotent: do not stack penalties if echo was already applied.
+        if past.echo_penalty != 0.0:
+            return EchoResult(
+                matched_session_id=best_id,
+                similarity=round(best_sim, 4),
+                penalty=0.0,
+                label="echo",
+                fact_ids=list(past.fact_ids),
+            )
+
         # Past session seemed resonant but user returned — strongest signal of false closure
         if past.r_score > 0.35:
             penalty = -0.8
@@ -95,6 +109,7 @@ class EchoStore:
             similarity=round(best_sim, 4),
             penalty=penalty,
             label="echo",
+            fact_ids=list(past.fact_ids),
         )
 
     def get(self, session_id: str) -> StoredSession | None:

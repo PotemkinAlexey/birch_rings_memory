@@ -34,10 +34,12 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 
 CREATE TABLE IF NOT EXISTS echo_sessions (
-    session_id  TEXT PRIMARY KEY,
-    centroids   TEXT,
-    r_score     REAL,
-    recorded_at REAL
+    session_id   TEXT PRIMARY KEY,
+    centroids    TEXT,
+    r_score      REAL,
+    recorded_at  REAL,
+    fact_ids     TEXT,
+    echo_penalty REAL DEFAULT 0
 );
 """
 
@@ -49,7 +51,16 @@ class SQLiteBackend:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate_echo_sessions()
         self._conn.commit()
+
+    def _migrate_echo_sessions(self) -> None:
+        """Forward-compatible schema migration for pre-existing DBs."""
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(echo_sessions)")}
+        if "fact_ids" not in cols:
+            self._conn.execute("ALTER TABLE echo_sessions ADD COLUMN fact_ids TEXT")
+        if "echo_penalty" not in cols:
+            self._conn.execute("ALTER TABLE echo_sessions ADD COLUMN echo_penalty REAL DEFAULT 0")
 
     # ── Facts ────────────────────────────────────────────────────────────────
 
@@ -108,24 +119,42 @@ class SQLiteBackend:
         centroids: list[list[float]],
         r_score: float,
         recorded_at: float,
+        fact_ids: list[str] | None = None,
+        echo_penalty: float = 0.0,
     ) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO echo_sessions VALUES (?,?,?,?)",
-            (session_id, json.dumps(centroids), r_score, recorded_at),
+            "INSERT OR REPLACE INTO echo_sessions "
+            "(session_id, centroids, r_score, recorded_at, fact_ids, echo_penalty) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                session_id,
+                json.dumps(centroids),
+                r_score,
+                recorded_at,
+                json.dumps(list(fact_ids or [])),
+                echo_penalty,
+            ),
         )
         self._conn.commit()
 
     def load_echo_sessions(self) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM echo_sessions").fetchall()
-        return [
-            {
+        out = []
+        for r in rows:
+            raw_fact_ids = r["fact_ids"] if "fact_ids" in r.keys() else None
+            try:
+                fact_ids = json.loads(raw_fact_ids) if raw_fact_ids else []
+            except (TypeError, ValueError):
+                fact_ids = []
+            out.append({
                 "session_id": r["session_id"],
                 "centroids": json.loads(r["centroids"]),
                 "r_score": r["r_score"],
                 "recorded_at": r["recorded_at"],
-            }
-            for r in rows
-        ]
+                "fact_ids": fact_ids,
+                "echo_penalty": r["echo_penalty"] if "echo_penalty" in r.keys() else 0.0,
+            })
+        return out
 
     def close(self) -> None:
         self._conn.close()

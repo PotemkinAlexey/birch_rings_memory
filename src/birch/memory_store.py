@@ -90,6 +90,8 @@ class MemoryStore:
                 session_id=row["session_id"],
                 bundle=cb,
                 r_score=row["r_score"],
+                fact_ids=list(row.get("fact_ids", [])),
+                echo_penalty=row.get("echo_penalty", 0.0),
             )
 
     # ── Fact management ─────────────────────────────────────────────────────
@@ -166,9 +168,15 @@ class MemoryStore:
             if fid in self._facts:
                 self._facts[fid].touch()
 
-        # Register session in echo store
+        # Register session in echo store with the fact_ids it touched —
+        # required so future echoes can apply a retroactive gravity penalty.
         if self._session_id and vecs:
-            self._echo.record(self._session_id, vecs, result.r)
+            self._echo.record(
+                self._session_id,
+                vecs,
+                result.r,
+                fact_ids=list(self._session_fact_ids),
+            )
             if self._storage:
                 session_obj = self._echo.get(self._session_id)
                 if session_obj:
@@ -177,6 +185,8 @@ class MemoryStore:
                         session_obj.bundle.centroids,
                         session_obj.r_score,
                         time.time(),
+                        fact_ids=session_obj.fact_ids,
+                        echo_penalty=session_obj.echo_penalty,
                     )
 
         # Tick gravity and absorb dead facts
@@ -234,6 +244,11 @@ class MemoryStore:
 
         Searches live layers first. If hawking=True, also attempts
         Hawking emission from the black hole for extreme matches.
+
+        Side effects on every returned fact:
+          - access_count is incremented (touch)
+          - if a session is active, fact_id is attributed to it so the
+            session's resonance later propagates back to its gravity.
         """
         vec = embed(text)
         results: list[QueryResult] = []
@@ -252,14 +267,17 @@ class MemoryStore:
                 source=layer_labels.get(fact.layer, "kinetic"),
             ))
 
-        # Hawking emission from black hole
+        # Hawking emission: black hole returns facts AND removes them from
+        # the singularity. We must re-register them in the live store and
+        # persist the resurrection.
         if hawking:
             emitted = self._hole.hawking_emit(vec)
             for fact in emitted:
                 sim = _cosine(vec, fact.vector)
-                # Re-register emitted fact
                 self._facts[fact.fact_id] = fact
                 self._engine.register(fact)
+                if self._storage:
+                    self._storage.save_fact(fact)
                 results.append(QueryResult(
                     fact=fact,
                     similarity=round(sim, 4),
@@ -267,17 +285,57 @@ class MemoryStore:
                 ))
 
         results.sort(key=lambda r: r.similarity, reverse=True)
-        return results[:top_k]
+        top = results[:top_k]
+
+        # Attribution + touch — only on what the caller actually receives.
+        seen = set(self._session_fact_ids)
+        for r in top:
+            r.fact.touch()
+            if self._session_id and r.fact.fact_id not in seen:
+                self._session_fact_ids.append(r.fact.fact_id)
+                seen.add(r.fact.fact_id)
+
+        return top
 
     def check_echo(self, first_message: str) -> dict:
-        """Check if new session echoes a past unresolved problem."""
+        """
+        Check if a new session echoes a past unresolved problem.
+
+        If echo is detected and a non-zero retroactive penalty is applied
+        for the first time, the penalty is propagated to the gravity of
+        every fact that the matched past session touched. Affected facts
+        are re-persisted.
+        """
         vec = embed(first_message)
         result = self._echo.detect_echo(vec)
+
+        penalized_fact_ids: list[str] = []
+        if result.label == "echo" and result.penalty != 0.0 and result.fact_ids:
+            self._engine.apply_session_resonance(result.fact_ids, result.penalty)
+            penalized_fact_ids = list(result.fact_ids)
+
+            if self._storage:
+                for fid in penalized_fact_ids:
+                    if fid in self._facts:
+                        self._storage.save_fact(self._facts[fid])
+                # Persist the mutated echo session (r_score + echo_penalty).
+                past = self._echo.get(result.matched_session_id)
+                if past:
+                    self._storage.save_echo_session(
+                        past.session_id,
+                        past.bundle.centroids,
+                        past.r_score,
+                        time.time(),
+                        fact_ids=past.fact_ids,
+                        echo_penalty=past.echo_penalty,
+                    )
+
         return {
             "echo": result.label == "echo",
             "matched_session": result.matched_session_id,
             "similarity": result.similarity,
             "penalty": result.penalty,
+            "penalized_fact_ids": penalized_fact_ids,
         }
 
     # ── Status ───────────────────────────────────────────────────────────────
