@@ -51,12 +51,20 @@ class MemoryStore:
      -1 — black hole (gravity < 0.10 after tick, absorbed)
     """
 
+    # Minimum cosine similarity for auto-linking two facts.
+    # High enough to avoid false edges; low enough to catch related triples.
+    AUTO_LINK_THRESHOLD: float = 0.80
+    # Max neighbours considered per new fact to keep startup cost linear.
+    AUTO_LINK_TOP_K: int = 5
+
     def __init__(
         self,
         echo_k: int = 2,
         db_path: Optional[str | Path] = None,
         storage: Optional[StorageBackend] = None,
+        auto_link: bool = True,
     ) -> None:
+        self._auto_link = auto_link
         self._engine = GravityEngine()
         self._hole = BlackHole()
         self._echo = EchoStore(default_k=echo_k)
@@ -156,6 +164,22 @@ class MemoryStore:
             " ".join(obj.lower().split()),
         )
 
+    def _auto_link_fact(self, fact_id: str, vec: list[float]) -> None:
+        """Lock must be held. Link new fact to semantically close neighbours."""
+        if not self._auto_link or len(self._index) < 2:
+            return
+        neighbours = self._index.search(
+            vec, top_k=self.AUTO_LINK_TOP_K + 1, threshold=self.AUTO_LINK_THRESHOLD
+        )
+        for neighbour_id, sim in neighbours:
+            if neighbour_id == fact_id:
+                continue
+            self._engine.link(fact_id, neighbour_id)
+            self._engine.link(neighbour_id, fact_id)
+            if self._storage:
+                self._storage.save_edge(fact_id, neighbour_id)
+                self._storage.save_edge(neighbour_id, fact_id)
+
     def fact_exists(self, subject: str, predicate: str, obj: str) -> bool:
         """Return True if an identical SPO triple is already in the live index."""
         key = self._normalize_spo(subject, predicate, obj)
@@ -250,6 +274,7 @@ class MemoryStore:
             self._engine.register(fact)
             self._index.add(fact.fact_id, vec)
             self._spo_index[key] = fact.fact_id
+            self._auto_link_fact(fact.fact_id, vec)
             if self._storage:
                 self._storage.save_fact(fact)
             if sid is not None:
