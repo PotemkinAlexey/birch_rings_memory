@@ -47,4 +47,22 @@ ECHO_PAIRS = [
             "expected_r_after_echo": "toxic",  # stays toxic, penalty stacks
         },
     },
+    {
+        "name": "multi_topic_echo",
+        "description": "Session 1 covered nginx AND postgres; user returns on postgres sub-topic",
+        "session_1": {
+            "id": "s1_multi",
+            "messages": [
+                "как настроить nginx как reverse proxy",
+                "понял, теперь вопрос по postgres — почему медленные запросы",
+                "nginx заработал, спасибо",
+            ],
+            "expected_r_before_echo": "resonant",
+        },
+        "session_2": {
+            "messages": ["postgres запросы всё ещё медленные, не помогло"],
+            "expected_echo": True,
+            "expected_r_after_echo": "toxic",
+        },
+    },
 ]

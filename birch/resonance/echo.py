@@ -3,25 +3,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from .centroid import centroid as _centroid, dispersion as _dispersion
 
-
-import math
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+from .cluster import ClusterBundle, bundle as _bundle, nearest_similarity
 
 
 @dataclass
 class StoredSession:
     session_id: str
-    topic_vector: list[float]       # centroid of all session message embeddings
+    bundle: ClusterBundle           # K centroids representing session topics
     r_score: float                  # resonance at close time
     timestamp: float = field(default_factory=time.time)
     echo_penalty: float = 0.0      # applied retroactively if echo detected
@@ -42,40 +31,47 @@ _ECHO_THRESHOLD = 0.80
 class EchoStore:
     """In-memory store of closed sessions for echo detection."""
 
-    def __init__(self) -> None:
+    def __init__(self, default_k: int = 2) -> None:
         self._sessions: dict[str, StoredSession] = {}
+        self._k = default_k
 
     def record(
         self,
         session_id: str,
         all_vectors: list[list[float]],
         r_score: float,
-    ) -> None:
-        """Store session using centroid of all message vectors — O(dim) memory."""
-        topic_vector = _centroid(all_vectors) if len(all_vectors) > 1 else all_vectors[0]
+        k: int | None = None,
+    ) -> ClusterBundle:
+        """
+        Store session as a bundle of K centroids.
+
+        K is auto-reduced if session has fewer messages than K.
+        Returns the computed bundle (useful for inspection/testing).
+        """
+        b = _bundle(all_vectors, k=k or self._k)
         self._sessions[session_id] = StoredSession(
             session_id=session_id,
-            topic_vector=topic_vector,
+            bundle=b,
             r_score=r_score,
         )
+        return b
 
     def detect_echo(self, new_topic_vector: list[float]) -> EchoResult:
         """
         Check if the new session is returning to a previously unresolved problem.
 
-        Finds the most similar past session. If similarity > threshold and
-        the past session had R < 0.5 (wasn't strongly resonant), it's an echo.
-        If similarity > threshold and past session had R >= 0.5, user is
-        returning despite success — still flag but lighter penalty.
+        Matches against the nearest centroid in each session's bundle —
+        a multi-topic session won't miss an echo just because the overall
+        centroid drifted away from the problematic sub-topic.
         """
         if not self._sessions:
             return EchoResult(None, 0.0, 0.0, "no_history")
 
-        best_id, best_sim = max(
-            self._sessions.items(),
-            key=lambda kv: _cosine(kv[1].topic_vector, new_topic_vector),
+        best_id = max(
+            self._sessions,
+            key=lambda sid: nearest_similarity(new_topic_vector, self._sessions[sid].bundle),
         )
-        best_sim = _cosine(self._sessions[best_id].topic_vector, new_topic_vector)
+        best_sim = nearest_similarity(new_topic_vector, self._sessions[best_id].bundle)
 
         if best_sim < _ECHO_THRESHOLD:
             return EchoResult(None, round(best_sim, 4), 0.0, "clean")
@@ -92,7 +88,6 @@ class EchoStore:
         # Apply penalty retroactively — guarantee score drops into toxic zone
         past.echo_penalty = penalty
         new_score = past.r_score + penalty
-        # Echo is definitive evidence of failure: floor at -0.2 minimum
         past.r_score = min(-0.2, max(-1.0, new_score))
 
         return EchoResult(
