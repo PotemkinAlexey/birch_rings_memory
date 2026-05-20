@@ -49,7 +49,18 @@ Interpret the response by `source`:
 | `surface` | hot fact, used often, high gravity | trust, cite directly |
 | `kinetic` | working memory, moderate use | use, but check relevance |
 | `core` | cold archive, rarely used | verify before relying on it |
-| `hawking` | returned from black hole | treat with suspicion; it sank for a reason |
+| `hawking` | single FactPassport returned from the black hole | treat with suspicion; it sank for a reason |
+| `hawking_meta` | a MetaFact bundle returned from the black hole | dense context, but it represents *aggregated dead facts* — verify against the user's actual question |
+
+Interpret the response by `kind` — a query hit is either:
+
+- `kind == "fact"` — one SPO triple. Read `subject`/`predicate`/`object`
+  as you always have.
+- `kind == "meta"` — a MetaFact: `weight` facts collapsed into one
+  centroid. Read `weight`, `source_texts` (up to a handful of original
+  SPO strings), and `summary` if non-empty. A MetaFact answers "this
+  cluster of related dead facts came up before", not "here is one
+  precise statement". Cite it as a bundle, not as a single source.
 
 Interpret the response by `gravity_score`:
 
@@ -159,8 +170,8 @@ treat it as an echo:
 
 ## Hawking emission
 
-A fact returned with `source: "hawking"` was previously absorbed by the
-black hole — its gravity fell below the absorption floor. It returned only
+A result with `source: "hawking"` was previously absorbed by the black
+hole — its gravity fell below the absorption floor. It returned only
 because your query matched it at `similarity ≥ 0.95`.
 
 Do not use a Hawking fact as primary evidence. Use it as a lead:
@@ -168,6 +179,27 @@ Do not use a Hawking fact as primary evidence. Use it as a lead:
 - Ask whether it is still relevant
 - If confirmed, `record_fact` it again so it re-enters the live layers with
   fresh gravity
+
+### MetaFacts and `source: "hawking_meta"`
+
+A `MetaFact` is the residue of *several* facts that fell into the black
+hole around the same semantic topic, fused by gravitational collapse
+into one dense bundle. A query hit with `source: "hawking_meta"` is a
+MetaFact that just emerged at similarity `≥ 0.85` (the threshold is
+lower than for single facts because a centroid lives between its
+sources).
+
+Treat MetaFact hits as **aggregated leads, not citable statements**:
+
+- Read `source_texts` (up to a handful of "subject predicate object"
+  strings) for the constituent ideas.
+- Read `weight` to know how many facts were merged. Higher weight =
+  the cluster was strongly recurring.
+- Read `summary` if non-empty — a future LLM pass may populate it
+  with a one-line synthesis.
+- Do not cite a MetaFact as a single source-of-truth. Ask the user
+  whether the cluster is still relevant, or call `record_fact` on
+  any specific statement you want to keep live.
 
 ---
 
@@ -192,10 +224,16 @@ Interpret:
 
 - `black_hole_mass` rising steadily — facts are failing; review what is
   being stored and whether sessions are being scored correctly
+- `black_hole_meta_mass` rising while `black_hole_fact_mass` falls —
+  consolidation is working: dead-fact clusters are being fused into
+  MetaFacts. This is healthy compression, not a failure mode.
 - `surface` count dropping — active knowledge is declining; the system may
   need fresh input
-- `hawking_emissions` non-zero — dead facts are being retrieved; the store
-  may contain outdated information that keeps resurfacing
+- `hawking_emissions` non-zero — dead bodies are being retrieved; the
+  store may contain outdated information that keeps resurfacing
+- `total_collapses` increasing without `black_hole_fact_mass` falling —
+  collapses are running but not finding clusters. The collapse threshold
+  may be too strict for your data.
 - `active_sessions` > 0 after all agents have closed — a session was opened
   but `record_session` was never called; that context is leaking state
 
