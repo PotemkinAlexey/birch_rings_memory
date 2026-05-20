@@ -1,76 +1,44 @@
-"""Resonance detector experiment — baseline vs embeddings vs full (+ repetition)."""
-import sys
-sys.path.insert(0, "/Users/alexpotemkin/IdeaProjects/birch_rings_memory")
-
+"""Resonance detector — baseline vs embeddings vs full (+ repetition)."""
+import pytest
 from birch.resonance.detector import compute_resonance
 from birch.resonance.embeddings import embed_batch
 from tests.fixtures.sessions import SESSIONS
 
 
-def run_session(s, mode):
+def _run_session(s, mode):
     messages = s["messages"]
-    start_vec = end_vec = None
-    all_vecs = None
-
+    start_vec = end_vec = all_vecs = None
     if mode in ("embeddings", "full"):
         vecs = embed_batch(messages)
-        start_vec = vecs[0]
-        end_vec = vecs[-1]
+        start_vec, end_vec = vecs[0], vecs[-1]
         if mode == "full":
             all_vecs = vecs
+    result = compute_resonance(messages, start_vector=start_vec, end_vector=end_vec, all_vectors=all_vecs)
+    return result
 
-    result = compute_resonance(
-        messages,
-        start_vector=start_vec,
-        end_vector=end_vec,
-        all_vectors=all_vecs,
+
+@pytest.mark.parametrize("session", SESSIONS, ids=[s["name"] for s in SESSIONS])
+def test_baseline(session):
+    if session.get("requires_embeddings"):
+        pytest.skip("requires embeddings — not meaningful in baseline mode")
+    result = _run_session(session, "baseline")
+    assert result.label == session["expected_label"], (
+        f"[baseline] {session['name']}: R={result.r:+.3f} got {result.label!r}, "
+        f"expected {session['expected_label']!r}"
     )
-    ok = result.label == s["expected_label"]
-    return ok, result
 
 
-def run(mode):
-    labels = {
-        "baseline": "Baseline (patterns only)",
-        "embeddings": "Patterns + semantic embeddings",
-        "full": "Full (patterns + semantic + repetition)",
-    }
-    print(f"\n{'='*62}")
-    print(f"BirchKM — [{labels[mode]}]")
-    print(f"{'='*62}\n")
-
-    passed = failed = 0
-    for s in SESSIONS:
-        ok, result = run_session(s, mode)
-        status = "✓" if ok else "✗"
-        if ok:
-            passed += 1
-        else:
-            failed += 1
-
-        print(f"{status}  [{s['name']}]")
-        print(f"   {s['description']}")
-        print(
-            f"   behavioral={result.behavioral_score:+.2f}  "
-            f"semantic={result.semantic_score:+.2f}  "
-            f"repetition={result.repetition_score:+.2f}  "
-            f"R={result.r:+.3f}  label={result.label!r}"
-        )
-        print(f"   expected={s['expected_label']!r}")
-        print()
-
-    print(f"Result: {passed}/{len(SESSIONS)} passed\n")
-    return passed
+@pytest.mark.parametrize("session", SESSIONS, ids=[s["name"] for s in SESSIONS])
+def test_full(session):
+    result = _run_session(session, "full")
+    assert result.label == session["expected_label"], (
+        f"[full] {session['name']}: R={result.r:+.3f} got {result.label!r}, "
+        f"expected {session['expected_label']!r}"
+    )
 
 
 if __name__ == "__main__":
-    n = len(SESSIONS)
-    scores = {}
+    # Quick experiment runner (non-pytest)
     for mode in ("baseline", "embeddings", "full"):
-        scores[mode] = run(mode)
-
-    print(f"{'='*62}")
-    print(f"Baseline (patterns only):              {scores['baseline']}/{n}")
-    print(f"Patterns + semantic embeddings:        {scores['embeddings']}/{n}")
-    print(f"Full (+ repetition detector):          {scores['full']}/{n}")
-    print(f"{'='*62}\n")
+        passed = sum(1 for s in SESSIONS if _run_session(s, mode).label == s["expected_label"])
+        print(f"{mode:12}: {passed}/{len(SESSIONS)}")

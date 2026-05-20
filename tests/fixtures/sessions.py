@@ -61,7 +61,7 @@ SESSIONS = [
         ],
         "expected_label": "toxic",
     },
-    # Hard cases — no obvious positive/negative keywords, embeddings should help
+    # Hard cases — no obvious positive/negative keywords, require embeddings
     {
         "name": "hard_topic_shift",
         "description": "User moves from vague to concrete — productive narrowing, no keywords",
@@ -71,6 +71,7 @@ SESSIONS = [
             "ok found it — missing index on foreign key, added it",
         ],
         "expected_label": "resonant",
+        "requires_embeddings": True,
     },
     {
         "name": "hard_circular",
@@ -81,5 +82,6 @@ SESSIONS = [
             "what are the ways to increase performance",
         ],
         "expected_label": "toxic",
+        "requires_embeddings": True,
     },
 ]

@@ -16,7 +16,7 @@ class ClosureSignal(Enum):
 _POSITIVE = re.compile(
     r"\b("
     r"работает|взлетело|заработало|всё\s*ок|всё\s*окей|спасибо|понял|разобрался"
-    r"|got\s*it|works|perfect|done|thanks|thank\s*you|solved|fixed|great"
+    r"|got\s*it|found\s*it|figured\s*it\s*out|works|perfect|done|thanks|thank\s*you|solved|fixed|great"
     r"|окей|ок|👍|✅|🎉"
     r")\b",
     re.IGNORECASE,
