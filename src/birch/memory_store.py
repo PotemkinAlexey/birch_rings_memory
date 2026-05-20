@@ -195,6 +195,11 @@ class MemoryStore:
             if not fact.is_deprecated:
                 key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
                 self._spo_index.setdefault(key, fact.fact_id)
+        # MetaFacts persist inside the black hole until Hawking-emitted.
+        if hasattr(self._storage, "load_meta_facts"):
+            for meta in self._storage.load_meta_facts():
+                if meta.layer == -1:
+                    self._hole.restore_meta(meta)
         for from_id, to_id in self._storage.load_edges():
             self._engine.link(from_id, to_id)
         for row in self._storage.load_echo_sessions():
