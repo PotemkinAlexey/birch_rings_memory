@@ -156,6 +156,13 @@ class MemoryStore:
             " ".join(obj.lower().split()),
         )
 
+    def fact_exists(self, subject: str, predicate: str, obj: str) -> bool:
+        """Return True if an identical SPO triple is already in the live index."""
+        key = self._normalize_spo(subject, predicate, obj)
+        with self._lock:
+            existing_id = self._spo_index.get(key)
+            return existing_id is not None and existing_id in self._facts
+
     def _load_from_storage(self) -> None:
         for fact in self._storage.load_facts():
             self._facts[fact.fact_id] = fact
