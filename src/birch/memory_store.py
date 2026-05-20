@@ -429,6 +429,10 @@ class MemoryStore:
                 result.r,
                 fact_weights=facts_snapshot,
             )
+            # Opportunistic TTL sweep on session close. Drops stale resolved
+            # and already-penalised echo sessions so the store stays bounded
+            # without a separate cron job.
+            expired = self._echo.expire()
             if self._storage:
                 session_obj = self._echo.get(sid)
                 if session_obj:
@@ -440,6 +444,11 @@ class MemoryStore:
                         fact_weights=session_obj.fact_weights,
                         echo_penalty=session_obj.echo_penalty,
                     )
+                # Storage layer doesn't yet expose a delete; drop via the
+                # tolerated load-time gc instead. We still drop in-memory.
+                if expired and hasattr(self._storage, "delete_echo_session"):
+                    for stale_sid in expired:
+                        self._storage.delete_echo_session(stale_sid)
 
             migrations = self._engine.tick()
             absorbed = self._absorb_dead()

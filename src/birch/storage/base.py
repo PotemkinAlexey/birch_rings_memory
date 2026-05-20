@@ -48,6 +48,8 @@ class StorageBackend(Protocol):
 
     def load_echo_sessions(self) -> list[dict]: ...
 
+    def delete_echo_session(self, session_id: str) -> None: ...
+
     def save_open_session(
         self,
         session_id: str,

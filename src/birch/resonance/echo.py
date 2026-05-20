@@ -37,6 +37,13 @@ class EchoResult:
 # Similarity threshold above which we consider it a return to the same problem
 _ECHO_THRESHOLD = 0.68
 
+# TTL defaults (in seconds). The store is unbounded by default; ``expire()``
+# is opportunistic — call it from session lifecycle or from a background
+# job, not on every detect_echo.
+TTL_RESOLVED = 7 * 24 * 3600       # resonant sessions older than a week
+TTL_PENALIZED = 14 * 24 * 3600     # echo-applied sessions older than 2 weeks
+TTL_DEFAULT = 30 * 24 * 3600       # everything else older than 30 days
+
 
 class EchoStore:
     """In-memory store of closed sessions for echo detection."""
@@ -124,3 +131,45 @@ class EchoStore:
 
     def get(self, session_id: str) -> StoredSession | None:
         return self._sessions.get(session_id)
+
+    def expire(
+        self,
+        now: float | None = None,
+        ttl_resolved: float = TTL_RESOLVED,
+        ttl_penalized: float = TTL_PENALIZED,
+        ttl_default: float = TTL_DEFAULT,
+    ) -> list[str]:
+        """Drop sessions that no longer need echo tracking.
+
+        Three tiers:
+          - resolved (r_score > 0.35) — already a win, no need to keep
+            looking for echoes.
+          - penalized (echo_penalty != 0) — already converted into a
+            gravity correction; no further action it can drive.
+          - everything else — capped at the long default TTL so the
+            store never grows unboundedly.
+
+        Returns the list of dropped session_ids.
+        """
+        now = now if now is not None else time.time()
+        dropped: list[str] = []
+        for sid, s in list(self._sessions.items()):
+            age = now - s.timestamp
+            # Penalty tier wins: once a session has been echoed it is locked
+            # into the toxic floor and cannot drift back into "resolved".
+            if s.echo_penalty != 0.0:
+                if age > ttl_penalized:
+                    dropped.append(sid)
+                continue
+            if s.r_score > 0.35:
+                if age > ttl_resolved:
+                    dropped.append(sid)
+                continue
+            if age > ttl_default:
+                dropped.append(sid)
+        for sid in dropped:
+            del self._sessions[sid]
+        return dropped
+
+    def __len__(self) -> int:
+        return len(self._sessions)

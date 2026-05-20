@@ -181,6 +181,12 @@ class SQLiteBackend:
         )
         self._conn.commit()
 
+    def delete_echo_session(self, session_id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM echo_sessions WHERE session_id = ?", (session_id,)
+        )
+        self._conn.commit()
+
     def load_echo_sessions(self) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM echo_sessions").fetchall()
         out = []
