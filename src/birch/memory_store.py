@@ -1,8 +1,9 @@
 """MemoryStore — unified entry point for the BirchKM memory system."""
 from __future__ import annotations
 
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +28,16 @@ class QueryResult:
     fact: FactPassport
     similarity: float
     source: str     # "surface" | "kinetic" | "core" | "hawking"
+
+
+@dataclass
+class SessionContext:
+    """Per-session mutable state. Two agents = two independent contexts."""
+    session_id: str
+    messages: list[str] = field(default_factory=list)
+    vectors: list[list[float]] = field(default_factory=list)
+    # fact_id → relevance weight in [0, 1] for this session.
+    facts: dict[str, float] = field(default_factory=dict)
 
 
 class MemoryStore:
@@ -61,21 +72,55 @@ class MemoryStore:
         else:
             self._storage = None
 
-        # Active session tracking
-        self._session_messages: list[str] = []
-        self._session_vectors: list[list[float]] = []
-        # fact_id → relevance weight in [0, 1] for this session.
-        # We keep the MAX similarity observed across all queries that
-        # returned each fact; explicit add_fact calls pin weight=1.0.
-        self._session_facts: dict[str, float] = {}
-        self._session_id: Optional[str] = None
+        # Multiple sessions can be open concurrently — one per agent in
+        # the typical MCP setup. Public methods accept an explicit
+        # session_id; the convenience fallback _current_session_id is
+        # only safe under single-user / sequential use.
+        self._sessions: dict[str, SessionContext] = {}
+        self._current_session_id: Optional[str] = None
+        # Re-entrant lock guards _facts, _index, _spo_index, _sessions and
+        # gravity/echo internals. Embed() calls are kept OUT of the lock
+        # so concurrent agents don't serialize on a slow HTTP roundtrip.
+        self._lock = threading.RLock()
 
         if self._storage:
             self._load_from_storage()
 
     # ── Storage bootstrap ────────────────────────────────────────────────────
 
-    # Back-compat shim — older tests and callers read/write this as a list.
+    # ── Back-compat shims for the legacy single-session API ────────────────
+    #
+    # The public methods now accept an explicit session_id. When omitted
+    # they fall back to ``_current_session_id`` so old single-user code
+    # (``mem.session_start("s"); mem.add_fact(...); mem.session_close()``)
+    # keeps working. These shims expose the current session's state under
+    # the original attribute names that some tests still touch directly.
+
+    @property
+    def _session_id(self) -> Optional[str]:
+        return self._current_session_id
+
+    @property
+    def _session_messages(self) -> list[str]:
+        ctx = self._sessions.get(self._current_session_id or "")
+        return ctx.messages if ctx else []
+
+    @property
+    def _session_vectors(self) -> list[list[float]]:
+        ctx = self._sessions.get(self._current_session_id or "")
+        return ctx.vectors if ctx else []
+
+    @property
+    def _session_facts(self) -> dict[str, float]:
+        ctx = self._sessions.get(self._current_session_id or "")
+        return ctx.facts if ctx else {}
+
+    @_session_facts.setter
+    def _session_facts(self, value) -> None:
+        ctx = self._sessions.get(self._current_session_id or "")
+        if ctx is not None:
+            ctx.facts = {fid: float(w) for fid, w in dict(value).items()}
+
     @property
     def _session_fact_ids(self) -> list[str]:
         return list(self._session_facts.keys())
@@ -83,18 +128,25 @@ class MemoryStore:
     @_session_fact_ids.setter
     def _session_fact_ids(self, value) -> None:
         if isinstance(value, dict):
-            self._session_facts = {fid: float(w) for fid, w in value.items()}
+            self._session_facts = value
         else:
             self._session_facts = {fid: 1.0 for fid in value}
 
-    def _attribute_fact(self, fact_id: str, weight: float) -> None:
-        """Tag a fact to the active session, keeping the max weight seen."""
-        if not self._session_id:
-            return
+    def _resolve_sid(self, session_id: Optional[str]) -> Optional[str]:
+        return session_id if session_id is not None else self._current_session_id
+
+    @staticmethod
+    def _attribute_to(ctx: SessionContext, fact_id: str, weight: float) -> None:
         clipped = max(0.0, min(1.0, float(weight)))
-        prev = self._session_facts.get(fact_id, 0.0)
-        if clipped > prev:
-            self._session_facts[fact_id] = clipped
+        if clipped > ctx.facts.get(fact_id, 0.0):
+            ctx.facts[fact_id] = clipped
+
+    def _attribute_fact(self, fact_id: str, weight: float) -> None:
+        """Tag a fact to the current (legacy) session if any."""
+        ctx = self._sessions.get(self._current_session_id or "")
+        if ctx is None:
+            return
+        self._attribute_to(ctx, fact_id, weight)
 
     @staticmethod
     def _normalize_spo(subject: str, predicate: str, obj: str) -> tuple[str, str, str]:
@@ -133,6 +185,7 @@ class MemoryStore:
         predicate: str,
         obj: str,
         layer: int = 1,
+        session_id: Optional[str] = None,
     ) -> FactPassport:
         """
         Create, embed, and register a new fact.
@@ -140,105 +193,155 @@ class MemoryStore:
         If an identical (case-insensitive, whitespace-normalised) SPO triple
         already lives in the store, return the existing fact instead of
         creating a duplicate. The existing fact is touched and attributed
-        to the active session, so the caller's intent (it was used here)
-        still propagates to gravity.
+        to the named session (or the current one), so the caller's intent
+        still propagates to gravity at weight 1.0.
+
+        Embedding happens outside the lock so concurrent agents don't
+        serialize on the slow HTTP roundtrip to Ollama.
         """
         key = self._normalize_spo(subject, predicate, obj)
-        existing_id = self._spo_index.get(key)
-        if existing_id and existing_id in self._facts:
-            existing = self._facts[existing_id]
-            existing.touch()
-            if self._storage:
-                self._storage.save_fact(existing)
-            self._attribute_fact(existing_id, 1.0)
-            return existing
 
-        fact = FactPassport(
-            subject=subject,
-            predicate=predicate,
-            object=obj,
-            layer=layer,
-            source_session=self._session_id,
-        )
-        fact.vector = embed(f"{subject} {predicate} {obj}")
-        self._facts[fact.fact_id] = fact
-        self._engine.register(fact)
-        self._index.add(fact.fact_id, fact.vector)
-        self._spo_index[key] = fact.fact_id
+        # Fast path: SPO already present.
+        with self._lock:
+            existing_id = self._spo_index.get(key)
+            if existing_id and existing_id in self._facts:
+                return self._touch_existing(existing_id, session_id)
+
+        # Slow path: embed without holding the lock.
+        vec = embed(f"{subject} {predicate} {obj}")
+
+        with self._lock:
+            # Double-check: another thread may have created the same triple
+            # while we were embedding.
+            existing_id = self._spo_index.get(key)
+            if existing_id and existing_id in self._facts:
+                return self._touch_existing(existing_id, session_id)
+
+            sid = self._resolve_sid(session_id)
+            fact = FactPassport(
+                subject=subject,
+                predicate=predicate,
+                object=obj,
+                layer=layer,
+                source_session=sid,
+            )
+            fact.vector = vec
+            self._facts[fact.fact_id] = fact
+            self._engine.register(fact)
+            self._index.add(fact.fact_id, vec)
+            self._spo_index[key] = fact.fact_id
+            if self._storage:
+                self._storage.save_fact(fact)
+            if sid is not None:
+                ctx = self._sessions.get(sid)
+                if ctx is not None:
+                    self._attribute_to(ctx, fact.fact_id, 1.0)
+            return fact
+
+    def _touch_existing(
+        self,
+        existing_id: str,
+        session_id: Optional[str],
+    ) -> FactPassport:
+        """Lock-guarded helper for the dedupe path of add_fact."""
+        existing = self._facts[existing_id]
+        existing.touch()
         if self._storage:
-            self._storage.save_fact(fact)
-        self._attribute_fact(fact.fact_id, 1.0)
-        return fact
+            self._storage.save_fact(existing)
+        sid = self._resolve_sid(session_id)
+        if sid is not None:
+            ctx = self._sessions.get(sid)
+            if ctx is not None:
+                self._attribute_to(ctx, existing_id, 1.0)
+        return existing
 
     def link(self, from_id: str, to_id: str) -> None:
-        self._engine.link(from_id, to_id)
-        if self._storage:
-            self._storage.save_edge(from_id, to_id)
+        with self._lock:
+            self._engine.link(from_id, to_id)
+            if self._storage:
+                self._storage.save_edge(from_id, to_id)
 
     def deprecate(self, old_id: str, new_id: str) -> None:
-        if old_id in self._facts:
-            old = self._facts[old_id]
-            old.deprecated_by = new_id
-            # A deprecated fact is no longer the canonical bearer of its SPO.
-            key = self._normalize_spo(old.subject, old.predicate, old.object)
-            if self._spo_index.get(key) == old_id:
-                del self._spo_index[key]
-            if self._storage:
-                self._storage.save_fact(old)
+        with self._lock:
+            if old_id in self._facts:
+                old = self._facts[old_id]
+                old.deprecated_by = new_id
+                # A deprecated fact is no longer the canonical bearer of its SPO.
+                key = self._normalize_spo(old.subject, old.predicate, old.object)
+                if self._spo_index.get(key) == old_id:
+                    del self._spo_index[key]
+                if self._storage:
+                    self._storage.save_fact(old)
 
     # ── Session lifecycle ────────────────────────────────────────────────────
 
     def session_start(self, session_id: str) -> None:
-        self._session_id = session_id
-        self._session_messages = []
-        self._session_vectors = []
-        self._session_facts = {}
+        """Open a session context. Safe to call concurrently."""
+        with self._lock:
+            self._sessions[session_id] = SessionContext(session_id=session_id)
+            self._current_session_id = session_id
 
-    def session_message(self, text: str) -> None:
-        """Record a user message in the current session."""
-        self._session_messages.append(text)
-        self._session_vectors.append(embed(text))
+    def session_message(self, text: str, session_id: Optional[str] = None) -> None:
+        """Record a user message in the named session (or the current one)."""
+        # Embed outside the lock — slow HTTP call, must not serialize agents.
+        vec = embed(text)
+        with self._lock:
+            sid = self._resolve_sid(session_id)
+            if sid is None or sid not in self._sessions:
+                raise KeyError(f"unknown session: {sid!r}")
+            ctx = self._sessions[sid]
+            ctx.messages.append(text)
+            ctx.vectors.append(vec)
 
-    def session_close(self) -> dict:
+    def session_close(self, session_id: Optional[str] = None) -> dict:
         """
         Close session: compute resonance, propagate R to facts,
         record echo bundle, tick gravity, absorb dead facts.
-        """
-        if not self._session_messages:
-            return {}
 
-        vecs = self._session_vectors
+        Operates on the named session if provided; otherwise on the
+        most recently opened one.
+        """
+        with self._lock:
+            sid = self._resolve_sid(session_id)
+            if sid is None or sid not in self._sessions:
+                return {}
+            ctx = self._sessions[sid]
+            if not ctx.messages:
+                self._pop_session_locked(sid)
+                return {}
+            messages_snapshot = list(ctx.messages)
+            vectors_snapshot = list(ctx.vectors)
+            facts_snapshot = dict(ctx.facts)
+
+        # Resonance is pure computation on the snapshot — do it outside the
+        # lock so other agents can keep querying.
         result = compute_resonance(
-            self._session_messages,
-            start_vector=vecs[0],
-            end_vector=vecs[-1],
-            all_vectors=vecs,
+            messages_snapshot,
+            start_vector=vectors_snapshot[0],
+            end_vector=vectors_snapshot[-1],
+            all_vectors=vectors_snapshot,
         )
 
-        # Propagate R to facts used in this session, weighted by how
-        # relevant each fact was to the session's queries.
-        self._engine.apply_session_resonance(self._session_facts, result.r)
+        with self._lock:
+            # Propagate R to facts used in this session, weighted by how
+            # relevant each fact was to the session's queries.
+            self._engine.apply_session_resonance(facts_snapshot, result.r)
 
-        # Touch facts that were accessed
-        for fid in self._session_facts:
-            if fid in self._facts:
-                self._facts[fid].touch()
+            for fid in facts_snapshot:
+                if fid in self._facts:
+                    self._facts[fid].touch()
 
-        # Register session in echo store with the fact weights it touched —
-        # required so future echoes can apply a retroactive gravity penalty
-        # scaled by how relevant each fact was.
-        if self._session_id and vecs:
             self._echo.record(
-                self._session_id,
-                vecs,
+                sid,
+                vectors_snapshot,
                 result.r,
-                fact_weights=dict(self._session_facts),
+                fact_weights=facts_snapshot,
             )
             if self._storage:
-                session_obj = self._echo.get(self._session_id)
+                session_obj = self._echo.get(sid)
                 if session_obj:
                     self._storage.save_echo_session(
-                        self._session_id,
+                        sid,
                         session_obj.bundle.centroids,
                         session_obj.r_score,
                         time.time(),
@@ -246,28 +349,30 @@ class MemoryStore:
                         echo_penalty=session_obj.echo_penalty,
                     )
 
-        # Tick gravity and absorb dead facts
-        migrations = self._engine.tick()
-        absorbed = self._absorb_dead()
+            migrations = self._engine.tick()
+            absorbed = self._absorb_dead()
 
-        # Persist updated gravity scores for all live facts in one transaction.
-        if self._storage:
-            self._storage.save_facts(list(self._facts.values()))
+            if self._storage:
+                self._storage.save_facts(list(self._facts.values()))
 
-        summary = {
-            "session_id": self._session_id,
-            "r": result.r,
-            "label": result.label,
-            "migrations": migrations,
-            "absorbed": absorbed,
-        }
-
-        self._session_id = None
-        self._session_messages = []
-        self._session_vectors = []
-        self._session_facts = {}
+            summary = {
+                "session_id": sid,
+                "r": result.r,
+                "label": result.label,
+                "migrations": migrations,
+                "absorbed": absorbed,
+            }
+            self._pop_session_locked(sid)
 
         return summary
+
+    def _pop_session_locked(self, sid: str) -> None:
+        """Caller must hold self._lock."""
+        self._sessions.pop(sid, None)
+        if self._current_session_id == sid:
+            self._current_session_id = (
+                next(reversed(self._sessions)) if self._sessions else None
+            )
 
     def _absorb_dead(self) -> list[str]:
         """Send facts with gravity below threshold into the black hole."""
@@ -303,6 +408,7 @@ class MemoryStore:
         min_layer: int = 0,
         max_layer: int = 2,
         hawking: bool = True,
+        session_id: Optional[str] = None,
     ) -> list[QueryResult]:
         """
         Retrieve relevant facts by cosine similarity.
@@ -315,60 +421,63 @@ class MemoryStore:
           - if a session is active, fact_id is attributed to it so the
             session's resonance later propagates back to its gravity.
         """
+        # Embed outside the lock.
         vec = embed(text)
-        results: list[QueryResult] = []
 
-        # Search live facts via the numpy-backed index. Single matmul over
-        # the whole live store; layer filter applied afterwards.
-        layer_labels = {0: "surface", 1: "kinetic", 2: "core"}
-        sims = self._index.all_similarities(vec)
-        for fid, sim in sims.items():
-            fact = self._facts.get(fid)
-            if fact is None:
-                continue
-            if not (min_layer <= fact.layer <= max_layer):
-                continue
-            results.append(QueryResult(
-                fact=fact,
-                similarity=round(sim, 4),
-                source=layer_labels.get(fact.layer, "kinetic"),
-            ))
-
-        # Hawking emission: black hole returns facts AND removes them from
-        # the singularity. We must re-register them in the live store and
-        # persist the resurrection.
-        if hawking:
-            emitted = self._hole.hawking_emit(vec)
-            for fact in emitted:
-                self._facts[fact.fact_id] = fact
-                self._engine.register(fact)
-                self._index.add(fact.fact_id, fact.vector)
-                if not fact.is_deprecated:
-                    key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
-                    self._spo_index.setdefault(key, fact.fact_id)
-                if self._storage:
-                    self._storage.save_fact(fact)
-                sim = VectorIndex.similarity(vec, fact.vector)
+        with self._lock:
+            results: list[QueryResult] = []
+            layer_labels = {0: "surface", 1: "kinetic", 2: "core"}
+            sims = self._index.all_similarities(vec)
+            for fid, sim in sims.items():
+                fact = self._facts.get(fid)
+                if fact is None:
+                    continue
+                if not (min_layer <= fact.layer <= max_layer):
+                    continue
                 results.append(QueryResult(
                     fact=fact,
                     similarity=round(sim, 4),
-                    source="hawking",
+                    source=layer_labels.get(fact.layer, "kinetic"),
                 ))
 
-        results.sort(key=lambda r: r.similarity, reverse=True)
-        top = results[:top_k]
+            # Hawking emission: black hole returns facts AND removes them from
+            # the singularity. We must re-register them in the live store and
+            # persist the resurrection.
+            if hawking:
+                emitted = self._hole.hawking_emit(vec)
+                for fact in emitted:
+                    self._facts[fact.fact_id] = fact
+                    self._engine.register(fact)
+                    self._index.add(fact.fact_id, fact.vector)
+                    if not fact.is_deprecated:
+                        key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
+                        self._spo_index.setdefault(key, fact.fact_id)
+                    if self._storage:
+                        self._storage.save_fact(fact)
+                    sim = VectorIndex.similarity(vec, fact.vector)
+                    results.append(QueryResult(
+                        fact=fact,
+                        similarity=round(sim, 4),
+                        source="hawking",
+                    ))
 
-        # Attribution + touch — only on what the caller actually receives.
-        # Weight is the similarity itself (clipped to [0, 1]); a fact
-        # returned with cosine 0.95 ends up nine times more sensitive
-        # to the session R than one returned at 0.10.
-        for r in top:
-            r.fact.touch()
-            self._attribute_fact(r.fact.fact_id, r.similarity)
+            results.sort(key=lambda r: r.similarity, reverse=True)
+            top = results[:top_k]
+
+            # Attribution + touch — only on what the caller actually
+            # receives. Weight is the similarity itself; a fact returned at
+            # cosine 0.95 ends up nine times more sensitive to session R
+            # than one returned at 0.10.
+            sid = self._resolve_sid(session_id)
+            ctx = self._sessions.get(sid) if sid else None
+            for r in top:
+                r.fact.touch()
+                if ctx is not None:
+                    self._attribute_to(ctx, r.fact.fact_id, r.similarity)
 
         return top
 
-    def check_echo(self, first_message: str) -> dict:
+    def check_echo(self, first_message: str, session_id: Optional[str] = None) -> dict:
         """
         Check if a new session echoes a past unresolved problem.
 
@@ -377,51 +486,57 @@ class MemoryStore:
         every fact that the matched past session touched. Affected facts
         are re-persisted.
         """
+        # session_id is accepted for symmetry with the other methods but
+        # echo penalties apply to the matched PAST session, not to the
+        # active one; we keep the param for forward compatibility.
+        _ = session_id  # currently unused — explicit silence
         vec = embed(first_message)
-        result = self._echo.detect_echo(vec)
 
-        penalized_fact_ids: list[str] = []
-        if result.label == "echo" and result.penalty != 0.0 and result.fact_weights:
-            self._engine.apply_session_resonance(result.fact_weights, result.penalty)
-            penalized_fact_ids = list(result.fact_weights.keys())
+        with self._lock:
+            result = self._echo.detect_echo(vec)
+            penalized_fact_ids: list[str] = []
+            if result.label == "echo" and result.penalty != 0.0 and result.fact_weights:
+                self._engine.apply_session_resonance(result.fact_weights, result.penalty)
+                penalized_fact_ids = list(result.fact_weights.keys())
 
-            if self._storage:
-                affected = [
-                    self._facts[fid] for fid in penalized_fact_ids if fid in self._facts
-                ]
-                self._storage.save_facts(affected)
-                # Persist the mutated echo session (r_score + echo_penalty).
-                past = self._echo.get(result.matched_session_id)
-                if past:
-                    self._storage.save_echo_session(
-                        past.session_id,
-                        past.bundle.centroids,
-                        past.r_score,
-                        time.time(),
-                        fact_weights=past.fact_weights,
-                        echo_penalty=past.echo_penalty,
-                    )
+                if self._storage:
+                    affected = [
+                        self._facts[fid] for fid in penalized_fact_ids if fid in self._facts
+                    ]
+                    self._storage.save_facts(affected)
+                    past = self._echo.get(result.matched_session_id)
+                    if past:
+                        self._storage.save_echo_session(
+                            past.session_id,
+                            past.bundle.centroids,
+                            past.r_score,
+                            time.time(),
+                            fact_weights=past.fact_weights,
+                            echo_penalty=past.echo_penalty,
+                        )
 
-        return {
-            "echo": result.label == "echo",
-            "matched_session": result.matched_session_id,
-            "similarity": result.similarity,
-            "penalty": result.penalty,
-            "penalized_fact_ids": penalized_fact_ids,
-        }
+            return {
+                "echo": result.label == "echo",
+                "matched_session": result.matched_session_id,
+                "similarity": result.similarity,
+                "penalty": result.penalty,
+                "penalized_fact_ids": penalized_fact_ids,
+            }
 
     # ── Status ───────────────────────────────────────────────────────────────
 
     @property
     def stats(self) -> dict:
-        layers = {0: 0, 1: 0, 2: 0}
-        for f in self._facts.values():
-            layers[f.layer] = layers.get(f.layer, 0) + 1
-        return {
-            "surface": layers[0],
-            "kinetic": layers[1],
-            "core": layers[2],
-            "black_hole_mass": self._hole.mass,
-            "hawking_emissions": self._hole.total_emissions,
-            "total_live": len(self._facts),
-        }
+        with self._lock:
+            layers = {0: 0, 1: 0, 2: 0}
+            for f in self._facts.values():
+                layers[f.layer] = layers.get(f.layer, 0) + 1
+            return {
+                "surface": layers[0],
+                "kinetic": layers[1],
+                "core": layers[2],
+                "black_hole_mass": self._hole.mass,
+                "hawking_emissions": self._hole.total_emissions,
+                "total_live": len(self._facts),
+                "active_sessions": len(self._sessions),
+            }

@@ -125,6 +125,77 @@ def test_query_dedupes_attribution_within_session():
     assert mem._session_fact_ids.count(f.fact_id) == 1, "fact must appear at most once per session"
 
 
+def test_two_sessions_open_simultaneously_keep_independent_state():
+    """Interleaved messages must land in the correct session context."""
+    mem = MemoryStore()
+    mem.session_start("agent_A")
+    mem.session_start("agent_B")
+
+    mem.session_message("alpha-1", session_id="agent_A")
+    mem.session_message("beta-1",  session_id="agent_B")
+    mem.session_message("alpha-2", session_id="agent_A")
+    mem.session_message("beta-2",  session_id="agent_B")
+
+    assert mem._sessions["agent_A"].messages == ["alpha-1", "alpha-2"]
+    assert mem._sessions["agent_B"].messages == ["beta-1", "beta-2"]
+    assert mem.stats["active_sessions"] == 2
+
+    mem.session_close(session_id="agent_A")
+    mem.session_close(session_id="agent_B")
+    assert mem.stats["active_sessions"] == 0
+
+
+def test_concurrent_sessions_attribute_facts_to_the_correct_agent():
+    """Two agents racing on the same store must not cross-attribute facts."""
+    import threading
+
+    mem = MemoryStore()
+    f_a = mem.add_fact("mailer alpha", "runs on", "Go")
+    f_b = mem.add_fact("mailer beta",  "runs on", "Rust")
+    assert f_a.resonance_count == 0
+    assert f_b.resonance_count == 0
+
+    barrier = threading.Barrier(2)
+    results: dict = {}
+
+    def agent(name: str, query_text: str, closing_line: str, sid: str) -> None:
+        mem.session_start(sid)
+        mem.session_message(f"how does {query_text} work", session_id=sid)
+        mem.query(query_text, top_k=1, session_id=sid)
+        barrier.wait()
+        mem.session_message(closing_line, session_id=sid)
+        results[name] = mem.session_close(session_id=sid)
+
+    t_a = threading.Thread(
+        target=agent,
+        args=("a", "mailer alpha Go programming", "works, thanks!", "sid_A"),
+    )
+    t_b = threading.Thread(
+        target=agent,
+        args=("b", "mailer beta Rust programming", "still not working", "sid_B"),
+    )
+    t_a.start(); t_b.start()
+    t_a.join();  t_b.join()
+
+    assert results["a"]["label"] == "resonant"
+    assert results["b"]["label"] == "toxic"
+
+    # Each agent's session must have touched only its own fact.
+    assert f_a.resonance_count == 1
+    assert f_b.resonance_count == 1
+    assert f_a.resonance_sum > 0, "agent A's resonant session must raise f_a"
+    assert f_b.resonance_sum < 0, "agent B's toxic session must lower f_b"
+
+
+def test_session_message_unknown_session_raises():
+    mem = MemoryStore()
+    try:
+        mem.session_message("no session open", session_id="ghost")
+    except KeyError:
+        return
+    raise AssertionError("session_message with unknown session_id must raise")
+
+
 def test_sqlite_save_facts_batches_in_one_transaction(tmp_path):
     """save_facts must round-trip via SQLite in a single transaction."""
     from birch.storage.sqlite import SQLiteBackend

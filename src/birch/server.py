@@ -14,7 +14,6 @@ _DB_PATH = os.environ.get("BIRCH_DB", str(Path.home() / ".birch" / "memory.db"))
 Path(_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 _store = MemoryStore(db_path=_DB_PATH)
-_active_sessions: dict[str, str] = {}   # agent_id → session_id
 
 mcp = FastMCP("BirchKM")
 
@@ -78,11 +77,14 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
 
     Returns: label, r_score, migrations, absorbed count.
     """
+    # Every record_session call gets its own session_id and threads it
+    # through every store call, so concurrent agents never share active
+    # session state.
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)
     for msg in messages:
-        _store.session_message(msg)
-    summary = _store.session_close()
+        _store.session_message(msg, session_id=session_id)
+    summary = _store.session_close(session_id=session_id)
     return {
         "session_id": session_id,
         "label": summary.get("label"),
