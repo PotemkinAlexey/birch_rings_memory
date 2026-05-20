@@ -57,10 +57,10 @@ def score_semantic_shift(
     # - stayed on same topic but got specific → good
     # - stayed on same topic, same vagueness → stuck
     if start_vector and end_vector:
-        if cosine > 0.85 and specificity_delta < 0.05:
+        if cosine > 0.75 and specificity_delta < 0.05:
             # High similarity, no specificity gain = stuck
             combined = -0.4
-        elif cosine > 0.85 and specificity_delta >= 0.05:
+        elif cosine > 0.75 and specificity_delta >= 0.05:
             # High similarity but specificity grew = productive narrowing
             combined = +0.6
         else:

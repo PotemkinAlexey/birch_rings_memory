@@ -1,29 +1,33 @@
-"""Session Closure Detector — combines behavioral and semantic signals into R score."""
+"""Session Closure Detector — combines behavioral, semantic, repetition into R score."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from .behavioral import score_session_decay
 from .semantic import SemanticScore, score_semantic_shift
+from .repetition import RepetitionScore, score_repetition
 
 
 @dataclass
 class ResonanceResult:
     behavioral_score: float     # -1.0 … +1.0
     semantic_score: float       # -1.0 … +1.0
+    repetition_score: float     # -1.0 … 0.0
     r: float                    # final resonance index -1.0 … +1.0
     label: str                  # "resonant" | "neutral" | "toxic"
 
 
-# Weights — behavioral carries more because it's more reliable without embeddings
-_W_BEHAVIORAL = 0.65
-_W_SEMANTIC = 0.35
+# Weights
+_W_BEHAVIORAL = 0.55
+_W_SEMANTIC = 0.25
+_W_REPETITION = 0.20
 
 
 def compute_resonance(
     messages: list[str],
     start_vector: list[float] | None = None,
     end_vector: list[float] | None = None,
+    all_vectors: list[list[float]] | None = None,
 ) -> ResonanceResult:
     """
     Compute resonance index R for a completed session.
@@ -32,12 +36,13 @@ def compute_resonance(
         messages:     All user messages in the session (chronological).
         start_vector: Embedding of the first message (optional).
         end_vector:   Embedding of the last message (optional).
+        all_vectors:  Embeddings of all messages for repetition detection (optional).
 
     Returns:
         ResonanceResult with R in [-1.0, +1.0].
     """
     if not messages:
-        return ResonanceResult(0.0, 0.0, 0.0, "neutral")
+        return ResonanceResult(0.0, 0.0, 0.0, 0.0, "neutral")
 
     behavioral = score_session_decay(messages)
 
@@ -49,12 +54,15 @@ def compute_resonance(
     )
     semantic = semantic_result.score
 
-    r = _W_BEHAVIORAL * behavioral + _W_SEMANTIC * semantic
+    repetition_result: RepetitionScore = score_repetition(all_vectors or [])
+    repetition = repetition_result.score
+
+    r = _W_BEHAVIORAL * behavioral + _W_SEMANTIC * semantic + _W_REPETITION * repetition
     r = max(-1.0, min(1.0, r))
 
     if r > 0.35:
         label = "resonant"
-    elif r < -0.2:
+    elif r < -0.15:
         label = "toxic"
     else:
         label = "neutral"
@@ -62,6 +70,7 @@ def compute_resonance(
     return ResonanceResult(
         behavioral_score=behavioral,
         semantic_score=semantic,
+        repetition_score=repetition,
         r=round(r, 3),
         label=label,
     )

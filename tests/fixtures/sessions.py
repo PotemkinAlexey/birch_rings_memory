@@ -61,4 +61,25 @@ SESSIONS = [
         ],
         "expected_label": "toxic",
     },
+    # Hard cases — no obvious positive/negative keywords, embeddings should help
+    {
+        "name": "hard_topic_shift",
+        "description": "User moves from vague to concrete — productive narrowing, no keywords",
+        "messages": [
+            "у меня проблема с производительностью",
+            "запросы медленные",
+            "окей нашел — индекс отсутствовал на foreign key, добавил",
+        ],
+        "expected_label": "resonant",
+    },
+    {
+        "name": "hard_circular",
+        "description": "User rephrases same vague question without progress",
+        "messages": [
+            "как улучшить производительность системы",
+            "что можно сделать для производительности",
+            "какие есть способы повысить производительность",
+        ],
+        "expected_label": "toxic",
+    },
 ]
