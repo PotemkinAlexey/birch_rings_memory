@@ -15,7 +15,7 @@ from .resonance.echo import EchoStore
 from .resonance.embeddings import embed, embed_batch
 from .resonance.cluster import bundle as _bundle, ClusterBundle
 from .resonance.echo import StoredSession
-from .storage import Storage
+from .storage import StorageBackend, SQLiteBackend
 
 
 # Gravity floor — facts below this after tick fall into the black hole
@@ -49,12 +49,22 @@ class MemoryStore:
      -1 — black hole (gravity < 0.10 after tick, absorbed)
     """
 
-    def __init__(self, echo_k: int = 2, db_path: Optional[str | Path] = None) -> None:
+    def __init__(
+        self,
+        echo_k: int = 2,
+        db_path: Optional[str | Path] = None,
+        storage: Optional[StorageBackend] = None,
+    ) -> None:
         self._engine = GravityEngine()
         self._hole = BlackHole()
         self._echo = EchoStore(default_k=echo_k)
         self._facts: dict[str, FactPassport] = {}
-        self._storage: Optional[Storage] = Storage(db_path) if db_path else None
+        if storage is not None:
+            self._storage: Optional[StorageBackend] = storage
+        elif db_path is not None:
+            self._storage = SQLiteBackend(db_path)
+        else:
+            self._storage = None
 
         # Active session tracking
         self._session_messages: list[str] = []
