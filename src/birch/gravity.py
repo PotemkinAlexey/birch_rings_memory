@@ -99,11 +99,26 @@ class GravityEngine:
         """Record a dependency edge — increases graph degree of to_id."""
         self._degrees[to_id] = self._degrees.get(to_id, 0) + 1
 
-    def apply_session_resonance(self, fact_ids: list[str], r: float) -> None:
-        """After a session closes, propagate its R to all facts it used."""
-        for fid in fact_ids:
-            if fid in self._facts:
-                self._facts[fid].apply_resonance(r)
+    def apply_session_resonance(self, facts, r: float) -> None:
+        """Propagate a session's R to the facts it touched.
+
+        ``facts`` may be either:
+          - a list[str] of fact_ids (legacy, uniform weight 1.0)
+          - a dict[str, float] of fact_id → relevance weight ∈ [0, 1]
+
+        Per-fact weighting is the right primitive: an irrelevant
+        low-similarity fact that happened to be returned by query
+        gets a tiny resonance bump, while a high-similarity fact
+        the agent actually leaned on gets the full session R.
+        """
+        if isinstance(facts, dict):
+            for fid, weight in facts.items():
+                if fid in self._facts:
+                    self._facts[fid].apply_resonance(r * float(weight))
+        else:
+            for fid in facts:
+                if fid in self._facts:
+                    self._facts[fid].apply_resonance(r)
 
     def tick(self, now: float | None = None) -> list[tuple[str, int]]:
         """

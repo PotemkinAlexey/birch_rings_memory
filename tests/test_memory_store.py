@@ -147,6 +147,51 @@ def test_sqlite_save_facts_batches_in_one_transaction(tmp_path):
     assert by_id[f3.fact_id].gravity_score == 0.13
 
 
+def test_query_attribution_uses_similarity_as_weight():
+    """C5: facts returned with high similarity weigh more than near-noise hits."""
+    mem = MemoryStore()
+    f_relevant = mem.add_fact("mailer service", "runs on", "Go")
+    f_unrelated = mem.add_fact("siamese cat", "fur color", "cream")
+
+    mem.session_start("s_weight")
+    mem.query("mailer service Go programming language", top_k=2)
+
+    assert f_relevant.fact_id in mem._session_facts
+    assert f_unrelated.fact_id in mem._session_facts
+    w_rel = mem._session_facts[f_relevant.fact_id]
+    w_unr = mem._session_facts[f_unrelated.fact_id]
+    assert w_rel > w_unr, f"relevant fact must outweigh noise: {w_rel} vs {w_unr}"
+    assert 0.0 <= w_unr <= w_rel <= 1.0
+
+
+def test_add_fact_pins_weight_to_one():
+    """Explicit add_fact during a session must pin weight=1.0."""
+    mem = MemoryStore()
+    mem.session_start("s_pin")
+    f = mem.add_fact("mailer service", "runs on", "Go")
+    assert mem._session_facts[f.fact_id] == 1.0
+
+
+def test_weighted_resonance_propagates_proportionally():
+    """A high-weight fact must receive more resonance than a low-weight one."""
+    mem = MemoryStore()
+    f_relevant = mem.add_fact("mailer service", "runs on", "Go")
+    f_unrelated = mem.add_fact("siamese cat", "fur color", "cream")
+
+    mem.session_start("s_prop")
+    mem.query("mailer service Go programming language", top_k=2)
+    mem.session_message("how do I configure the mailer service")
+    mem.session_message("works, thanks!")
+    summary = mem.session_close()
+    assert summary["label"] == "resonant"
+
+    # Both received some resonance, but the relevant fact should have received
+    # strictly more (positive R × bigger weight).
+    assert f_relevant.resonance_sum > f_unrelated.resonance_sum
+    assert f_relevant.resonance_count == 1
+    assert f_unrelated.resonance_count == 1
+
+
 def test_add_fact_dedupes_identical_triples():
     """Re-adding the same SPO triple should not create a duplicate fact."""
     mem = MemoryStore()

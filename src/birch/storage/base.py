@@ -41,7 +41,7 @@ class StorageBackend(Protocol):
         centroids: list[list[float]],
         r_score: float,
         recorded_at: float,
-        fact_ids: list[str] | None = None,
+        fact_weights: dict[str, float] | None = None,
         echo_penalty: float = 0.0,
     ) -> None: ...
 

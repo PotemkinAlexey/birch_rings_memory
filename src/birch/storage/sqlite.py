@@ -134,9 +134,13 @@ class SQLiteBackend:
         centroids: list[list[float]],
         r_score: float,
         recorded_at: float,
-        fact_ids: list[str] | None = None,
+        fact_weights: dict[str, float] | None = None,
         echo_penalty: float = 0.0,
     ) -> None:
+        # The on-disk column is still named ``fact_ids`` for backward
+        # compatibility, but its JSON payload is now a {fact_id: weight}
+        # dict. The loader accepts both shapes.
+        payload = dict(fact_weights or {})
         self._conn.execute(
             "INSERT OR REPLACE INTO echo_sessions "
             "(session_id, centroids, r_score, recorded_at, fact_ids, echo_penalty) "
@@ -146,7 +150,7 @@ class SQLiteBackend:
                 json.dumps(centroids),
                 r_score,
                 recorded_at,
-                json.dumps(list(fact_ids or [])),
+                json.dumps(payload),
                 echo_penalty,
             ),
         )
@@ -158,15 +162,22 @@ class SQLiteBackend:
         for r in rows:
             raw_fact_ids = r["fact_ids"] if "fact_ids" in r.keys() else None
             try:
-                fact_ids = json.loads(raw_fact_ids) if raw_fact_ids else []
+                parsed = json.loads(raw_fact_ids) if raw_fact_ids else {}
             except (TypeError, ValueError):
-                fact_ids = []
+                parsed = {}
+            if isinstance(parsed, list):
+                # Legacy rows stored just the ids — treat them as uniform weight 1.0.
+                fact_weights = {fid: 1.0 for fid in parsed}
+            elif isinstance(parsed, dict):
+                fact_weights = {fid: float(w) for fid, w in parsed.items()}
+            else:
+                fact_weights = {}
             out.append({
                 "session_id": r["session_id"],
                 "centroids": json.loads(r["centroids"]),
                 "r_score": r["r_score"],
                 "recorded_at": r["recorded_at"],
-                "fact_ids": fact_ids,
+                "fact_weights": fact_weights,
                 "echo_penalty": r["echo_penalty"] if "echo_penalty" in r.keys() else 0.0,
             })
         return out

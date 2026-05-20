@@ -64,13 +64,37 @@ class MemoryStore:
         # Active session tracking
         self._session_messages: list[str] = []
         self._session_vectors: list[list[float]] = []
-        self._session_fact_ids: list[str] = []
+        # fact_id → relevance weight in [0, 1] for this session.
+        # We keep the MAX similarity observed across all queries that
+        # returned each fact; explicit add_fact calls pin weight=1.0.
+        self._session_facts: dict[str, float] = {}
         self._session_id: Optional[str] = None
 
         if self._storage:
             self._load_from_storage()
 
     # ── Storage bootstrap ────────────────────────────────────────────────────
+
+    # Back-compat shim — older tests and callers read/write this as a list.
+    @property
+    def _session_fact_ids(self) -> list[str]:
+        return list(self._session_facts.keys())
+
+    @_session_fact_ids.setter
+    def _session_fact_ids(self, value) -> None:
+        if isinstance(value, dict):
+            self._session_facts = {fid: float(w) for fid, w in value.items()}
+        else:
+            self._session_facts = {fid: 1.0 for fid in value}
+
+    def _attribute_fact(self, fact_id: str, weight: float) -> None:
+        """Tag a fact to the active session, keeping the max weight seen."""
+        if not self._session_id:
+            return
+        clipped = max(0.0, min(1.0, float(weight)))
+        prev = self._session_facts.get(fact_id, 0.0)
+        if clipped > prev:
+            self._session_facts[fact_id] = clipped
 
     @staticmethod
     def _normalize_spo(subject: str, predicate: str, obj: str) -> tuple[str, str, str]:
@@ -97,7 +121,7 @@ class MemoryStore:
                 session_id=row["session_id"],
                 bundle=cb,
                 r_score=row["r_score"],
-                fact_ids=list(row.get("fact_ids", [])),
+                fact_weights=dict(row.get("fact_weights", {})),
                 echo_penalty=row.get("echo_penalty", 0.0),
             )
 
@@ -126,8 +150,7 @@ class MemoryStore:
             existing.touch()
             if self._storage:
                 self._storage.save_fact(existing)
-            if self._session_id and existing_id not in self._session_fact_ids:
-                self._session_fact_ids.append(existing_id)
+            self._attribute_fact(existing_id, 1.0)
             return existing
 
         fact = FactPassport(
@@ -144,8 +167,7 @@ class MemoryStore:
         self._spo_index[key] = fact.fact_id
         if self._storage:
             self._storage.save_fact(fact)
-        if self._session_id:
-            self._session_fact_ids.append(fact.fact_id)
+        self._attribute_fact(fact.fact_id, 1.0)
         return fact
 
     def link(self, from_id: str, to_id: str) -> None:
@@ -170,7 +192,7 @@ class MemoryStore:
         self._session_id = session_id
         self._session_messages = []
         self._session_vectors = []
-        self._session_fact_ids = []
+        self._session_facts = {}
 
     def session_message(self, text: str) -> None:
         """Record a user message in the current session."""
@@ -193,22 +215,24 @@ class MemoryStore:
             all_vectors=vecs,
         )
 
-        # Propagate R to all facts used in this session
-        self._engine.apply_session_resonance(self._session_fact_ids, result.r)
+        # Propagate R to facts used in this session, weighted by how
+        # relevant each fact was to the session's queries.
+        self._engine.apply_session_resonance(self._session_facts, result.r)
 
         # Touch facts that were accessed
-        for fid in self._session_fact_ids:
+        for fid in self._session_facts:
             if fid in self._facts:
                 self._facts[fid].touch()
 
-        # Register session in echo store with the fact_ids it touched —
-        # required so future echoes can apply a retroactive gravity penalty.
+        # Register session in echo store with the fact weights it touched —
+        # required so future echoes can apply a retroactive gravity penalty
+        # scaled by how relevant each fact was.
         if self._session_id and vecs:
             self._echo.record(
                 self._session_id,
                 vecs,
                 result.r,
-                fact_ids=list(self._session_fact_ids),
+                fact_weights=dict(self._session_facts),
             )
             if self._storage:
                 session_obj = self._echo.get(self._session_id)
@@ -218,7 +242,7 @@ class MemoryStore:
                         session_obj.bundle.centroids,
                         session_obj.r_score,
                         time.time(),
-                        fact_ids=session_obj.fact_ids,
+                        fact_weights=session_obj.fact_weights,
                         echo_penalty=session_obj.echo_penalty,
                     )
 
@@ -241,7 +265,7 @@ class MemoryStore:
         self._session_id = None
         self._session_messages = []
         self._session_vectors = []
-        self._session_fact_ids = []
+        self._session_facts = {}
 
         return summary
 
@@ -335,12 +359,12 @@ class MemoryStore:
         top = results[:top_k]
 
         # Attribution + touch — only on what the caller actually receives.
-        seen = set(self._session_fact_ids)
+        # Weight is the similarity itself (clipped to [0, 1]); a fact
+        # returned with cosine 0.95 ends up nine times more sensitive
+        # to the session R than one returned at 0.10.
         for r in top:
             r.fact.touch()
-            if self._session_id and r.fact.fact_id not in seen:
-                self._session_fact_ids.append(r.fact.fact_id)
-                seen.add(r.fact.fact_id)
+            self._attribute_fact(r.fact.fact_id, r.similarity)
 
         return top
 
@@ -357,9 +381,9 @@ class MemoryStore:
         result = self._echo.detect_echo(vec)
 
         penalized_fact_ids: list[str] = []
-        if result.label == "echo" and result.penalty != 0.0 and result.fact_ids:
-            self._engine.apply_session_resonance(result.fact_ids, result.penalty)
-            penalized_fact_ids = list(result.fact_ids)
+        if result.label == "echo" and result.penalty != 0.0 and result.fact_weights:
+            self._engine.apply_session_resonance(result.fact_weights, result.penalty)
+            penalized_fact_ids = list(result.fact_weights.keys())
 
             if self._storage:
                 affected = [
@@ -374,7 +398,7 @@ class MemoryStore:
                         past.bundle.centroids,
                         past.r_score,
                         time.time(),
-                        fact_ids=past.fact_ids,
+                        fact_weights=past.fact_weights,
                         echo_penalty=past.echo_penalty,
                     )
 

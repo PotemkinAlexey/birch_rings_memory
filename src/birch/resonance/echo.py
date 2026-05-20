@@ -12,9 +12,13 @@ class StoredSession:
     session_id: str
     bundle: ClusterBundle           # K centroids representing session topics
     r_score: float                  # resonance at close time
-    fact_ids: list[str] = field(default_factory=list)   # facts touched by this session
+    fact_weights: dict[str, float] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
     echo_penalty: float = 0.0      # applied retroactively if echo detected
+
+    @property
+    def fact_ids(self) -> list[str]:
+        return list(self.fact_weights.keys())
 
 
 @dataclass
@@ -23,7 +27,11 @@ class EchoResult:
     similarity: float
     penalty: float          # 0.0 or negative — applied to matched session
     label: str              # "echo" | "clean" | "no_history"
-    fact_ids: list[str] = field(default_factory=list)   # facts of the matched session
+    fact_weights: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def fact_ids(self) -> list[str]:
+        return list(self.fact_weights.keys())
 
 
 # Similarity threshold above which we consider it a return to the same problem
@@ -43,20 +51,22 @@ class EchoStore:
         all_vectors: list[list[float]],
         r_score: float,
         k: int | None = None,
-        fact_ids: list[str] | None = None,
+        fact_weights: dict[str, float] | None = None,
     ) -> ClusterBundle:
         """
         Store session as a bundle of K centroids.
 
         K is auto-reduced if session has fewer messages than K.
-        Returns the computed bundle (useful for inspection/testing).
+        ``fact_weights`` maps fact_id → relevance weight ∈ [0, 1]; it
+        is what future echoes use to apply a retroactive penalty to
+        gravity, scaled by how relevant each fact actually was.
         """
         b = _bundle(all_vectors, k=k or self._k)
         self._sessions[session_id] = StoredSession(
             session_id=session_id,
             bundle=b,
             r_score=r_score,
-            fact_ids=list(fact_ids or []),
+            fact_weights=dict(fact_weights or {}),
         )
         return b
 
@@ -89,7 +99,7 @@ class EchoStore:
                 similarity=round(best_sim, 4),
                 penalty=0.0,
                 label="echo",
-                fact_ids=list(past.fact_ids),
+                fact_weights=dict(past.fact_weights),
             )
 
         # Past session seemed resonant but user returned — strongest signal of false closure
@@ -109,7 +119,7 @@ class EchoStore:
             similarity=round(best_sim, 4),
             penalty=penalty,
             label="echo",
-            fact_ids=list(past.fact_ids),
+            fact_weights=dict(past.fact_weights),
         )
 
     def get(self, session_id: str) -> StoredSession | None:
