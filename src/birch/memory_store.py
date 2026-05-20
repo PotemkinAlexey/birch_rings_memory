@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,10 @@ from .resonance.echo import EchoStore
 from .resonance.embeddings import embed
 from .resonance.cluster import ClusterBundle
 from .resonance.echo import StoredSession
+from .singularity_compactor import (
+    CollapseReport,
+    collapse_singularity,
+)
 from .storage import StorageBackend, SQLiteBackend
 from .vector_index import VectorIndex
 
@@ -80,14 +85,31 @@ class MemoryStore:
     # Max neighbours considered per new fact to keep startup cost linear.
     AUTO_LINK_TOP_K: int = 5
 
+    # Background collapse triggers — once both are satisfied, queue a
+    # gravitational collapse pass on the singularity.
+    COLLAPSE_FACT_MASS_TRIGGER: int = 100     # min absolute fact_mass
+    COLLAPSE_DELTA_TRIGGER: int = 50          # min absorbed-since-last-collapse
+
     def __init__(
         self,
         echo_k: int = 2,
         db_path: Optional[str | Path] = None,
         storage: Optional[StorageBackend] = None,
         auto_link: bool = True,
+        collapse_threshold: float = 0.92,
+        collapse_min_group_size: int = 2,
+        collapse_async: bool = True,
     ) -> None:
         self._auto_link = auto_link
+        # Collapse configuration — knobs the operator can tune per deployment.
+        self._collapse_threshold = collapse_threshold
+        self._collapse_min_group_size = collapse_min_group_size
+        self._collapse_async = collapse_async
+        self._collapse_counter = 0       # facts absorbed since last collapse
+        self._last_collapse_at: Optional[float] = None
+        self._total_collapses = 0
+        self._collapse_executor: Optional[ThreadPoolExecutor] = None
+        self._inflight_collapse: Optional[Future] = None
         self._engine = GravityEngine()
         self._hole = BlackHole()
         self._echo = EchoStore(default_k=echo_k)
@@ -458,6 +480,10 @@ class MemoryStore:
                 if self._meta_facts and hasattr(self._storage, "save_meta_facts"):
                     self._storage.save_meta_facts(list(self._meta_facts.values()))
 
+            # Counter-triggered collapse. Held inside the lock so the
+            # collapse counter and the trigger decision are consistent.
+            self._maybe_trigger_collapse_locked(len(absorbed))
+
             summary = {
                 "session_id": sid,
                 "r": result.r,
@@ -509,6 +535,86 @@ class MemoryStore:
                     self._storage.save_meta_fact(meta)
                 absorbed.append(mid)
         return absorbed
+
+    # ── Collapse orchestration ──────────────────────────────────────────────
+
+    def collapse_singularity(
+        self,
+        threshold: Optional[float] = None,
+        min_group_size: Optional[int] = None,
+        persist: bool = True,
+    ) -> CollapseReport:
+        """Synchronous compactor pass — usable from tests, jobs, or by hand.
+
+        Holds the store lock for the duration. Returns the CollapseReport
+        even if nothing was collapsed, so the caller can log it.
+        """
+        thr = self._collapse_threshold if threshold is None else threshold
+        mgs = self._collapse_min_group_size if min_group_size is None else min_group_size
+        with self._lock:
+            new_metas, report = collapse_singularity(
+                self._hole, threshold=thr, min_group_size=mgs,
+            )
+            if persist and self._storage and hasattr(self._storage, "save_meta_facts"):
+                self._storage.save_meta_facts(new_metas)
+                # The absorbed FactPassports are gone from the live store and
+                # were never persisted as "absorbed" — but if storage was
+                # tracking them as deleted-on-absorb, we should drop them now.
+                for meta in new_metas:
+                    for fid in meta.source_fact_ids:
+                        if hasattr(self._storage, "delete_fact"):
+                            self._storage.delete_fact(fid)
+            self._last_collapse_at = time.time()
+            self._total_collapses += 1
+            self._collapse_counter = 0
+            return report
+
+    def _maybe_trigger_collapse_locked(self, absorbed_count: int) -> None:
+        """Caller must hold self._lock. Schedules collapse if thresholds met."""
+        self._collapse_counter += absorbed_count
+        if self._hole.fact_mass < self.COLLAPSE_FACT_MASS_TRIGGER:
+            return
+        if self._collapse_counter < self.COLLAPSE_DELTA_TRIGGER:
+            return
+        # Skip if a previous collapse is still running.
+        if self._inflight_collapse is not None and not self._inflight_collapse.done():
+            return
+        if not self._collapse_async:
+            self.collapse_singularity()
+            return
+        if self._collapse_executor is None:
+            self._collapse_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="birch-collapse",
+            )
+        self._inflight_collapse = self._collapse_executor.submit(
+            self.collapse_singularity,
+        )
+
+    def close(self) -> None:
+        """Release the background executor and close the storage layer.
+
+        We must NOT wait for inflight collapse or call ``shutdown(wait=True)``
+        while holding ``self._lock`` — the worker thread acquires the same
+        lock from inside ``collapse_singularity``, so blocking on it while
+        holding it would deadlock. Snapshot the handles under the lock, then
+        wait outside it.
+        """
+        with self._lock:
+            inflight = self._inflight_collapse
+            executor = self._collapse_executor
+            storage = self._storage
+            self._inflight_collapse = None
+            self._collapse_executor = None
+
+        if inflight is not None:
+            try:
+                inflight.result(timeout=5.0)
+            except Exception:
+                pass
+        if executor is not None:
+            executor.shutdown(wait=True)
+        if storage is not None and hasattr(storage, "close"):
+            storage.close()
 
     def _drop_from_spo_index(self, fact: FactPassport) -> None:
         key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
@@ -700,4 +806,7 @@ class MemoryStore:
                 "total_live_metas": len(self._meta_facts),
                 "meta_layers": meta_layers,
                 "active_sessions": len(self._sessions),
+                "collapse_counter": self._collapse_counter,
+                "total_collapses": self._total_collapses,
+                "last_collapse_at": self._last_collapse_at,
             }
