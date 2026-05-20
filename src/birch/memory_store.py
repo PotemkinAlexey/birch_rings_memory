@@ -59,6 +59,8 @@ class MemoryStore:
         self._hole = BlackHole()
         self._echo = EchoStore(default_k=echo_k)
         self._facts: dict[str, FactPassport] = {}
+        # Normalised SPO → fact_id, for cheap duplicate detection in add_fact.
+        self._spo_index: dict[tuple[str, str, str], str] = {}
         if storage is not None:
             self._storage: Optional[StorageBackend] = storage
         elif db_path is not None:
@@ -77,10 +79,21 @@ class MemoryStore:
 
     # ── Storage bootstrap ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_spo(subject: str, predicate: str, obj: str) -> tuple[str, str, str]:
+        return (
+            " ".join(subject.lower().split()),
+            " ".join(predicate.lower().split()),
+            " ".join(obj.lower().split()),
+        )
+
     def _load_from_storage(self) -> None:
         for fact in self._storage.load_facts():
             self._facts[fact.fact_id] = fact
             self._engine.register(fact)
+            if not fact.is_deprecated:
+                key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
+                self._spo_index.setdefault(key, fact.fact_id)
         for from_id, to_id in self._storage.load_edges():
             self._engine.link(from_id, to_id)
         for row in self._storage.load_echo_sessions():
@@ -103,7 +116,26 @@ class MemoryStore:
         obj: str,
         layer: int = 1,
     ) -> FactPassport:
-        """Create, embed, and register a new fact."""
+        """
+        Create, embed, and register a new fact.
+
+        If an identical (case-insensitive, whitespace-normalised) SPO triple
+        already lives in the store, return the existing fact instead of
+        creating a duplicate. The existing fact is touched and attributed
+        to the active session, so the caller's intent (it was used here)
+        still propagates to gravity.
+        """
+        key = self._normalize_spo(subject, predicate, obj)
+        existing_id = self._spo_index.get(key)
+        if existing_id and existing_id in self._facts:
+            existing = self._facts[existing_id]
+            existing.touch()
+            if self._storage:
+                self._storage.save_fact(existing)
+            if self._session_id and existing_id not in self._session_fact_ids:
+                self._session_fact_ids.append(existing_id)
+            return existing
+
         fact = FactPassport(
             subject=subject,
             predicate=predicate,
@@ -114,6 +146,7 @@ class MemoryStore:
         fact.vector = embed(f"{subject} {predicate} {obj}")
         self._facts[fact.fact_id] = fact
         self._engine.register(fact)
+        self._spo_index[key] = fact.fact_id
         if self._storage:
             self._storage.save_fact(fact)
         if self._session_id:
@@ -127,9 +160,14 @@ class MemoryStore:
 
     def deprecate(self, old_id: str, new_id: str) -> None:
         if old_id in self._facts:
-            self._facts[old_id].deprecated_by = new_id
+            old = self._facts[old_id]
+            old.deprecated_by = new_id
+            # A deprecated fact is no longer the canonical bearer of its SPO.
+            key = self._normalize_spo(old.subject, old.predicate, old.object)
+            if self._spo_index.get(key) == old_id:
+                del self._spo_index[key]
             if self._storage:
-                self._storage.save_fact(self._facts[old_id])
+                self._storage.save_fact(old)
 
     # ── Session lifecycle ────────────────────────────────────────────────────
 
@@ -220,14 +258,21 @@ class MemoryStore:
             if fact.is_deprecated or fact.is_expired:
                 self._hole.absorb(fact)
                 del self._facts[fid]
+                self._drop_from_spo_index(fact)
                 absorbed.append(fid)
             elif fact.gravity_score < _ABSORPTION_THRESHOLD:
                 self._hole.absorb(fact)
                 del self._facts[fid]
+                self._drop_from_spo_index(fact)
                 if self._storage:
                     self._storage.delete_fact(fid)
                 absorbed.append(fid)
         return absorbed
+
+    def _drop_from_spo_index(self, fact: FactPassport) -> None:
+        key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
+        if self._spo_index.get(key) == fact.fact_id:
+            del self._spo_index[key]
 
     # ── Retrieval ────────────────────────────────────────────────────────────
 
@@ -276,6 +321,9 @@ class MemoryStore:
                 sim = _cosine(vec, fact.vector)
                 self._facts[fact.fact_id] = fact
                 self._engine.register(fact)
+                if not fact.is_deprecated:
+                    key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
+                    self._spo_index.setdefault(key, fact.fact_id)
                 if self._storage:
                     self._storage.save_fact(fact)
                 results.append(QueryResult(

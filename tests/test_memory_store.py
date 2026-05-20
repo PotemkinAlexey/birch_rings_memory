@@ -125,6 +125,47 @@ def test_query_dedupes_attribution_within_session():
     assert mem._session_fact_ids.count(f.fact_id) == 1, "fact must appear at most once per session"
 
 
+def test_add_fact_dedupes_identical_triples():
+    """Re-adding the same SPO triple should not create a duplicate fact."""
+    mem = MemoryStore()
+    a = mem.add_fact("user", "prefers", "dark mode")
+    initial_access = a.access_count
+    b = mem.add_fact("user", "prefers", "dark mode")
+    assert a.fact_id == b.fact_id, "identical SPO must collapse to one fact"
+    assert mem.stats["total_live"] == 1
+    assert b.access_count > initial_access, "dedupe path must still touch the fact"
+
+
+def test_add_fact_dedupe_is_case_and_whitespace_insensitive():
+    mem = MemoryStore()
+    a = mem.add_fact("User",  "Prefers", "dark mode")
+    b = mem.add_fact("user ", "prefers", "DARK   MODE")
+    assert a.fact_id == b.fact_id
+
+
+def test_add_fact_dedupe_attributes_to_active_session():
+    mem = MemoryStore()
+    a = mem.add_fact("user", "prefers", "dark mode")
+
+    mem.session_start("s_dedup_attr")
+    b = mem.add_fact("user", "prefers", "dark mode")
+    assert a.fact_id == b.fact_id
+    assert mem._session_fact_ids == [a.fact_id], (
+        "dedupe path must still attribute the fact to the active session"
+    )
+
+
+def test_deprecated_fact_frees_spo_slot():
+    """A deprecated fact must not block a new fact with the same SPO."""
+    mem = MemoryStore()
+    old = mem.add_fact("mailer", "runs on", "Python")
+    new_replacement = mem.add_fact("mailer", "runs on", "Go")
+    mem.deprecate(old.fact_id, new_replacement.fact_id)
+
+    revived = mem.add_fact("mailer", "runs on", "Python")
+    assert revived.fact_id != old.fact_id, "deprecated fact must release its SPO slot"
+
+
 def test_echo_drags_down_gravity_of_misleading_facts():
     """Fix #2: when echo is detected, facts of the past session lose resonance."""
     mem = MemoryStore()
