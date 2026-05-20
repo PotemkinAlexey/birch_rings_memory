@@ -61,6 +61,12 @@ Interpret the response by `gravity_score`:
 
 Do not summarize retrieved facts without stating the source layer and gravity.
 
+Every fact returned by `query_memory` is attributed to the current session
+proportionally to its similarity. A fact returned at cosine 0.95 absorbs
+nearly the full session R; a fact returned at 0.10 absorbs almost none.
+You can ask for a broad `top_k` without worrying that low-similarity noise
+will significantly tilt the gravity of unrelated facts.
+
 ---
 
 ## Writing facts
@@ -94,6 +100,14 @@ Search before writing. If `query_memory` returns a fact with `similarity > 0.85`
 covering the same ground — do not duplicate. Facts compete by gravity; duplicates
 dilute the signal.
 
+BirchKM enforces this at the store level too: identical SPO triples
+(case-insensitive, whitespace-normalised) collapse to a single fact, so a
+duplicate `record_fact` returns the existing `fact_id` and touches it instead
+of creating a new record. The returned `gravity_score` reflects the existing
+fact's current value; `access_count` will have incremented by one. That is a
+safety net, not a license — still search before writing, since paraphrases
+(`"runs on" Go` vs `"is written in" Go`) will not be de-duped automatically.
+
 ---
 
 ## Session scoring
@@ -122,8 +136,17 @@ pattern means the memory itself may be misleading you.
 
 ## Echo signal
 
-The system detects when a user returns to an unresolved problem. When
-`record_session` returns a `toxic` label on a topic you have seen before,
+The system detects when a user returns to an unresolved problem. Echo is
+checked at `check_echo` time and also implicitly whenever a new session
+opens on a topic close to a closed one (`similarity ≥ 0.68`). On a hit:
+
+- The matched past session's R score is pulled into toxic territory.
+- The retroactive penalty is propagated to the gravity of every fact that
+  past session touched, scaled by each fact's per-session relevance weight.
+- The store records that the penalty was applied, so a second echo on the
+  same matched session does not stack penalties.
+
+When `record_session` returns a `toxic` label on a topic you have seen before,
 treat it as an echo:
 
 - Do not repeat the same answer
@@ -173,6 +196,8 @@ Interpret:
   need fresh input
 - `hawking_emissions` non-zero — dead facts are being retrieved; the store
   may contain outdated information that keeps resurfacing
+- `active_sessions` > 0 after all agents have closed — a session was opened
+  but `record_session` was never called; that context is leaking state
 
 ---
 

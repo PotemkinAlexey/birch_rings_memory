@@ -42,7 +42,7 @@ subject       "mailer service"
 predicate     "runs on"
 object        "Go"
 ─────────────────────────────
-fact_id       uuid[:8]
+fact_id       full uuid4
 vector        [768-dim float]   nomic-embed-text embedding of "s p o"
 gravity_score 0.5               starts neutral, drifts with sessions
 layer         1                 0=surface 1=kinetic 2=core -1=black_hole
@@ -55,6 +55,15 @@ resonance_count number of contributing sessions
 source_session session_id that created this fact
 deprecated_by  fact_id of the successor (if superseded)
 ```
+
+### SPO deduplication
+
+`MemoryStore` keeps a `_spo_index: dict[(subject, predicate, object), fact_id]`
+keyed on case- and whitespace-normalised triples. A repeated `add_fact` for an
+existing triple returns the original `FactPassport`, bumps `access_count`, and
+re-attributes the fact to the calling session — instead of creating a parallel
+record that would dilute its gravity. The index is rebuilt from storage on
+startup and is updated on deprecation and on black-hole absorption.
 
 ---
 
@@ -174,6 +183,26 @@ R is propagated to all facts accessed during the session via
 `apply_session_resonance()`, which updates `resonance_sum` and
 `resonance_count`.
 
+### Per-fact weighting
+
+`apply_session_resonance()` accepts a `dict[fact_id → weight]`. The weight
+is the maximum cosine similarity at which the fact appeared inside the
+session (1.0 for facts created or re-confirmed via `record_fact`, similarity
+for facts returned by `query`). The contribution is:
+
+```
+fact.resonance_sum   += R × weight   # scaled contribution accumulates
+fact.resonance_count += 1            # counts sessions, not weighted sessions
+```
+
+`avg_resonance = resonance_sum / resonance_count` is therefore the mean of
+per-session weighted contributions `(R × w)` — not a true weighted average
+of R scores, but it is bounded to `[-1, +1]` and correctly discounts
+low-similarity matches: a fact at cosine 0.10 contributes 10× less to
+`resonance_sum` per session than one at cosine 1.0, while both increment
+`resonance_count` by 1. Legacy callers that pass a flat `list[fact_id]`
+still work — every weight defaults to 1.0.
+
 ---
 
 ## Echo validation
@@ -185,9 +214,10 @@ covered both "auth" and "deployment" won't miss an echo on either sub-topic.
 ```
 EchoStore
   session_id → StoredSession
-                  bundle: ClusterBundle   (K centroids, cosine K-means++)
-                  r_score: float          (retroactively mutable)
-                  echo_penalty: float
+                  bundle:        ClusterBundle (K centroids, cosine K-means++)
+                  r_score:       float         (retroactively mutable)
+                  fact_weights:  dict[fact_id → relevance]
+                  echo_penalty:  float
 ```
 
 ### Detection
@@ -203,27 +233,48 @@ If `similarity ≥ 0.68`:
 - Past session was already weak: `penalty = -0.6`
 - New `r_score = min(-0.2, max(-1.0, old_r + penalty))`
 
-The penalty is **retroactive** — the past session's gravity contribution is
-revised downward. Facts that looked good because the user appeared satisfied
-now get a negative signal.
+The penalty is **retroactive and idempotent**:
+
+- `EchoStore` records `echo_penalty` per matched session and refuses to
+  stack a second hit on the same session.
+- `MemoryStore.check_echo` calls `apply_session_resonance(fact_weights, R')`
+  with the *delta* between new and old `r_score`, so the past session's
+  facts absorb the correction exactly once, weighted by how relevant each
+  fact was to that session.
+
+Facts that looked good because the user appeared satisfied now get a
+negative signal scaled by their actual involvement.
 
 ---
 
 ## Black hole
 
 Facts absorbed by the black hole are removed from the live index and from
-the gravity engine. They are stored in `BlackHole._absorbed` by fact vector.
+the gravity engine. They are stored in `BlackHole._singularity` keyed by
+`fact_id`, with their vectors mirrored into a private `VectorIndex` for
+fast similarity scans.
 
 ### Hawking emission
 
 ```python
 def hawking_emit(query_vector):
-    return [f for f in _absorbed if cosine(query_vector, f.vector) >= 0.95]
+    # all_similarities returns {fid: cosine} for every fact in the index.
+    sims = self._index.all_similarities(query_vector)
+    to_emit = [fid for fid, sim in sims.items() if sim >= 0.95]
+    emitted = []
+    for fid in to_emit:
+        rec = self._singularity.pop(fid)
+        self._index.remove(fid)
+        self._total_emissions += 1    # process-level counter, never decrements
+        emitted.append(rec.fact)
+    return emitted
 ```
 
-Emitted facts return to `kinetic` layer with `gravity = 0.30` and are
-re-registered in the gravity engine. The threshold 0.95 is intentionally high:
-Hawking emission should be rare and only triggered by near-exact recall.
+Emitted facts leave the singularity, return to `kinetic` layer with
+`gravity = 0.30`, are re-registered in the gravity engine, and are
+persisted back to storage so a restart will not reanimate them. The
+threshold 0.95 is intentionally high: Hawking emission should be rare
+and only triggered by near-exact recall.
 
 ---
 
@@ -234,19 +285,67 @@ Hawking emission should be rare and only triggered by near-exact recall.
 ```python
 class StorageBackend(Protocol):
     def save_fact(self, fact: FactPassport) -> None: ...
+    def save_facts(self, facts: list[FactPassport]) -> None: ...   # batched
     def delete_fact(self, fact_id: str) -> None: ...
     def load_facts(self) -> list[FactPassport]: ...
     def save_edge(self, from_id: str, to_id: str) -> None: ...
     def load_edges(self) -> list[tuple[str, str]]: ...
-    def save_echo_session(self, session_id, centroids, r_score, recorded_at) -> None: ...
+    def save_echo_session(
+        self,
+        session_id: str,
+        centroids: list[list[float]],
+        r_score: float,
+        recorded_at: float,
+        fact_weights: dict[str, float] | None = None,
+        echo_penalty: float = 0.0,
+    ) -> None: ...
     def load_echo_sessions(self) -> list[dict]: ...
     def close(self) -> None: ...
 ```
 
+`save_facts` has a default implementation that loops `save_fact`; concrete
+backends are encouraged to override it for batched commits. `SQLiteBackend`
+does so via `executemany` inside a single transaction, which makes startup
+re-hydration and large `tick()` cascades materially faster.
+
 `SQLiteBackend` is the default. Write-through: every mutation hits the DB
-immediately. On startup, all facts, edges, and echo session bundles are loaded
-into memory. Retrieval is always in-memory (linear cosine scan); SQLite is
-only for durability.
+immediately. On startup, all facts, edges, and echo session bundles are
+loaded into memory and into a numpy `VectorIndex`. Retrieval is in-memory:
+a single matrix–vector dot product against the index, plus a parallel scan
+of the black hole's index for Hawking candidates. SQLite is only for
+durability.
+
+The `echo_sessions` table is migrated on startup — older rows that stored
+`fact_ids` as a JSON list are read back transparently, and new rows store
+the per-fact weight map as a JSON dict in the same column.
+
+---
+
+## Concurrency
+
+`MemoryStore` is designed for several agents sharing one process.
+
+```
+MemoryStore
+  _sessions: dict[session_id → SessionContext]
+  _current_session_id: Optional[str]      # legacy convenience for single-agent use
+  _lock: threading.RLock
+```
+
+A `SessionContext` carries one session's messages, vectors, accumulated
+`fact_weights`, and the echo result returned at `session_start`. Every
+mutating public method (`add_fact`, `session_message`, `session_close`,
+`query`, `check_echo`, `link`, `deprecate`, `stats`) accepts an optional
+`session_id` and acquires `_lock` for the critical section. Embedding HTTP
+calls are made *outside* the lock so multiple agents don't serialize on
+Ollama.
+
+`_current_session_id` is still set by `session_start`/`session_close` so
+single-threaded callers can omit `session_id` exactly as before. The MCP
+server (`server.py`) always passes `session_id` explicitly, so any two
+agents talking to the same server stay isolated.
+
+For visibility, `MemoryStore.stats` includes `active_sessions`.
 
 ---
 
@@ -256,21 +355,22 @@ only for durability.
 src/birch/
   fact.py                   FactPassport dataclass
   gravity.py                GravityEngine — score computation + migration
-  black_hole.py             BlackHole — sink + Hawking emission
-  memory_store.py           MemoryStore — unified API
-  server.py                 MCP server (FastMCP)
+  black_hole.py             BlackHole — sink + Hawking emission (numpy index)
+  vector_index.py           VectorIndex — numpy L2-normalised cosine search
+  memory_store.py           MemoryStore — unified API, per-session contexts, RLock
+  server.py                 MCP server (FastMCP), threads session_id through
   storage/
-    base.py                 StorageBackend protocol
-    sqlite.py               SQLiteBackend
+    base.py                 StorageBackend protocol + save_facts batch hook
+    sqlite.py               SQLiteBackend — executemany commits, schema migrations
   resonance/
     detector.py             compute_resonance() — combines all signals
     behavioral.py           pattern match on message closure
     semantic.py             cosine shift + specificity delta
     repetition.py           centroid dispersion
-    echo.py                 EchoStore — cross-session echo detection
+    echo.py                 EchoStore — cross-session echo, per-fact weight map
     centroid.py             centroid() + dispersion() utilities
     cluster.py              K-means++ ClusterBundle
-    embeddings.py           Ollama nomic-embed-text client
+    embeddings.py           Ollama batch (/api/embed) + single fallback
 ```
 
 ---
@@ -284,26 +384,29 @@ user message
 embed()  ──────────────────────────────────────────────┐
     │                                                   │
     ▼                                                   │
-session_message()                                       │
-  appends to _session_messages                          │
-  appends to _session_vectors                           │
+session_message(session_id)                             │
+  appends to ctx.messages                               │
+  appends to ctx.vectors                                │
     │                                                   │
     ▼                                                   │
-session_close()                                         │
+session_close(session_id)                               │
   compute_resonance(messages, vectors)                  │
     ├── score_behavioral(messages)                      │
     ├── score_semantic_shift(start_vec, end_vec)        │
     └── score_repetition(all_vecs)                      │
   → R score                                             │
     │                                                   │
-    ├── apply_session_resonance(fact_ids, R)            │
-    ├── EchoStore.record(session_id, vecs, R)           │
+    ├── apply_session_resonance(ctx.fact_weights, R)    │
+    ├── EchoStore.record(session_id, vecs, R,           │
+    │                    fact_weights=ctx.fact_weights) │
     ├── GravityEngine.tick()  → layer migrations        │
     └── _absorb_dead()        → black hole              │
                                                         │
-query(text)                                             │
+query(text, session_id)                                 │
     │◄──────────────────────────────────────────────────┘
     ├── embed(text)
-    ├── cosine scan over live facts (by layer)
+    ├── VectorIndex.search  over live facts
+    ├── _attribute_fact(fid, similarity) into ctx       │
     └── BlackHole.hawking_emit(vec)  if similarity ≥ 0.95
+            └── persists re-registered fact via save_fact
 ```
