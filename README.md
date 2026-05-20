@@ -121,25 +121,25 @@ from birch.memory_store import MemoryStore
 mem = MemoryStore()
 
 # Add facts
-f_go = mem.add_fact("модуль рассылок", "работает на", "Go")
-f_db = mem.add_fact("база данных", "использует", "PostgreSQL")
+f_go = mem.add_fact("mailer service", "runs on",  "Go")
+f_db = mem.add_fact("database",       "uses",     "PostgreSQL")
 mem.link(f_go.fact_id, f_db.fact_id)
 
 # Run a session
 mem.session_start("session_1")
-mem.session_message("как настроить модуль рассылок")
-mem.session_message("как подключить к PostgreSQL")
-mem.session_message("всё заработало, спасибо!")
+mem.session_message("how to configure the mailer service")
+mem.session_message("how to connect it to PostgreSQL")
+mem.session_message("everything works, thanks!")
 summary = mem.session_close()
 print(summary)  # R score, migrations, absorbed facts
 
 # Query
-results = mem.query("модуль рассылок Go", top_k=3)
+results = mem.query("mailer service Go", top_k=3)
 for r in results:
     print(r.source, r.similarity, r.fact)
 
 # Check for echo before starting a new session
-echo = mem.check_echo("рассылки снова не работают")
+echo = mem.check_echo("mailer service broken again")
 if echo["echo"]:
     print(f"Warning: returning to unresolved problem (sim={echo['similarity']:.2f})")
 ```

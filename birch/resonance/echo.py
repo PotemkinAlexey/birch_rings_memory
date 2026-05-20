@@ -25,7 +25,7 @@ class EchoResult:
 
 
 # Similarity threshold above which we consider it a return to the same problem
-_ECHO_THRESHOLD = 0.80
+_ECHO_THRESHOLD = 0.68
 
 
 class EchoStore:

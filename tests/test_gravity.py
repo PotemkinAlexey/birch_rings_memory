@@ -1,6 +1,5 @@
 """Gravity engine experiment — do facts migrate correctly under different conditions?"""
 import sys
-import time
 sys.path.insert(0, "/Users/alexpotemkin/IdeaProjects/birch_rings_memory")
 
 from birch.fact import FactPassport
@@ -28,16 +27,16 @@ def run():
     engine = GravityEngine()
 
     # Three facts with different access + resonance profiles
-    f_hot = make_fact("модуль рассылок", "работает на", "Go")
-    f_cold = make_fact("старый скрипт", "написан на", "Python")
-    f_connected = make_fact("Go", "используется в", "модуль рассылок")
+    f_hot       = make_fact("mailer service", "runs on",    "Go")
+    f_cold      = make_fact("legacy script",  "written in", "Python")
+    f_connected = make_fact("Go",             "used by",    "mailer service")
 
     for f in (f_hot, f_cold, f_connected):
         engine.register(f)
 
-    # f_hot → f_connected (рассылки зависят от Go)
+    # f_hot → f_connected (mailer depends on Go)
     engine.link(f_hot.fact_id, f_connected.fact_id)
-    # f_connected → f_hot (Go используется в рассылках — обратная ссылка)
+    # f_connected → f_hot (Go used by mailer — back-reference)
     engine.link(f_connected.fact_id, f_hot.fact_id)
 
     print("Initial state:")
@@ -66,7 +65,6 @@ def run():
     migrations = engine.tick()
 
     print("After gravity tick:")
-    results = []
     for f in (f_hot, f_cold, f_connected):
         migrated = any(fid == f.fact_id for fid, _ in migrations)
         tag = " → MIGRATED" if migrated else ""
@@ -75,12 +73,10 @@ def run():
             f"\n    access={f.access_count}  avg_R={f.avg_resonance:+.2f}"
             f"  gravity={f.gravity_score:.3f}  layer={label(f.layer)}{tag}"
         )
-        results.append(f)
     print()
 
     # Assertions
     passed = failed = 0
-
     checks = [
         (f_hot.gravity_score > 0.70,   "f_hot gravity > 0.70 (should promote)"),
         (f_hot.layer == 0,             "f_hot migrated to layer 0 (surface)"),

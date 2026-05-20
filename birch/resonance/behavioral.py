@@ -43,7 +43,12 @@ class BehavioralScore:
     matched_pattern: str
 
 
-_FOLLOWUP = re.compile(r"\?\s*$|а\s+(как|что|где|почему|зачем)|but\s+(how|what|why)", re.IGNORECASE)
+_FOLLOWUP = re.compile(
+    r"\?\s*$"
+    r"|а\s+(как|что|где|почему|зачем)"
+    r"|(but|and)\s+(how|what|why|where)",
+    re.IGNORECASE,
+)
 
 
 def classify_final_message(message: str) -> BehavioralScore:

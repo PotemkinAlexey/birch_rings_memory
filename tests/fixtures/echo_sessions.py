@@ -6,13 +6,13 @@ ECHO_PAIRS = [
         "description": "Session 1 looked resonant but problem came back next day",
         "session_1": {
             "id": "s1_nginx",
-            "messages": ["как настроить nginx", "попробую, спасибо"],
+            "messages": ["how to configure nginx", "I'll try it, thanks"],
             "expected_r_before_echo": "resonant",
         },
         "session_2": {
-            "messages": ["nginx всё равно не работает после перезапуска"],
+            "messages": ["nginx still not working after restart"],
             "expected_echo": True,
-            "expected_r_after_echo": "toxic",  # session 1 retroactively downgraded
+            "expected_r_after_echo": "toxic",
         },
     },
     {
@@ -20,13 +20,13 @@ ECHO_PAIRS = [
         "description": "Session 1 resolved, session 2 is a new unrelated topic",
         "session_1": {
             "id": "s1_docker",
-            "messages": ["как запустить docker контейнер", "работает, спасибо!"],
+            "messages": ["how to start a docker container", "works, thanks!"],
             "expected_r_before_echo": "resonant",
         },
         "session_2": {
-            "messages": ["как написать unit тест на pytest"],
+            "messages": ["how to write a unit test with pytest"],
             "expected_echo": False,
-            "expected_r_after_echo": "resonant",  # session 1 unchanged
+            "expected_r_after_echo": "resonant",
         },
     },
     {
@@ -35,16 +35,16 @@ ECHO_PAIRS = [
         "session_1": {
             "id": "s1_sql",
             "messages": [
-                "почему не работает sql запрос",
-                "всё равно не работает",
-                "не понимаю почему не работает",
+                "why is the sql query not working",
+                "still not working",
+                "I don't understand why it's not working",
             ],
             "expected_r_before_echo": "toxic",
         },
         "session_2": {
-            "messages": ["опять проблема с sql запросом, тот же error"],
+            "messages": ["having the sql query problem again, same error"],
             "expected_echo": True,
-            "expected_r_after_echo": "toxic",  # stays toxic, penalty stacks
+            "expected_r_after_echo": "toxic",
         },
     },
     {
@@ -53,14 +53,14 @@ ECHO_PAIRS = [
         "session_1": {
             "id": "s1_multi",
             "messages": [
-                "как настроить nginx как reverse proxy",
-                "понял, теперь вопрос по postgres — почему медленные запросы",
-                "nginx заработал, спасибо",
+                "how to configure nginx as reverse proxy",
+                "got it, now a question about postgres — why are queries slow",
+                "nginx is working, thanks",
             ],
             "expected_r_before_echo": "resonant",
         },
         "session_2": {
-            "messages": ["postgres запросы всё ещё медленные, не помогло"],
+            "messages": ["postgres queries are still slow, didn't help"],
             "expected_echo": True,
             "expected_r_after_echo": "toxic",
         },
