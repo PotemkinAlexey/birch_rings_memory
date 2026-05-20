@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from ..fact import FactPassport
+from ..meta_fact import MetaFact
 
 
 @runtime_checkable
@@ -47,6 +48,8 @@ class StorageBackend(Protocol):
 
     def load_echo_sessions(self) -> list[dict]: ...
 
+    def delete_echo_session(self, session_id: str) -> None: ...
+
     def save_open_session(
         self,
         session_id: str,
@@ -59,5 +62,22 @@ class StorageBackend(Protocol):
     def delete_open_session(self, session_id: str) -> None: ...
 
     def load_open_sessions(self) -> list[dict]: ...
+
+    # ── MetaFact persistence ────────────────────────────────────────────────
+
+    def save_meta_fact(self, meta: MetaFact) -> None: ...
+
+    def save_meta_facts(self, metas: list[MetaFact]) -> None:
+        """Persist many MetaFacts in one transaction.
+
+        Default implementation loops save_meta_fact; backends are encouraged
+        to override with a real batch insert (SQLite uses executemany).
+        """
+        for m in metas:
+            self.save_meta_fact(m)
+
+    def delete_meta_fact(self, meta_id: str) -> None: ...
+
+    def load_meta_facts(self) -> list[MetaFact]: ...
 
     def close(self) -> None: ...

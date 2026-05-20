@@ -30,7 +30,11 @@ Hawking emission.
 │  core      (layer 2)  gravity < 0.30   cold archive          │
 │──────────────────────────────────────────────────────────────│
 │  black hole (layer -1)  gravity < 0.10                       │
-│              ↑  hawking_emit()  similarity ≥ 0.95            │
+│   ├── FactPassports   ↑ hawking_emit()       sim ≥ 0.95      │
+│   └── MetaFacts       ↑ hawking_emit_metas() sim ≥ 0.85      │
+│                                                              │
+│           gravitational collapse: clusters of dead facts     │
+│           fuse into a single dense MetaFact (cosine ≥ 0.92)  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -85,13 +89,59 @@ the singularity, returns to `kinetic` layer with `gravity = 0.30`, and is
 persisted back to storage. The threshold is intentionally high: only an
 almost-exact match justifies retrieval.
 
+MetaFacts emit at a looser threshold (`0.85`) because a centroid drifts
+between its sources; their gravity on emission is set by their own
+weight: `gravity = 0.30 + 0.10 · log10(weight)`, capped at `0.70`. A
+bundle of fifty dead facts ends up around `0.47` — dense, but not
+straight into the surface layer.
+
+### Memory consolidation (gravitational collapse)
+
+The black hole would grow linearly with every session close. **Singularity
+Compactor** runs gravitational collapse over the singularity: a single
+numpy `matmul` computes pairwise cosine over all absorbed fact vectors,
+path-compressing Union-Find groups every transitive cluster above the
+collapse threshold (default `0.92`), and each group becomes one
+`MetaFact`. The originals are removed from both `_singularity` and the
+index; their texts and ids live on inside the MetaFact (`source_texts`,
+`source_fact_ids`) for lineage.
+
+`MemoryStore` runs collapse opportunistically on `session_close` — when
+the singularity has both grown past `COLLAPSE_FACT_MASS_TRIGGER` (default
+`100`) and accumulated at least `COLLAPSE_DELTA_TRIGGER` new absorptions
+(default `50`) since the last pass, a job is submitted to a
+single-worker `ThreadPoolExecutor`. Set `collapse_async=False` on
+construction for predictable test runs or deployments that don't want
+background threads.
+
+Live MetaFacts participate in the full feedback loop: they accumulate
+`access_count`, `resonance_sum`, and migrate between layers like any
+fact. When their gravity drops back below `0.10`, they are re-absorbed
+by the singularity (a future pass may compact MetaFacts with MetaFacts).
+
+### Echo TTL
+
+Closed sessions don't live forever in `EchoStore`. A TTL sweep runs on
+every `session_close()` with three tiers:
+
+| Tier | Trigger | Default TTL |
+|------|---------|-------------|
+| Penalty | `echo_penalty != 0` (already converted to gravity correction) | 14 days |
+| Resolved | `r_score > 0.35` and no penalty | 7 days |
+| Default | everything else | 30 days |
+
+The penalty tier wins precedence — once a session has been echoed its
+`r_score` is locked into the toxic floor and cannot drift back into
+"resolved". Drops propagate to disk via `delete_echo_session`.
+
 ### Numpy vector index
 
 Live facts and absorbed facts each live in a numpy-backed `VectorIndex`:
 an L2-normalised `(n, d)` matrix kept in sync with every add/remove. A
 query is a single matrix–vector dot product plus an `argpartition` for
 top-K, so retrieval stays in milliseconds well past tens of thousands
-of facts.
+of facts. MetaFacts have their own pair of indices (live + singularity)
+so polymorphic `query()` does four scans without ID collisions.
 
 ---
 
@@ -100,10 +150,12 @@ of facts.
 | Module | Responsibility |
 |---|---|
 | `fact.py` | `FactPassport` — subject/predicate/object triple + gravity metadata |
+| `meta_fact.py` | `MetaFact` — dense centroid bundle with lineage + feedback-loop fields |
 | `gravity.py` | `GravityEngine` — computes scores, triggers layer migration |
-| `black_hole.py` | `BlackHole` — irreversible sink + Hawking emission |
+| `black_hole.py` | `BlackHole` — irreversible sink + Hawking emission (facts + metas) |
+| `singularity_compactor.py` | `collapse_singularity()` — Union-Find collapse + center of mass |
 | `vector_index.py` | `VectorIndex` — numpy-backed cosine search |
-| `memory_store.py` | `MemoryStore` — unified API over all layers, per-session contexts, RLock |
+| `memory_store.py` | `MemoryStore` — unified API, per-session contexts, RLock, collapse orchestration |
 | `storage/base.py` | `StorageBackend` — Protocol for pluggable persistence |
 | `storage/sqlite.py` | `SQLiteBackend` — default write-through implementation, batched commits |
 | `server.py` | MCP server — exposes memory as tools for Claude agents |
@@ -111,7 +163,7 @@ of facts.
 | `resonance/semantic.py` | Cosine shift + specificity delta |
 | `resonance/repetition.py` | Centroid dispersion detector |
 | `resonance/detector.py` | Combines all signals into R score |
-| `resonance/echo.py` | Cross-session echo detection + retroactive gravity penalty |
+| `resonance/echo.py` | Cross-session echo detection + retroactive penalty + TTL sweep |
 | `resonance/cluster.py` | K-means++ bundle for session storage |
 | `resonance/embeddings.py` | Ollama batch embedding client |
 
@@ -154,8 +206,12 @@ summary = mem.session_close()
 # The "mailer service" fact's gravity rises because it was used in a
 # resonant session.  A repeated toxic session would pull it back down.
 
+# Query results are polymorphic — either a FactPassport or a MetaFact.
 for r in results:
-    print(r.source, r.similarity, r.fact)
+    if r.kind == "fact":
+        print(r.source, r.similarity, r.fact.subject, r.fact.predicate, r.fact.object)
+    else:  # r.kind == "meta"
+        print(r.source, r.similarity, "META", r.meta.weight, r.meta.source_texts[:2])
 ```
 
 ### With SQLite persistence
@@ -174,16 +230,30 @@ from birch.storage import StorageBackend
 from birch.memory_store import MemoryStore
 
 class RedisBackend:                          # no inheritance required
+    # Facts
     def save_fact(self, fact): ...
-    def save_facts(self, facts): ...         # batch path; default loops save_fact
+    def save_facts(self, facts): ...         # default loops save_fact
     def delete_fact(self, fact_id): ...
     def load_facts(self): ...
+    # Edges
     def save_edge(self, from_id, to_id): ...
     def load_edges(self): ...
+    # Echo sessions (closed sessions with K-means topic bundle)
     def save_echo_session(self, session_id, centroids,
                           r_score, recorded_at,
                           fact_weights=None, echo_penalty=0.0): ...
     def load_echo_sessions(self): ...
+    def delete_echo_session(self, session_id): ...
+    # Open sessions (for crash recovery)
+    def save_open_session(self, session_id, messages,
+                          vectors, facts, started_at): ...
+    def delete_open_session(self, session_id): ...
+    def load_open_sessions(self): ...
+    # MetaFacts (compressed bundles produced by collapse)
+    def save_meta_fact(self, meta): ...
+    def save_meta_facts(self, metas): ...    # default loops save_meta_fact
+    def delete_meta_fact(self, meta_id): ...
+    def load_meta_facts(self): ...
     def close(self): ...
 
 mem = MemoryStore(storage=RedisBackend(...))
@@ -249,7 +319,7 @@ Standard systems treat memory as a static index — facts stay where you put
 them until you explicitly change them.
 
 BirchKM memory is **kinetic**: facts compete for space based on how useful
-they actually proved. Three properties distinguish it:
+they actually proved. Four properties distinguish it:
 
 1. **No explicit feedback required** — resonance is inferred from session
    structure (behavioral patterns + semantic shift + topic dispersion).
@@ -258,6 +328,10 @@ they actually proved. Three properties distinguish it:
    gravity of facts that gave a false sense of resolution.
 3. **Lossy by design** — the black hole is not an edge case. It is the
    mechanism that prevents stale, misleading facts from accumulating silently.
+4. **Self-consolidating** — clusters of dead facts collapse into dense
+   MetaFacts. Lineage (`source_fact_ids`, `source_texts`) is preserved,
+   and surviving MetaFacts re-enter the live layers via Hawking emission
+   like any other body.
 
 ---
 
@@ -298,11 +372,17 @@ Environment knobs:
 
 ## Status
 
-Working proof of concept. Resonance pipeline, gravity engine, black hole,
-SQLite persistence, numpy-backed vector index, per-session concurrency,
-and MCP server are all functional. Next natural steps: a persistent
-similarity index for very large stores (FAISS / hnswlib), auto-linking
-from co-occurrence for graph degree, and shared multi-agent memory.
+Working proof of concept. All of the following are functional and covered
+by the test suite: resonance pipeline, gravity engine, black hole with
+polymorphic singularity (facts + MetaFacts), SQLite persistence, numpy
+vector index, per-session concurrency, auto-linking on `add_fact`,
+counter-triggered background collapse with lineage, EchoStore TTL, and
+the MCP server.
+
+Next natural steps: a persistent similarity index for very large stores
+(FAISS / hnswlib), an LLM-driven `MetaFact.summary` writer that runs
+async after collapse, recursive collapse (MetaFacts colliding with
+MetaFacts), and shared multi-agent memory across processes.
 
 ## License
 

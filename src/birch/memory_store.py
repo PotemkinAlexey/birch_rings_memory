@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -10,24 +11,51 @@ from typing import Optional
 from .fact import FactPassport
 from .gravity import GravityEngine
 from .black_hole import BlackHole
+from .meta_fact import MetaFact
 from .resonance.detector import compute_resonance
 from .resonance.echo import EchoStore
 from .resonance.embeddings import embed
 from .resonance.cluster import ClusterBundle
 from .resonance.echo import StoredSession
+from .singularity_compactor import (
+    CollapseReport,
+    collapse_singularity,
+)
 from .storage import StorageBackend, SQLiteBackend
 from .vector_index import VectorIndex
 
 
-# Gravity floor — facts below this after tick fall into the black hole
+# Gravity floor — bodies below this after tick fall into the black hole
 _ABSORPTION_THRESHOLD = 0.10
+# Hawking emission threshold for MetaFacts: a centroid lives between its
+# sources, so a strict 0.95 almost never fires. 0.85 is the working default.
+_META_HAWKING_THRESHOLD = 0.85
 
 
 @dataclass
 class QueryResult:
-    fact: FactPassport
+    """Polymorphic query hit — either a FactPassport or a MetaFact.
+
+    Exactly one of ``fact`` and ``meta`` is non-None. Legacy callers that
+    read ``r.fact.fact_id`` keep working for fact hits; new callers branch
+    on ``r.kind`` (``"fact"`` or ``"meta"``) and read the right field.
+    """
     similarity: float
-    source: str     # "surface" | "kinetic" | "core" | "hawking"
+    source: str     # "surface" | "kinetic" | "core" | "hawking" | "hawking_meta"
+    fact: Optional[FactPassport] = None
+    meta: Optional[MetaFact] = None
+
+    @property
+    def kind(self) -> str:
+        return "meta" if self.meta is not None else "fact"
+
+    @property
+    def body_id(self) -> str:
+        if self.meta is not None:
+            return self.meta.meta_id
+        if self.fact is not None:
+            return self.fact.fact_id
+        return ""
 
 
 @dataclass
@@ -57,14 +85,31 @@ class MemoryStore:
     # Max neighbours considered per new fact to keep startup cost linear.
     AUTO_LINK_TOP_K: int = 5
 
+    # Background collapse triggers — once both are satisfied, queue a
+    # gravitational collapse pass on the singularity.
+    COLLAPSE_FACT_MASS_TRIGGER: int = 100     # min absolute fact_mass
+    COLLAPSE_DELTA_TRIGGER: int = 50          # min absorbed-since-last-collapse
+
     def __init__(
         self,
         echo_k: int = 2,
         db_path: Optional[str | Path] = None,
         storage: Optional[StorageBackend] = None,
         auto_link: bool = True,
+        collapse_threshold: float = 0.92,
+        collapse_min_group_size: int = 2,
+        collapse_async: bool = True,
     ) -> None:
         self._auto_link = auto_link
+        # Collapse configuration — knobs the operator can tune per deployment.
+        self._collapse_threshold = collapse_threshold
+        self._collapse_min_group_size = collapse_min_group_size
+        self._collapse_async = collapse_async
+        self._collapse_counter = 0       # facts absorbed since last collapse
+        self._last_collapse_at: Optional[float] = None
+        self._total_collapses = 0
+        self._collapse_executor: Optional[ThreadPoolExecutor] = None
+        self._inflight_collapse: Optional[Future] = None
         self._engine = GravityEngine()
         self._hole = BlackHole()
         self._echo = EchoStore(default_k=echo_k)
@@ -73,6 +118,11 @@ class MemoryStore:
         self._spo_index: dict[tuple[str, str, str], str] = {}
         # Numpy-backed cosine index, kept in sync with live facts.
         self._index = VectorIndex()
+        # MetaFacts that have re-entered the live layers via Hawking emission.
+        # Kept on a separate index so query() can search and surface them
+        # without colliding with FactPassport ids in the SPO machinery.
+        self._meta_facts: dict[str, MetaFact] = {}
+        self._meta_index = VectorIndex()
         if storage is not None:
             self._storage: Optional[StorageBackend] = storage
         elif db_path is not None:
@@ -195,6 +245,16 @@ class MemoryStore:
             if not fact.is_deprecated:
                 key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
                 self._spo_index.setdefault(key, fact.fact_id)
+        # MetaFacts: layer -1 live in the singularity; promoted ones (after
+        # Hawking emission) live in the live meta store with the engine.
+        if hasattr(self._storage, "load_meta_facts"):
+            for meta in self._storage.load_meta_facts():
+                if meta.layer == -1:
+                    self._hole.restore_meta(meta)
+                else:
+                    self._meta_facts[meta.meta_id] = meta
+                    self._meta_index.add(meta.meta_id, meta.vector)
+                    self._engine.register(meta)
         for from_id, to_id in self._storage.load_edges():
             self._engine.link(from_id, to_id)
         for row in self._storage.load_echo_sessions():
@@ -391,6 +451,10 @@ class MemoryStore:
                 result.r,
                 fact_weights=facts_snapshot,
             )
+            # Opportunistic TTL sweep on session close. Drops stale resolved
+            # and already-penalised echo sessions so the store stays bounded
+            # without a separate cron job.
+            expired = self._echo.expire()
             if self._storage:
                 session_obj = self._echo.get(sid)
                 if session_obj:
@@ -402,12 +466,23 @@ class MemoryStore:
                         fact_weights=session_obj.fact_weights,
                         echo_penalty=session_obj.echo_penalty,
                     )
+                # Storage layer doesn't yet expose a delete; drop via the
+                # tolerated load-time gc instead. We still drop in-memory.
+                if expired and hasattr(self._storage, "delete_echo_session"):
+                    for stale_sid in expired:
+                        self._storage.delete_echo_session(stale_sid)
 
             migrations = self._engine.tick()
             absorbed = self._absorb_dead()
 
             if self._storage:
                 self._storage.save_facts(list(self._facts.values()))
+                if self._meta_facts and hasattr(self._storage, "save_meta_facts"):
+                    self._storage.save_meta_facts(list(self._meta_facts.values()))
+
+            # Counter-triggered collapse. Held inside the lock so the
+            # collapse counter and the trigger decision are consistent.
+            self._maybe_trigger_collapse_locked(len(absorbed))
 
             summary = {
                 "session_id": sid,
@@ -431,7 +506,7 @@ class MemoryStore:
             self._storage.delete_open_session(sid)
 
     def _absorb_dead(self) -> list[str]:
-        """Send facts with gravity below threshold into the black hole."""
+        """Send facts and live MetaFacts below the threshold back into the hole."""
         absorbed = []
         for fid, fact in list(self._facts.items()):
             if fact.is_deprecated or fact.is_expired:
@@ -448,7 +523,98 @@ class MemoryStore:
                 if self._storage:
                     self._storage.delete_fact(fid)
                 absorbed.append(fid)
+        # Live MetaFacts use the same gravity floor — they came out of the
+        # singularity once, they can fall back in.
+        for mid, meta in list(self._meta_facts.items()):
+            if meta.gravity_score < _ABSORPTION_THRESHOLD:
+                self._hole.absorb_meta(meta)
+                del self._meta_facts[mid]
+                self._meta_index.remove(mid)
+                if self._storage and hasattr(self._storage, "save_meta_fact"):
+                    # absorb_meta resets layer to -1, persist that.
+                    self._storage.save_meta_fact(meta)
+                absorbed.append(mid)
         return absorbed
+
+    # ── Collapse orchestration ──────────────────────────────────────────────
+
+    def collapse_singularity(
+        self,
+        threshold: Optional[float] = None,
+        min_group_size: Optional[int] = None,
+        persist: bool = True,
+    ) -> CollapseReport:
+        """Synchronous compactor pass — usable from tests, jobs, or by hand.
+
+        Holds the store lock for the duration. Returns the CollapseReport
+        even if nothing was collapsed, so the caller can log it.
+        """
+        thr = self._collapse_threshold if threshold is None else threshold
+        mgs = self._collapse_min_group_size if min_group_size is None else min_group_size
+        with self._lock:
+            new_metas, report = collapse_singularity(
+                self._hole, threshold=thr, min_group_size=mgs,
+            )
+            if persist and self._storage and hasattr(self._storage, "save_meta_facts"):
+                self._storage.save_meta_facts(new_metas)
+                # The absorbed FactPassports are gone from the live store and
+                # were never persisted as "absorbed" — but if storage was
+                # tracking them as deleted-on-absorb, we should drop them now.
+                for meta in new_metas:
+                    for fid in meta.source_fact_ids:
+                        if hasattr(self._storage, "delete_fact"):
+                            self._storage.delete_fact(fid)
+            self._last_collapse_at = time.time()
+            self._total_collapses += 1
+            self._collapse_counter = 0
+            return report
+
+    def _maybe_trigger_collapse_locked(self, absorbed_count: int) -> None:
+        """Caller must hold self._lock. Schedules collapse if thresholds met."""
+        self._collapse_counter += absorbed_count
+        if self._hole.fact_mass < self.COLLAPSE_FACT_MASS_TRIGGER:
+            return
+        if self._collapse_counter < self.COLLAPSE_DELTA_TRIGGER:
+            return
+        # Skip if a previous collapse is still running.
+        if self._inflight_collapse is not None and not self._inflight_collapse.done():
+            return
+        if not self._collapse_async:
+            self.collapse_singularity()
+            return
+        if self._collapse_executor is None:
+            self._collapse_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="birch-collapse",
+            )
+        self._inflight_collapse = self._collapse_executor.submit(
+            self.collapse_singularity,
+        )
+
+    def close(self) -> None:
+        """Release the background executor and close the storage layer.
+
+        We must NOT wait for inflight collapse or call ``shutdown(wait=True)``
+        while holding ``self._lock`` — the worker thread acquires the same
+        lock from inside ``collapse_singularity``, so blocking on it while
+        holding it would deadlock. Snapshot the handles under the lock, then
+        wait outside it.
+        """
+        with self._lock:
+            inflight = self._inflight_collapse
+            executor = self._collapse_executor
+            storage = self._storage
+            self._inflight_collapse = None
+            self._collapse_executor = None
+
+        if inflight is not None:
+            try:
+                inflight.result(timeout=5.0)
+            except Exception:
+                pass
+        if executor is not None:
+            executor.shutdown(wait=True)
+        if storage is not None and hasattr(storage, "close"):
+            storage.close()
 
     def _drop_from_spo_index(self, fact: FactPassport) -> None:
         key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
@@ -483,6 +649,8 @@ class MemoryStore:
         with self._lock:
             results: list[QueryResult] = []
             layer_labels = {0: "surface", 1: "kinetic", 2: "core"}
+
+            # Live FactPassports.
             sims = self._index.all_similarities(vec)
             for fid, sim in sims.items():
                 fact = self._facts.get(fid)
@@ -494,6 +662,21 @@ class MemoryStore:
                     fact=fact,
                     similarity=round(sim, 4),
                     source=layer_labels.get(fact.layer, "kinetic"),
+                ))
+
+            # Live MetaFacts — promoted out of the black hole by past
+            # Hawking emissions; share the same layer machinery as facts.
+            meta_sims = self._meta_index.all_similarities(vec)
+            for mid, sim in meta_sims.items():
+                meta = self._meta_facts.get(mid)
+                if meta is None:
+                    continue
+                if not (min_layer <= meta.layer <= max_layer):
+                    continue
+                results.append(QueryResult(
+                    meta=meta,
+                    similarity=round(sim, 4),
+                    source=layer_labels.get(meta.layer, "kinetic"),
                 ))
 
             # Hawking emission: black hole returns facts AND removes them from
@@ -517,19 +700,40 @@ class MemoryStore:
                         source="hawking",
                     ))
 
+                # MetaFact Hawking emission — looser threshold so a centroid
+                # actually fires on a topically close query.
+                meta_emitted = self._hole.hawking_emit_metas(
+                    vec, threshold=_META_HAWKING_THRESHOLD
+                )
+                for meta in meta_emitted:
+                    self._meta_facts[meta.meta_id] = meta
+                    self._engine.register(meta)
+                    self._meta_index.add(meta.meta_id, meta.vector)
+                    if self._storage and hasattr(self._storage, "save_meta_fact"):
+                        self._storage.save_meta_fact(meta)
+                    sim = VectorIndex.similarity(vec, meta.vector)
+                    results.append(QueryResult(
+                        meta=meta,
+                        similarity=round(sim, 4),
+                        source="hawking_meta",
+                    ))
+
             results.sort(key=lambda r: r.similarity, reverse=True)
             top = results[:top_k]
 
             # Attribution + touch — only on what the caller actually
-            # receives. Weight is the similarity itself; a fact returned at
+            # receives. Weight is the similarity itself; a body returned at
             # cosine 0.95 ends up nine times more sensitive to session R
-            # than one returned at 0.10.
+            # than one returned at 0.10. Polymorphic over fact / meta.
             sid = self._resolve_sid(session_id)
             ctx = self._sessions.get(sid) if sid else None
             for r in top:
-                r.fact.touch()
+                body = r.fact if r.fact is not None else r.meta
+                if body is None:
+                    continue
+                body.touch()
                 if ctx is not None:
-                    self._attribute_to(ctx, r.fact.fact_id, r.similarity)
+                    self._attribute_to(ctx, r.body_id, r.similarity)
 
         return top
 
@@ -587,12 +791,22 @@ class MemoryStore:
             layers = {0: 0, 1: 0, 2: 0}
             for f in self._facts.values():
                 layers[f.layer] = layers.get(f.layer, 0) + 1
+            meta_layers = {0: 0, 1: 0, 2: 0}
+            for m in self._meta_facts.values():
+                meta_layers[m.layer] = meta_layers.get(m.layer, 0) + 1
             return {
                 "surface": layers[0],
                 "kinetic": layers[1],
                 "core": layers[2],
                 "black_hole_mass": self._hole.mass,
+                "black_hole_fact_mass": self._hole.fact_mass,
+                "black_hole_meta_mass": self._hole.meta_mass,
                 "hawking_emissions": self._hole.total_emissions,
                 "total_live": len(self._facts),
+                "total_live_metas": len(self._meta_facts),
+                "meta_layers": meta_layers,
                 "active_sessions": len(self._sessions),
+                "collapse_counter": self._collapse_counter,
+                "total_collapses": self._total_collapses,
+                "last_collapse_at": self._last_collapse_at,
             }

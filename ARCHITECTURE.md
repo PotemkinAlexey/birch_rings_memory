@@ -249,12 +249,19 @@ negative signal scaled by their actual involvement.
 
 ## Black hole
 
-Facts absorbed by the black hole are removed from the live index and from
-the gravity engine. They are stored in `BlackHole._singularity` keyed by
-`fact_id`, with their vectors mirrored into a private `VectorIndex` for
-fast similarity scans.
+The black hole holds two kinds of bodies. They are kept in separate
+dicts and separate vector indices so Hawking emission stays typed and
+ID collisions are impossible:
 
-### Hawking emission
+```
+BlackHole
+  _singularity      : dict[str, SingularityRecord]      # FactPassports
+  _meta_singularity : dict[str, MetaSingularityRecord]  # MetaFacts
+  _index            : VectorIndex                       # fact vectors
+  _meta_index       : VectorIndex                       # meta vectors
+```
+
+### Hawking emission — facts
 
 ```python
 def hawking_emit(query_vector):
@@ -276,6 +283,96 @@ persisted back to storage so a restart will not reanimate them. The
 threshold 0.95 is intentionally high: Hawking emission should be rare
 and only triggered by near-exact recall.
 
+### Hawking emission — MetaFacts
+
+A MetaFact centroid lives between its sources, so the same 0.95
+threshold almost never fires. `hawking_emit_metas(query, threshold)`
+accepts a looser bound (`MemoryStore` calls it with `0.85`), and the
+emitted MetaFact's gravity is set by its own weight, not by a fixed
+constant:
+
+```
+gravity_on_emission = base + 0.10 · log10(weight)   # base=0.30, cap=0.70
+```
+
+`weight=1` → `0.30`. `weight=10` → `0.40`. `weight=100` → `0.50`. A
+bundle of a thousand dead facts ends up at `0.60` — dense, but never
+straight into the surface layer (`0.70`).
+
+---
+
+## MetaFact
+
+A `MetaFact` is the residue of a `SingularityCompactor.collapse()` —
+several FactPassports collapsed into a single centroid body:
+
+```
+meta_id          full uuid4
+vector           [768-dim float]   L2-normalised weighted center of mass
+weight           int               number of facts absorbed
+source_texts     list[str]         "subject predicate object" per original
+source_fact_ids  list[str]         lineage to the absorbed FactPassports
+summary          str               (optional, future LLM pass)
+gravity_score    0.30 by default   bumped on emission via log(weight)
+layer            -1 in singularity, 1 after Hawking, etc.
+access_count, last_accessed
+resonance_sum, resonance_count
+```
+
+The feedback-loop surface is exposed through the same attributes and
+methods as `FactPassport` — `touch()`, `apply_resonance(r)`,
+`avg_resonance`, `is_deprecated`, `is_expired`, `fact_id`. The
+`GravityEngine`, `BlackHole`, and `MemoryStore.session_close()` treat
+a MetaFact like any other body via duck typing.
+
+A MetaFact whose gravity falls back below `0.10` is re-absorbed by the
+singularity — `BlackHole.absorb_meta()` handles it, and a future
+collapse may eventually merge it with another MetaFact (not yet
+implemented; recursive collapse is a planned pass).
+
+---
+
+## Memory consolidation
+
+`SingularityCompactor.collapse_singularity(hole, threshold, min_group_size)`
+runs gravitational collapse over the singularity's FactPassports:
+
+1. Snapshot every absorbed vector into a `(n, d)` numpy matrix.
+2. `M @ M.T` gives the full pairwise cosine matrix in one matmul.
+3. Path-compressing Union-Find groups every transitive cluster at
+   `cosine ≥ threshold` (default `0.92`).
+4. Each group with at least `min_group_size` members becomes a MetaFact
+   whose vector is the L2-normalised weighted center of mass.
+5. The originals are removed from `_singularity` and from `_index`; the
+   new MetaFact is `absorb_meta()`-ed back into the same hole.
+
+Pre-existing MetaFacts in the singularity are not touched (recursive
+collapse needs its own threshold tuning). FactPassports with empty
+vectors are skipped.
+
+### Orchestration
+
+`MemoryStore` triggers collapse opportunistically after `_absorb_dead()`
+runs at session close:
+
+```
+if hole.fact_mass         >= COLLAPSE_FACT_MASS_TRIGGER (100)  AND
+   counter-since-last     >= COLLAPSE_DELTA_TRIGGER     (50):
+    submit collapse to single-worker ThreadPoolExecutor
+```
+
+A second trigger while one collapse is inflight is dropped (not queued).
+`collapse_async=False` runs the pass inline for predictable tests or
+deployments without background threads.
+
+`MemoryStore.close()` snapshots the executor and any inflight future
+under the lock then releases the lock before waiting on them — the
+worker itself wants the same lock from inside `collapse_singularity`,
+so blocking on it while holding it would deadlock the shutdown.
+
+For visibility, `MemoryStore.stats` includes `collapse_counter`,
+`total_collapses`, and `last_collapse_at`.
+
 ---
 
 ## Persistence
@@ -284,12 +381,15 @@ and only triggered by near-exact recall.
 
 ```python
 class StorageBackend(Protocol):
+    # Facts
     def save_fact(self, fact: FactPassport) -> None: ...
     def save_facts(self, facts: list[FactPassport]) -> None: ...   # batched
     def delete_fact(self, fact_id: str) -> None: ...
     def load_facts(self) -> list[FactPassport]: ...
+    # Edges (auto-link graph + manual link())
     def save_edge(self, from_id: str, to_id: str) -> None: ...
     def load_edges(self) -> list[tuple[str, str]]: ...
+    # Echo sessions (closed sessions with K-means topic bundle)
     def save_echo_session(
         self,
         session_id: str,
@@ -300,24 +400,40 @@ class StorageBackend(Protocol):
         echo_penalty: float = 0.0,
     ) -> None: ...
     def load_echo_sessions(self) -> list[dict]: ...
+    def delete_echo_session(self, session_id: str) -> None: ...
+    # Open sessions (for crash recovery)
+    def save_open_session(self, session_id, messages,
+                          vectors, facts, started_at) -> None: ...
+    def delete_open_session(self, session_id: str) -> None: ...
+    def load_open_sessions(self) -> list[dict]: ...
+    # MetaFacts (compressed bundles produced by collapse)
+    def save_meta_fact(self, meta: MetaFact) -> None: ...
+    def save_meta_facts(self, metas: list[MetaFact]) -> None: ...   # batched
+    def delete_meta_fact(self, meta_id: str) -> None: ...
+    def load_meta_facts(self) -> list[MetaFact]: ...
     def close(self) -> None: ...
 ```
 
-`save_facts` has a default implementation that loops `save_fact`; concrete
-backends are encouraged to override it for batched commits. `SQLiteBackend`
-does so via `executemany` inside a single transaction, which makes startup
-re-hydration and large `tick()` cascades materially faster.
+`save_facts` and `save_meta_facts` have default implementations that
+loop the singular variant; concrete backends are encouraged to override
+them for batched commits. `SQLiteBackend` does so via `executemany`
+inside a single transaction, which makes startup re-hydration and large
+`tick()` cascades materially faster.
 
 `SQLiteBackend` is the default. Write-through: every mutation hits the DB
-immediately. On startup, all facts, edges, and echo session bundles are
-loaded into memory and into a numpy `VectorIndex`. Retrieval is in-memory:
-a single matrix–vector dot product against the index, plus a parallel scan
-of the black hole's index for Hawking candidates. SQLite is only for
-durability.
+immediately. On startup, facts go into the live store and the numpy
+`VectorIndex`; MetaFacts at `layer == -1` go back into the black hole's
+singularity, MetaFacts at `layer >= 0` go into the live MetaFact store.
+Retrieval is in-memory: four matrix–vector dot products (live facts,
+live metas, fact singularity, meta singularity), sorted and merged.
+SQLite is only for durability.
 
-The `echo_sessions` table is migrated on startup — older rows that stored
-`fact_ids` as a JSON list are read back transparently, and new rows store
-the per-fact weight map as a JSON dict in the same column.
+Schema migrations happen on open: the `echo_sessions` table picks up
+`fact_ids` and `echo_penalty` columns via `ALTER TABLE`, while the new
+`meta_facts` table is added by the idempotent `CREATE TABLE IF NOT EXISTS`
+in the bundled schema. Older rows that stored `fact_ids` as a JSON list
+inside the echo session column are read back transparently — new rows
+store the per-fact weight map as a JSON dict in the same column.
 
 ---
 
@@ -354,20 +470,22 @@ For visibility, `MemoryStore.stats` includes `active_sessions`.
 ```
 src/birch/
   fact.py                   FactPassport dataclass
+  meta_fact.py              MetaFact dataclass + lineage + Hawking gravity helper
   gravity.py                GravityEngine — score computation + migration
-  black_hole.py             BlackHole — sink + Hawking emission (numpy index)
+  black_hole.py             BlackHole — polymorphic sink (facts + metas) + Hawking
+  singularity_compactor.py  collapse_singularity() — Union-Find + center of mass
   vector_index.py           VectorIndex — numpy L2-normalised cosine search
-  memory_store.py           MemoryStore — unified API, per-session contexts, RLock
+  memory_store.py           MemoryStore — unified API, sessions, RLock, collapse orchestration
   server.py                 MCP server (FastMCP), threads session_id through
   storage/
-    base.py                 StorageBackend protocol + save_facts batch hook
+    base.py                 StorageBackend protocol + save_*_batch hooks
     sqlite.py               SQLiteBackend — executemany commits, schema migrations
   resonance/
     detector.py             compute_resonance() — combines all signals
     behavioral.py           pattern match on message closure
     semantic.py             cosine shift + specificity delta
     repetition.py           centroid dispersion
-    echo.py                 EchoStore — cross-session echo, per-fact weight map
+    echo.py                 EchoStore — cross-session echo, per-fact weights, TTL sweep
     centroid.py             centroid() + dispersion() utilities
     cluster.py              K-means++ ClusterBundle
     embeddings.py           Ollama batch (/api/embed) + single fallback
@@ -397,16 +515,32 @@ session_close(session_id)                               │
   → R score                                             │
     │                                                   │
     ├── apply_session_resonance(ctx.fact_weights, R)    │
+    │     ↳ also scales MetaFact resonance when         │
+    │       ctx attributed any meta_id                  │
     ├── EchoStore.record(session_id, vecs, R,           │
     │                    fact_weights=ctx.fact_weights) │
+    ├── EchoStore.expire()    → drop stale sessions     │
     ├── GravityEngine.tick()  → layer migrations        │
-    └── _absorb_dead()        → black hole              │
+    ├── _absorb_dead()        → black hole (facts+metas)│
+    └── _maybe_trigger_collapse_locked(absorbed_count)  │
+          ↳ when fact_mass ≥ 100 AND counter ≥ 50:      │
+            submit collapse_singularity() to executor   │
+                                                        │
+collapse_singularity(hole, threshold=0.92)              │
+    ├── one matmul over hole._index → pairwise cosine   │
+    ├── Union-Find groups at cosine ≥ threshold         │
+    ├── for each group: build MetaFact (center of mass) │
+    │     drop originals from _singularity + _index     │
+    │     absorb_meta(new) into _meta_singularity       │
+    └── save_meta_facts(new_metas) + delete_fact(...)   │
                                                         │
 query(text, session_id)                                 │
     │◄──────────────────────────────────────────────────┘
     ├── embed(text)
-    ├── VectorIndex.search  over live facts
-    ├── _attribute_fact(fid, similarity) into ctx       │
-    └── BlackHole.hawking_emit(vec)  if similarity ≥ 0.95
-            └── persists re-registered fact via save_fact
+    ├── VectorIndex.search over live facts            → QueryResult(fact=…)
+    ├── _meta_index.search over live MetaFacts        → QueryResult(meta=…)
+    ├── BlackHole.hawking_emit(vec)        sim ≥ 0.95 → re-register fact
+    ├── BlackHole.hawking_emit_metas(vec)  sim ≥ 0.85 → re-register meta
+    └── _attribute_to(ctx, body_id, similarity)
+          ↳ touches FactPassport or MetaFact symmetrically
 ```
