@@ -1,50 +1,39 @@
-"""Repetition detector — catches circular sessions via pairwise similarity."""
+"""Repetition detector — catches circular sessions via centroid dispersion."""
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+from .centroid import centroid, dispersion
 
 
 @dataclass
 class RepetitionScore:
-    avg_pairwise_similarity: float
+    avg_dispersion: float
     score: float    # -1.0 … 0.0 (only penalizes, never rewards)
 
 
 def score_repetition(vectors: list[list[float]]) -> RepetitionScore:
     """
-    Compute pairwise cosine similarity across all message vectors.
+    Detect circular sessions via dispersion around the centroid.
 
-    High average similarity = messages are semantically circular = penalty.
-    Returns score in [-1.0, 0.0] — this metric only penalizes.
+    Low dispersion = messages semantically stuck in the same place = penalty.
+    High dispersion = conversation moved = no penalty.
+
+    Thresholds (cosine distance from centroid):
+      < 0.05 → tight loop   → -0.8
+      < 0.12 → rephrasing   → -0.4
+      >= 0.12 → moving       → 0.0
     """
     if len(vectors) < 2:
         return RepetitionScore(0.0, 0.0)
 
-    pairs = []
-    for i in range(len(vectors)):
-        for j in range(i + 1, len(vectors)):
-            pairs.append(_cosine(vectors[i], vectors[j]))
+    center = centroid(vectors)
+    avg_disp = dispersion(vectors, center)
 
-    avg = sum(pairs) / len(pairs)
-
-    # avg > 0.80: clear circular loop → strong penalty
-    # avg > 0.70: likely rephrasing → moderate penalty
-    # below 0.70: conversation moved → no penalty
-    if avg > 0.80:
+    if avg_disp < 0.05:
         penalty = -0.8
-    elif avg > 0.70:
+    elif avg_disp < 0.12:
         penalty = -0.4
     else:
         penalty = 0.0
 
-    return RepetitionScore(avg_pairwise_similarity=round(avg, 4), score=penalty)
+    return RepetitionScore(avg_dispersion=round(avg_disp, 4), score=penalty)
