@@ -14,7 +14,7 @@ from .black_hole import BlackHole
 from .meta_fact import MetaFact
 from .resonance.detector import compute_resonance
 from .resonance.echo import EchoStore
-from .resonance.embeddings import embed
+from .resonance.embeddings import embed, embed_batch
 from .resonance.cluster import ClusterBundle
 from .resonance.echo import StoredSession
 from .singularity_compactor import (
@@ -392,6 +392,97 @@ class MemoryStore:
             if ctx is not None:
                 self._attribute_to(ctx, existing_id, 1.0)
         return existing
+
+    def add_facts(
+        self,
+        triples: list[tuple[str, str, str]],
+        layer: int = 1,
+        session_id: Optional[str] = None,
+    ) -> list[FactPassport]:
+        """
+        Batch-insert a list of (subject, predicate, object) triples.
+
+        One Ollama round-trip for all embeddings, one SQLite transaction for
+        all inserts. Duplicate SPOs are touched and returned, not duplicated.
+
+        Returns one FactPassport per input triple, in the same order.
+        """
+        if not triples:
+            return []
+
+        # ── Phase 1: SPO dedup under lock ──────────────────────────────────
+        # Split into existing (already in store) and new (need embedding).
+        results: list[Optional[FactPassport]] = [None] * len(triples)
+        need_embed: list[int] = []          # indices into triples
+
+        with self._lock:
+            sid = self._resolve_sid(session_id)
+            ctx = self._sessions.get(sid) if sid else None
+            for i, (s, p, o) in enumerate(triples):
+                key = self._normalize_spo(s, p, o)
+                existing_id = self._spo_index.get(key)
+                if existing_id and existing_id in self._facts:
+                    fact = self._facts[existing_id]
+                    fact.touch()
+                    if ctx is not None:
+                        self._attribute_to(ctx, existing_id, 1.0)
+                    results[i] = fact
+                else:
+                    need_embed.append(i)
+
+        if not need_embed:
+            # All duplicates — persist touches in one shot and return.
+            if self._storage:
+                self._storage.save_facts([results[i] for i in range(len(triples))])  # type: ignore[arg-type]
+            return results  # type: ignore[return-value]
+
+        # ── Phase 2: batch-embed new triples (outside lock) ────────────────
+        texts = [
+            f"{triples[i][0]} {triples[i][1]} {triples[i][2]}"
+            for i in need_embed
+        ]
+        vectors = embed_batch(texts)
+
+        # ── Phase 3: register new facts + bulk save ─────────────────────────
+        new_facts: list[FactPassport] = []
+        with self._lock:
+            sid = self._resolve_sid(session_id)
+            ctx = self._sessions.get(sid) if sid else None
+            for idx, vec in zip(need_embed, vectors):
+                s, p, o = triples[idx]
+                key = self._normalize_spo(s, p, o)
+                # Double-check: concurrent thread may have inserted same SPO.
+                existing_id = self._spo_index.get(key)
+                if existing_id and existing_id in self._facts:
+                    fact = self._facts[existing_id]
+                    fact.touch()
+                    if ctx is not None:
+                        self._attribute_to(ctx, existing_id, 1.0)
+                    results[idx] = fact
+                    continue
+
+                fact = FactPassport(
+                    subject=s,
+                    predicate=p,
+                    object=o,
+                    layer=layer,
+                    source_session=sid,
+                )
+                fact.vector = vec
+                self._facts[fact.fact_id] = fact
+                self._engine.register(fact)
+                self._index.add(fact.fact_id, vec)
+                self._spo_index[key] = fact.fact_id
+                self._auto_link_fact(fact.fact_id, vec)
+                if ctx is not None:
+                    self._attribute_to(ctx, fact.fact_id, 1.0)
+                results[idx] = fact
+                new_facts.append(fact)
+
+            if self._storage and new_facts:
+                self._storage.save_facts(new_facts)
+
+        return results  # type: ignore[return-value]
 
     def link(self, from_id: str, to_id: str) -> None:
         with self._lock:

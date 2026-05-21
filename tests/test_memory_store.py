@@ -336,6 +336,61 @@ def test_echo_drags_down_gravity_of_misleading_facts():
     assert f_misleading.resonance_sum == rsum_after_first
 
 
+def test_add_facts_batch_dedup_and_order():
+    """add_facts returns results in input order; duplicates are touched, not doubled."""
+    mem = MemoryStore()
+    # Pre-insert one triple to exercise the dedup path.
+    existing = mem.add_fact("batch service", "runs on", "Rust")
+
+    triples = [
+        ("batch service", "runs on", "Rust"),   # duplicate
+        ("batch service", "exposes", "gRPC"),   # new
+        ("batch service", "deployed on", "K8s"), # new
+    ]
+    results = mem.add_facts(triples)
+
+    assert len(results) == 3
+    # Duplicate comes back as the same fact.
+    assert results[0].fact_id == existing.fact_id
+    # New facts got unique ids.
+    assert results[1].fact_id != results[2].fact_id
+    assert results[1].fact_id != existing.fact_id
+    # All three are in the live store.
+    assert len(mem._facts) == 3
+
+
+def test_add_facts_batch_single_embed_call(monkeypatch):
+    """add_facts calls embed_batch once, not embed N times."""
+    import birch.memory_store as ms_mod
+    calls = []
+
+    def fake_batch(texts):
+        calls.append(len(texts))
+        # Return a unique deterministic vector per text.
+        import hashlib
+        result = []
+        for t in texts:
+            h = hashlib.md5(t.encode()).digest()
+            vec = [(b / 255.0) for b in h] * 24  # 384-dim
+            result.append(vec[:384])
+        return result
+
+    monkeypatch.setattr(ms_mod, "embed_batch", fake_batch)
+    # Also stub single embed so add_fact doesn't break if called elsewhere.
+    monkeypatch.setattr(ms_mod, "embed", lambda t: fake_batch([t])[0])
+
+    mem = MemoryStore()
+    triples = [
+        ("svc-a", "calls", "svc-b"),
+        ("svc-b", "calls", "svc-c"),
+        ("svc-c", "calls", "svc-d"),
+    ]
+    results = mem.add_facts(triples)
+    assert len(results) == 3
+    # embed_batch should have been called exactly once with all 3 texts.
+    assert calls == [3], f"expected one batch call with 3 texts, got {calls}"
+
+
 if __name__ == "__main__":
     import traceback
     tests = [

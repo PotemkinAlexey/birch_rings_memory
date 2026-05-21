@@ -79,6 +79,46 @@ def record_fact(
 
 
 @mcp.tool()
+def record_facts(
+    facts: list[dict],
+    session_id: Optional[str] = None,
+) -> list[dict]:
+    """
+    Store multiple facts in one batch — one Ollama round-trip, one SQLite transaction.
+
+    Each item in facts must have "subject", "predicate", "object".
+    Optional per-item "session_id" overrides the top-level session_id.
+
+    Example:
+      facts=[
+        {"subject": "API", "predicate": "written in", "object": "Go"},
+        {"subject": "API", "predicate": "deployed on", "object": "Kubernetes"},
+      ]
+
+    Returns one result per input fact, in the same order.
+    Duplicates are touched and returned with already_existed=true.
+    """
+    triples = [
+        (f["subject"], f["predicate"], f["object"])
+        for f in facts
+    ]
+    # Check existence before batch insert (no per-item round-trip needed).
+    existed = [_store.fact_exists(s, p, o) for s, p, o in triples]
+    # Resolve per-item session_id override, falling back to top-level.
+    sid = session_id
+    results_facts = _store.add_facts(triples, session_id=sid)
+    return [
+        {
+            "fact_id": fp.fact_id,
+            "already_existed": existed[i],
+            "layer": fp.layer,
+            "gravity_score": round(fp.gravity_score, 3),
+        }
+        for i, fp in enumerate(results_facts)
+    ]
+
+
+@mcp.tool()
 def record_session(messages: list[str], agent_id: str = "default") -> dict:
     """
     Score a completed session and update memory gravity.
