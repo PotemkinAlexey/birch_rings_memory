@@ -64,7 +64,12 @@ def query_memory(
         min_layer=min_layer,
         max_layer=max_layer,
     )
-    return [r.to_mcp_dict() for r in results]
+    hits = [r.to_mcp_dict() for r in results]
+    if not session_id:
+        hint = "pass session_id to attribute these reads to a session so gravity updates on session_close"
+    else:
+        hint = "call session_close when the conversation ends to propagate resonance to gravity"
+    return {"results": hits, "_hint": hint}
 
 
 @mcp.tool()
@@ -91,11 +96,16 @@ def record_fact(
     """
     already_existed = _store.fact_exists(subject, predicate, object)
     fact = _store.add_fact(subject, predicate, object, session_id=session_id)
+    if not session_id:
+        hint = "open a session with session_open and pass session_id here so gravity updates when the session closes"
+    else:
+        hint = "call session_close when the conversation ends to propagate resonance to gravity"
     return {
         "fact_id": fact.fact_id,
         "already_existed": already_existed,
         "layer": fact.layer,
         "gravity_score": round(fact.gravity_score, 3),
+        "_hint": hint,
     }
 
 
@@ -128,15 +138,22 @@ def record_facts(
     # Resolve per-item session_id override, falling back to top-level.
     sid = session_id
     results_facts = _store.add_facts(triples, session_id=sid)
-    return [
-        {
-            "fact_id": fp.fact_id,
-            "already_existed": existed[i],
-            "layer": fp.layer,
-            "gravity_score": round(fp.gravity_score, 3),
-        }
-        for i, fp in enumerate(results_facts)
-    ]
+    if not session_id:
+        hint = "open a session with session_open and pass session_id here so gravity updates when the session closes"
+    else:
+        hint = "call session_close when the conversation ends to propagate resonance to gravity"
+    return {
+        "facts": [
+            {
+                "fact_id": fp.fact_id,
+                "already_existed": existed[i],
+                "layer": fp.layer,
+                "gravity_score": round(fp.gravity_score, 3),
+            }
+            for i, fp in enumerate(results_facts)
+        ],
+        "_hint": hint,
+    }
 
 
 @mcp.tool()
@@ -194,7 +211,10 @@ def session_open(session_id: Optional[str] = None, agent_id: str = "default") ->
     """
     sid = session_id or f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(sid)
-    return {"session_id": sid}
+    return {
+        "session_id": sid,
+        "_hint": "pass this session_id to record_fact, record_facts, query_memory, and session_push — then call session_close when done",
+    }
 
 
 @mcp.tool()
@@ -207,7 +227,11 @@ def session_push(text: str, session_id: str) -> dict:
     Do NOT push your own (assistant) responses — only user-side text.
     """
     _store.session_message(text, session_id=session_id)
-    return {"session_id": session_id, "ok": True}
+    return {
+        "session_id": session_id,
+        "ok": True,
+        "_hint": "call session_close when the conversation ends to score resonance and update gravity",
+    }
 
 
 @mcp.tool()
