@@ -26,7 +26,7 @@ def query_memory(
     session_id: Optional[str] = None,
     min_similarity: float = 0.0,
     layers: Optional[list[str]] = None,
-) -> list[dict]:
+) -> dict:
     """
     Search memory for facts relevant to the given text.
 
@@ -113,7 +113,7 @@ def record_fact(
 def record_facts(
     facts: list[dict],
     session_id: Optional[str] = None,
-) -> list[dict]:
+) -> dict:
     """
     Store multiple facts in one batch — one Ollama round-trip, one SQLite transaction.
 
