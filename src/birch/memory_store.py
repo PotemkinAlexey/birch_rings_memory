@@ -484,6 +484,49 @@ class MemoryStore:
 
         return results  # type: ignore[return-value]
 
+    def delete_fact(self, fact_id: str) -> bool:
+        """
+        Permanently remove a fact from the live store.
+
+        Cleans up _facts, _index, _spo_index, gravity engine, and storage.
+        Returns True if the fact existed and was deleted, False if not found.
+        Unlike absorption, this does NOT send the fact to the black hole —
+        the data is gone.
+        """
+        with self._lock:
+            fact = self._facts.pop(fact_id, None)
+            if fact is None:
+                return False
+            self._index.remove(fact_id)
+            self._drop_from_spo_index(fact)
+            self._engine.unregister(fact_id)
+            if self._storage:
+                self._storage.delete_fact(fact_id)
+            return True
+
+    def list_facts(
+        self,
+        subject: Optional[str] = None,
+        predicate: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[FactPassport]:
+        """
+        Return live facts, optionally filtered by subject and/or predicate.
+
+        Matching is case-insensitive substring. Results are sorted by
+        gravity_score descending so the most relevant facts come first.
+        """
+        with self._lock:
+            facts = list(self._facts.values())
+        if subject is not None:
+            needle = subject.lower()
+            facts = [f for f in facts if needle in f.subject.lower()]
+        if predicate is not None:
+            needle = predicate.lower()
+            facts = [f for f in facts if needle in f.predicate.lower()]
+        facts.sort(key=lambda f: f.gravity_score, reverse=True)
+        return facts[:limit]
+
     def link(self, from_id: str, to_id: str) -> None:
         with self._lock:
             self._engine.link(from_id, to_id)
@@ -755,6 +798,7 @@ class MemoryStore:
         max_layer: int = 2,
         hawking: bool = True,
         session_id: Optional[str] = None,
+        min_similarity: float = 0.0,
     ) -> list[QueryResult]:
         """
         Retrieve relevant facts by cosine similarity.
@@ -843,6 +887,8 @@ class MemoryStore:
                     ))
 
             results.sort(key=lambda r: r.similarity, reverse=True)
+            if min_similarity > 0.0:
+                results = [r for r in results if r.similarity >= min_similarity]
             top = results[:top_k]
 
             # Attribution + touch — only on what the caller actually

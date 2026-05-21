@@ -95,6 +95,11 @@ class GravityEngine:
         self._facts[fact.fact_id] = fact
         self._degrees.setdefault(fact.fact_id, 0)
 
+    def unregister(self, fact_id: str) -> None:
+        """Remove a fact from the engine — called on explicit deletion."""
+        self._facts.pop(fact_id, None)
+        self._degrees.pop(fact_id, None)
+
     def link(self, from_id: str, to_id: str) -> None:
         """Record a dependency edge — increases graph degree of to_id."""
         self._degrees[to_id] = self._degrees.get(to_id, 0) + 1

@@ -410,3 +410,67 @@ if __name__ == "__main__":
             print(f"✓  {t.__name__}")
         except Exception as e:
             print(f"✗  {t.__name__}: {e}")
+
+
+def test_delete_fact_removes_from_store():
+    mem = MemoryStore()
+    f = mem.add_fact("service X", "uses", "Redis")
+    assert f.fact_id in mem._facts
+    deleted = mem.delete_fact(f.fact_id)
+    assert deleted is True
+    assert f.fact_id not in mem._facts
+    # SPO slot freed — can insert same triple again.
+    f2 = mem.add_fact("service X", "uses", "Redis")
+    assert f2.fact_id != f.fact_id
+
+
+def test_delete_fact_unknown_returns_false():
+    mem = MemoryStore()
+    assert mem.delete_fact("nonexistent-id") is False
+
+
+def test_list_facts_no_filter():
+    mem = MemoryStore()
+    mem.add_fact("svc-a", "calls", "svc-b")
+    mem.add_fact("svc-b", "calls", "svc-c")
+    facts = mem.list_facts()
+    assert len(facts) == 2
+
+
+def test_list_facts_subject_filter():
+    mem = MemoryStore()
+    mem.add_fact("auth service", "uses", "JWT")
+    mem.add_fact("auth service", "deployed on", "K8s")
+    mem.add_fact("mailer", "uses", "SMTP")
+    facts = mem.list_facts(subject="auth")
+    assert len(facts) == 2
+    assert all("auth" in f.subject for f in facts)
+
+
+def test_query_min_similarity_filters_low_scores(monkeypatch):
+    import birch.memory_store as ms_mod
+    import birch.resonance.embeddings as emb_mod
+
+    # Return a fixed vector for embed so we control similarity.
+    base = [1.0] + [0.0] * 383
+    ortho = [0.0, 1.0] + [0.0] * 382
+
+    call_count = {"n": 0}
+    def fake_embed(text):
+        call_count["n"] += 1
+        return base if "relevant" in text else ortho
+
+    monkeypatch.setattr(ms_mod, "embed", fake_embed)
+    monkeypatch.setattr(ms_mod, "embed_batch", lambda ts: [fake_embed(t) for t in ts])
+    monkeypatch.setattr(emb_mod, "embed", fake_embed)
+
+    mem = MemoryStore()
+    mem.add_fact("relevant topic", "is", "important")
+    mem.add_fact("unrelated topic", "is", "noise")
+
+    results_all = mem.query("relevant query", top_k=5, min_similarity=0.0)
+    results_filtered = mem.query("relevant query", top_k=5, min_similarity=0.5)
+
+    assert len(results_all) == 2
+    assert len(results_filtered) == 1
+    assert results_filtered[0].fact.subject == "relevant topic"
