@@ -83,3 +83,31 @@ def test_graph_degree_lifts_gravity():
 
     engine.tick()
     assert f_linked.gravity_score > f_lonely.gravity_score
+
+
+def test_warm_core_fact_climbs_back_to_kinetic():
+    """A fact sitting in core whose gravity recovers into the kinetic band
+    migrates back up — core is not a one-way trap."""
+    engine = GravityEngine()
+    f = FactPassport("revived", "is", "useful again")
+    f.layer = 2  # start in core
+    engine.register(f)
+    f.touch()
+
+    engine.tick()
+    assert 0.30 <= f.gravity_score <= 0.70, f.gravity_score
+    assert f.layer == 1, f"core fact should climb to kinetic, got {f.layer}"
+
+
+def test_cooled_surface_fact_settles_to_kinetic():
+    """A surface fact whose gravity falls into the kinetic band steps down
+    to kinetic instead of staying stuck on the surface."""
+    engine = GravityEngine()
+    f = FactPassport("was hot", "now", "lukewarm")
+    f.layer = 0  # start on surface
+    engine.register(f)
+    f.touch()
+
+    engine.tick()
+    assert 0.30 <= f.gravity_score <= 0.70, f.gravity_score
+    assert f.layer == 1, f"surface fact should settle to kinetic, got {f.layer}"

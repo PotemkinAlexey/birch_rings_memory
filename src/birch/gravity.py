@@ -105,6 +105,15 @@ def compute_gravity(
     return round(min(1.0, max(0.0, gravity)), 4)
 
 
+def _target_layer(gravity: float) -> int:
+    """The layer a gravity score belongs in: 0 surface, 1 kinetic, 2 core."""
+    if gravity > _LAYER_UP:
+        return 0
+    if gravity < _LAYER_DOWN:
+        return 2
+    return 1
+
+
 def update_gravity(
     fact: GravityBody,
     graph_degree: int = 0,
@@ -112,19 +121,23 @@ def update_gravity(
     now: float | None = None,
 ) -> int | None:
     """
-    Recompute gravity_score in place. Returns new layer if migration triggered.
+    Recompute gravity_score in place. Returns the new layer if it migrated.
 
-    Layer migration:
-      gravity > _LAYER_UP   → promote (layer - 1, min 0)
-      gravity < _LAYER_DOWN → demote  (layer + 1, max 2)
+    Migration steps one layer per tick *toward* the layer the gravity score
+    belongs in — so a fact climbs out of the core once its gravity recovers
+    into the kinetic band, and a cooled surface fact settles back to kinetic.
+    The single-step cap keeps movement gradual and avoids teleporting on a
+    noisy reading.
     """
     fact.gravity_score = compute_gravity(fact, graph_degree, max_degree, now)
 
-    new_layer = fact.layer
-    if fact.gravity_score > _LAYER_UP and fact.layer > 0:
-        new_layer = fact.layer - 1
-    elif fact.gravity_score < _LAYER_DOWN and fact.layer < 2:
-        new_layer = fact.layer + 1
+    target = _target_layer(fact.gravity_score)
+    if target < fact.layer:
+        new_layer = fact.layer - 1   # one step toward the surface
+    elif target > fact.layer:
+        new_layer = fact.layer + 1   # one step toward the core
+    else:
+        new_layer = fact.layer
 
     if new_layer != fact.layer:
         fact.layer = new_layer
