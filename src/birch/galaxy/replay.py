@@ -7,12 +7,11 @@ session's topic as a move of the *attention mass*.
 
 The galaxy then grows and breathes along the store's real timeline: a
 birth lifts a fact to the surface, drag sinks the untouched, resonance
-kicks fight the decay, and the attention mass — parked where the latest
-session's topic sits — tugs the facts you are working with toward it.
+kicks fight the decay, and the attention mass — gliding to where the
+latest session's topic sits — tugs the facts you are working with.
 """
 from __future__ import annotations
 
-import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -22,6 +21,7 @@ import numpy as np
 from ..fact import FactPassport
 from .collapse import collapse_step
 from .engine import Galaxy
+from .loader import fact_direction, fallback_direction
 from .projection import Projector
 
 # Session R (in [-1, 1]) x per-fact weight -> orbital impulse.
@@ -36,7 +36,7 @@ _ATTENTION_GLIDE = 0.03
 class _Birth:
     step: int
     fact_id: str
-    angle: float
+    direction: np.ndarray
     label: str
 
 
@@ -50,7 +50,7 @@ class _Kick:
 @dataclass
 class _Attention:
     step: int
-    angle: float          # topic direction of the session
+    direction: np.ndarray     # unit topic direction of the session
 
 
 @dataclass
@@ -58,6 +58,7 @@ class History:
     """A schedule of births, kicks and attention moves across sim steps."""
 
     steps: int
+    dim: int = 2
     births: list[_Birth] = field(default_factory=list)
     kicks: list[_Kick] = field(default_factory=list)
     attention: list[_Attention] = field(default_factory=list)
@@ -69,14 +70,15 @@ def build_history(
     *,
     steps: int = 1400,
     now: float | None = None,
+    dim: int = 2,
 ) -> History:
     """Schedule births, kicks and attention moves across ``steps`` sim steps.
 
-    Pure: reads facts and session rows (the shape returned by
-    ``SQLiteBackend.load_echo_sessions``), writes nothing.
+    ``dim`` is the galaxy dimensionality the history will be replayed into.
+    Pure: reads facts and session rows, writes nothing.
     """
     now = now if now is not None else time.time()
-    history = History(steps=steps)
+    history = History(steps=steps, dim=dim)
     if not facts:
         return history
 
@@ -89,18 +91,14 @@ def build_history(
         frac = (t - t_start) / span
         return min(steps - 1, max(0, round(frac * (steps - 1))))
 
-    projector = Projector.fit([f.vector for f in facts])
+    projector = Projector.fit([f.vector for f in facts], dim=dim)
 
     for fact in facts:
-        if projector is not None and fact.vector:
-            angle = projector.angle(fact.vector)
-        else:
-            angle = (hash(fact.fact_id) % 360) * math.pi / 180.0
         label = f"{fact.subject} {fact.predicate} {fact.object}"
         history.births.append(_Birth(
             step=step_of(fact.created_at),
             fact_id=fact.fact_id,
-            angle=angle,
+            direction=fact_direction(fact, projector, dim),
             label=label[:60],
         ))
 
@@ -118,7 +116,7 @@ def build_history(
             topic = np.array(centroids, dtype=float).mean(axis=0).tolist()
             history.attention.append(_Attention(
                 step=step_of(session["recorded_at"]),
-                angle=projector.angle(topic),
+                direction=projector.direction(topic),
             ))
     return history
 
@@ -132,10 +130,9 @@ def replay(
 ) -> list[str]:
     """Run ``history`` against ``galaxy``. Returns every fact_id absorbed.
 
-    Every ``collapse_every`` steps, cold bound clumps are checked for Jeans
-    collapse into MetaFacts; every ``hawking_every`` steps the black hole
-    leaks one swallowed body back out. ``on_step(step, galaxy)`` is invoked
-    after each step — used by the renderer to capture animation frames.
+    Every ``collapse_every`` steps cold bound clumps are checked for Jeans
+    collapse; every ``hawking_every`` steps the black hole leaks one body
+    back out. ``on_step(step, galaxy)`` runs after each step.
     """
     births: dict[int, list[_Birth]] = {}
     for b in history.births:
@@ -143,20 +140,23 @@ def replay(
     kicks: dict[int, list[_Kick]] = {}
     for k in history.kicks:
         kicks.setdefault(k.step, []).append(k)
-    # The latest session in a step sets where attention should drift to.
-    attention_target: dict[int, float] = {}
+    attention_target: dict[int, np.ndarray] = {}
     for a in history.attention:
-        attention_target[a.step] = a.angle
+        attention_target[a.step] = a.direction
 
     birth_radius = galaxy.r_surface * 1.05
     attention_radius = 0.5 * (galaxy.r_core + galaxy.r_surface)
-    current: float | None = None      # attention angle, glides toward target
-    target: float | None = None
+    current: np.ndarray | None = None     # attention direction, glides to target
+    target: np.ndarray | None = None
     absorbed: list[str] = []
 
     for step in range(history.steps):
         for b in births.get(step, []):
-            galaxy.place_in_orbit(b.fact_id, birth_radius, b.angle, 1.0, b.label)
+            direction = b.direction
+            if direction.shape[0] != galaxy.dim:
+                direction = fallback_direction(b.fact_id, galaxy.dim)
+            galaxy.place_in_orbit(b.fact_id, birth_radius, direction,
+                                  1.0, b.label)
         for k in kicks.get(step, []):
             if galaxy.kick(k.fact_id, k.strength) and k.strength > 0:
                 body = galaxy.find(k.fact_id)
@@ -164,17 +164,16 @@ def replay(
                     body.mass += _ACCRETION
         if step in attention_target:
             target = attention_target[step]
-            if current is None:       # the first focus simply appears in place
+            if current is None:
                 current = target
         if current is not None and target is not None:
-            # Glide the shortest angular way toward the latest topic — a
-            # gliding mass perturbs the disk gently; a teleporting one shocks it.
-            delta = math.atan2(math.sin(target - current),
-                               math.cos(target - current))
-            current += delta * _ATTENTION_GLIDE
-            galaxy.attention_pos = attention_radius * np.array(
-                [math.cos(current), math.sin(current)]
-            )
+            # Glide toward the latest topic — a gliding mass perturbs the
+            # disk gently; a teleporting one shocks it.
+            current = current + _ATTENTION_GLIDE * (target - current)
+            norm = float(np.linalg.norm(current))
+            if norm > 1e-9:
+                current = current / norm
+            galaxy.attention_pos = attention_radius * current
         absorbed.extend(galaxy.step())
         if collapse_every > 0 and step > 0 and step % collapse_every == 0:
             collapse_step(galaxy)

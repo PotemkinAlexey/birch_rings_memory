@@ -1,10 +1,9 @@
 """Loader — turn BirchKM facts into the bodies of a Galaxy.
 
-The embedding sets a body's *angle* — its place in the topical sky. Freshness
-and earned value set its *radius* — which ring it starts in. Mass is the value
-a fact has accumulated. From there engine.py takes over and the orbits evolve.
-
-Pure: reads facts, writes nothing.
+A fact's embedding, projected through a shared PCA basis, becomes a unit
+*direction* (2-D or 3-D) — its placement in the topical sky. Freshness and
+earned value set the orbit radius and mass. The dynamics in engine.py take
+over from there. Pure: reads facts, writes nothing.
 """
 from __future__ import annotations
 
@@ -17,21 +16,30 @@ from ..fact import FactPassport
 from .engine import Galaxy
 from .projection import Projector
 
-# Freshness half-life — matches the live gravity formula's grace period.
 _FRESHNESS_HALFLIFE_HOURS = 336.0
 _LN2 = math.log(2)
 
 
-def project_to_angles(vectors: list[list[float]]) -> np.ndarray:
-    """PCA every embedding to 2D and return each one's polar angle.
+def fallback_direction(fact_id: str, dim: int) -> np.ndarray:
+    """A deterministic unit direction for a fact with no usable embedding."""
+    rng = np.random.default_rng(abs(hash(fact_id)) & 0xFFFFFFFF)
+    vec = rng.normal(size=dim)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-9:
+        vec = np.zeros(dim)
+        vec[0] = 1.0
+        return vec
+    return vec / norm
 
-    Only the angle is kept — it carries the semantic direction; a body's
-    radius comes from vitality, not from the embedding magnitude.
-    """
-    projector = Projector.fit(vectors)
-    if projector is None:
-        return np.zeros(len(vectors))
-    return np.array([projector.angle(v) for v in vectors])
+
+def fact_direction(
+    fact: FactPassport, projector: Projector | None, dim: int
+) -> np.ndarray:
+    """Unit placement direction for a fact — the PCA of its embedding, or a
+    deterministic fallback when it has no usable vector."""
+    if projector is not None and fact.vector:
+        return projector.direction(fact.vector)
+    return fallback_direction(fact.fact_id, dim)
 
 
 def _vitality(fact: FactPassport, value: float, now: float) -> float:
@@ -47,19 +55,17 @@ def build_galaxy(
     now: float | None = None,
     galaxy: Galaxy | None = None,
 ) -> Galaxy:
-    """Build a Galaxy from BirchKM facts."""
+    """Build a Galaxy from BirchKM facts — a static snapshot, all placed at once."""
     now = now if now is not None else time.time()
     gal = galaxy if galaxy is not None else Galaxy()
 
-    angles = project_to_angles([f.vector for f in facts])
-    for fact, angle in zip(facts, angles):
+    projector = Projector.fit([f.vector for f in facts], dim=gal.dim)
+    for fact in facts:
         value = math.log1p(fact.access_count) + max(0.0, fact.resonance_sum)
         mass = 1.0 + 1.5 * value
         vitality = _vitality(fact, value, now)
         radius = gal.horizon + (gal.r_surface * 1.15 - gal.horizon) * vitality
-        if not fact.vector:
-            # No embedding — scatter deterministically by id.
-            angle = (hash(fact.fact_id) % 360) * math.pi / 180.0
+        direction = fact_direction(fact, projector, gal.dim)
         label = f"{fact.subject} {fact.predicate} {fact.object}"
-        gal.place_in_orbit(fact.fact_id, radius, float(angle), mass, label[:60])
+        gal.place_in_orbit(fact.fact_id, radius, direction, mass, label[:60])
     return gal

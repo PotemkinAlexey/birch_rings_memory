@@ -61,7 +61,7 @@ def _internal_energy(group: list[Body], g: float) -> tuple[float, float]:
     pe = 0.0
     for i in range(len(group)):
         for j in range(i + 1, len(group)):
-            dist = float(np.hypot(*(pos[i] - pos[j]))) + 1e-6
+            dist = float(np.linalg.norm(pos[i] - pos[j])) + 1e-6
             pe -= g * mass[i] * mass[j] / dist
     return ke, pe
 

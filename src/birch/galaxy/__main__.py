@@ -1,6 +1,7 @@
 """python -m birch.galaxy — replay the real BirchKM store and diagnose it.
 
   python -m birch.galaxy            one replay: GIF, final still, diagnosis
+  python -m birch.galaxy --3d       replay in 3-D: a rotating-camera GIF
   python -m birch.galaxy --watch    live: re-render whenever the store changes
 
 Read-only. Loads facts and session history from the store, replays them as
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from ..storage.sqlite import SQLiteBackend
 from .engine import Galaxy
-from .render import render, render_animation
+from .render import render, render_3d, render_animation
 from .replay import build_history, replay
 from .report import diagnose, format_report
 
@@ -34,21 +35,25 @@ def _load() -> tuple[list, list]:
     return facts, sessions
 
 
-def main() -> None:
+def main(dim: int = 2) -> None:
     facts, sessions = _load()
     print(f"loaded {len(facts)} facts and {len(sessions)} sessions from {_DB}")
 
-    history = build_history(facts, sessions, steps=_STEPS)
-    galaxy = Galaxy(attention_mass=40.0)
+    history = build_history(facts, sessions, steps=_STEPS, dim=dim)
+    galaxy = Galaxy(attention_mass=40.0, dim=dim)
     _OUT.mkdir(parents=True, exist_ok=True)
 
-    gif, absorbed = render_animation(galaxy, history, str(_OUT / "galaxy.gif"))
-    print("wrote", gif)
-    still = render(
-        galaxy, str(_OUT / "galaxy_final.png"),
-        title="BirchKM memory galaxy — end of history",
-    )
-    print("wrote", still)
+    if dim == 3:
+        absorbed = replay(galaxy, history)
+        print("wrote", render_3d(galaxy, str(_OUT / "galaxy_3d.gif")))
+    else:
+        gif, absorbed = render_animation(galaxy, history, str(_OUT / "galaxy.gif"))
+        print("wrote", gif)
+        still = render(
+            galaxy, str(_OUT / "galaxy_final.png"),
+            title="BirchKM memory galaxy — end of history",
+        )
+        print("wrote", still)
 
     labels = {f.fact_id: f"{f.subject} {f.predicate} {f.object}" for f in facts}
     report = diagnose(galaxy, absorbed_ids=absorbed, fact_labels=labels)
@@ -97,4 +102,4 @@ if __name__ == "__main__":
     if "--watch" in sys.argv:
         watch()
     else:
-        main()
+        main(dim=3 if "--3d" in sys.argv else 2)

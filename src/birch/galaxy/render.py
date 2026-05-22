@@ -172,3 +172,58 @@ def render_animation(
     anim.save(path, writer=PillowWriter(fps=12))
     plt.close(fig)
     return path, absorbed
+
+
+def render_3d(galaxy: Galaxy, path: str, frames: int = 72) -> str:
+    """Write a rotating-camera GIF of a settled 3-D galaxy.
+
+    Takes an already-replayed galaxy and orbits the camera once around it,
+    so the inclined orbits read as a disk-with-halo volume.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    bodies = [
+        (float(b.pos[0]), float(b.pos[1]),
+         float(b.pos[2]) if b.pos.shape[0] > 2 else 0.0,
+         galaxy.ring_of(b), b.mass, b.kind)
+        for b in galaxy.bodies
+    ]
+    span = galaxy.r_surface * 1.35
+
+    fig = plt.figure(figsize=(9, 9), facecolor="#0b0b14")
+    ax = fig.add_subplot(projection="3d")
+
+    def draw(frame_idx: int) -> None:
+        ax.clear()
+        ax.set_axis_off()
+        ax.patch.set_alpha(0.0)          # let the dark figure show through
+        ax.scatter([0], [0], [0], s=44, c="#ff5555")
+        for ring, colour in _RING_COLOUR.items():
+            pts = [(x, y, z, m) for (x, y, z, r, m, k) in bodies
+                   if k == "fact" and r == ring]
+            if pts:
+                ax.scatter([p[0] for p in pts], [p[1] for p in pts],
+                           [p[2] for p in pts],
+                           s=[12 + 26 * p[3] for p in pts],
+                           c=colour, alpha=0.8, edgecolors="none")
+        metas = [(x, y, z, m) for (x, y, z, r, m, k) in bodies if k == "meta"]
+        if metas:
+            ax.scatter([p[0] for p in metas], [p[1] for p in metas],
+                       [p[2] for p in metas],
+                       s=[min(420.0, 70 + 22 * p[3]) for p in metas],
+                       c="#ffffff", marker="*", edgecolors="#b070ff",
+                       linewidths=1.0)
+        ax.set_xlim(-span, span)
+        ax.set_ylim(-span, span)
+        ax.set_zlim(-span, span)
+        ax.view_init(elev=20, azim=frame_idx * 360.0 / frames)
+
+    fig.suptitle("BirchKM memory galaxy — 3D", color="#dddddd", fontsize=12)
+    anim = FuncAnimation(fig, draw, frames=frames, interval=90)  # type: ignore[arg-type]
+    anim.save(path, writer=PillowWriter(fps=14))
+    plt.close(fig)
+    return path

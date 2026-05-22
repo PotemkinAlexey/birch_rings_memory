@@ -45,12 +45,25 @@ class Body:
 
     @property
     def radius(self) -> float:
-        """Distance from the central black hole."""
-        return float(math.hypot(self.pos[0], self.pos[1]))
+        """Distance from the central black hole (any dimension)."""
+        return float(np.linalg.norm(self.pos))
 
     @property
     def speed(self) -> float:
-        return float(math.hypot(self.vel[0], self.vel[1]))
+        return float(np.linalg.norm(self.vel))
+
+
+def _unit_perpendicular(direction: np.ndarray) -> np.ndarray:
+    """A unit vector orthogonal to ``direction``, chosen deterministically.
+
+    Works in any dimension: it Gram-Schmidts the axis least aligned with
+    ``direction``. In 3D this gives each orbit its own inclined plane.
+    """
+    ref = np.zeros_like(direction, dtype=float)
+    ref[int(np.argmin(np.abs(direction)))] = 1.0
+    perp = ref - float(ref @ direction) * direction
+    norm = float(np.linalg.norm(perp))
+    return perp / norm if norm > 1e-9 else ref
 
 
 # Ring names, ordered from the black hole outward.
@@ -81,7 +94,9 @@ class Galaxy:
         r_surface: float = 14.0,
         attention_mass: float = 0.0,
         attention_softening: float = 4.0,
+        dim: int = 2,
     ) -> None:
+        self.dim = dim
         self.g = g
         self.central_mass = central_mass
         self.softening = softening
@@ -119,13 +134,18 @@ class Galaxy:
         self,
         fact_id: str,
         radius: float,
-        angle: float,
+        direction: np.ndarray,
         mass: float,
         label: str = "",
     ) -> Body:
-        """Add a body on a circular orbit at (radius, angle). Returns it."""
-        direction = np.array([math.cos(angle), math.sin(angle)])
-        tangent = np.array([-direction[1], direction[0]])
+        """Add a body on a circular orbit at ``radius`` along unit ``direction``.
+
+        The orbital plane is ``direction`` and a deterministic perpendicular,
+        so in 3D different directions give different inclinations — a disk
+        with a halo rather than one flat plane.
+        """
+        direction = np.asarray(direction, dtype=float)
+        tangent = _unit_perpendicular(direction)
         body = Body(
             fact_id=fact_id,
             pos=direction * radius,
@@ -230,13 +250,15 @@ class Galaxy:
         body = self._swallowed.pop(0)
         while body.fact_id in self.absorbed:
             self.absorbed.remove(body.fact_id)
-        angle = (math.atan2(body.pos[1], body.pos[0])
-                 if body.radius > 1e-6 else 0.0)
-        direction = np.array([math.cos(angle), math.sin(angle)])
-        tangent = np.array([-direction[1], direction[0]])
+        norm = float(np.linalg.norm(body.pos))
+        if norm > 1e-6:
+            direction = body.pos / norm
+        else:
+            direction = np.zeros(self.dim)
+            direction[0] = 1.0
         radius = self.r_core + 1.0
         body.pos = direction * radius
-        body.vel = tangent * self.circular_speed(radius)
+        body.vel = _unit_perpendicular(direction) * self.circular_speed(radius)
         self.bodies.append(body)
         self.hawking_count += 1
         return body
@@ -254,10 +276,10 @@ class Galaxy:
                 continue
             r = max(b.radius, self.softening)
             radial = b.pos / r
-            tangent = np.array([-radial[1], radial[0]])
-            # Align the tangential push with current travel direction.
-            if float(b.vel @ tangent) < 0:
-                tangent = -tangent
+            # Tangential push follows the body's own travel direction — the
+            # orbital plane, in any dimension.
+            speed = b.speed
+            tangent = b.vel / speed if speed > 1e-9 else _unit_perpendicular(radial)
             b.vel = b.vel + strength * (0.7 * tangent + 0.3 * radial)
             return True
         return False

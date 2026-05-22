@@ -1,5 +1,4 @@
 """Galaxy N-body engine — orbital physics and history replay."""
-import math
 import time
 
 import numpy as np
@@ -7,7 +6,7 @@ import numpy as np
 from birch.fact import FactPassport
 from birch.galaxy.collapse import collapse_step, friends_of_friends
 from birch.galaxy.engine import CORE, KINETIC, SURFACE, Body, Galaxy
-from birch.galaxy.loader import build_galaxy, project_to_angles
+from birch.galaxy.loader import build_galaxy
 from birch.galaxy.projection import Projector
 from birch.galaxy.replay import build_history, replay
 from birch.galaxy.report import GalaxyReport, diagnose, format_report, run_diagnosis
@@ -16,7 +15,7 @@ from birch.galaxy.report import GalaxyReport, diagnose, format_report, run_diagn
 def test_circular_orbit_is_stable():
     """A body placed on a circular orbit stays near its radius (no drag)."""
     gal = Galaxy(drag=0.0)
-    body = gal.place_in_orbit("f", radius=10.0, angle=0.0, mass=1.0)
+    body = gal.place_in_orbit("f", radius=10.0, direction=np.array([1.0, 0.0]), mass=1.0)
     gal.run(400)
     assert 8.5 < body.radius < 11.5, body.radius
 
@@ -24,7 +23,7 @@ def test_circular_orbit_is_stable():
 def test_drag_decays_the_orbit():
     """Dynamical friction spirals an untouched body inward."""
     gal = Galaxy(drag=0.05)
-    body = gal.place_in_orbit("f", radius=12.0, angle=0.0, mass=1.0)
+    body = gal.place_in_orbit("f", radius=12.0, direction=np.array([1.0, 0.0]), mass=1.0)
     start = body.radius
     gal.run(400)
     assert body.radius < start, (start, body.radius)
@@ -33,7 +32,7 @@ def test_drag_decays_the_orbit():
 def test_body_spiralling_past_the_horizon_is_absorbed():
     """Heavy friction drags a body down across the event horizon."""
     gal = Galaxy(drag=0.4)
-    gal.place_in_orbit("doomed", radius=4.0, angle=0.0, mass=1.0)
+    gal.place_in_orbit("doomed", radius=4.0, direction=np.array([1.0, 0.0]), mass=1.0)
     absorbed = gal.run(2000)
     assert "doomed" in absorbed
     assert gal.bodies == []
@@ -43,7 +42,7 @@ def test_body_spiralling_past_the_horizon_is_absorbed():
 def test_kick_raises_the_orbit():
     """A resonance kick boosts a body to a higher orbit."""
     gal = Galaxy(drag=0.0)
-    gal.place_in_orbit("f", radius=8.0, angle=0.0, mass=1.0)
+    gal.place_in_orbit("f", radius=8.0, direction=np.array([1.0, 0.0]), mass=1.0)
     before = _mean_radius(gal, "f", 120)
     gal.kick("f", strength=4.0)
     after = _mean_radius(gal, "f", 120)
@@ -72,7 +71,7 @@ def test_ring_assignment_by_radius():
 
 def test_total_energy_decays_under_drag():
     gal = Galaxy(drag=0.05)
-    gal.place_in_orbit("f", radius=10.0, angle=0.0, mass=1.0)
+    gal.place_in_orbit("f", radius=10.0, direction=np.array([1.0, 0.0]), mass=1.0)
     e_start = gal.total_energy()
     gal.run(300)
     assert gal.total_energy() < e_start
@@ -90,13 +89,6 @@ def test_build_galaxy_from_facts():
     assert len(gal.bodies) == 3
     # Every body sits on a sane orbit, clear of the event horizon.
     assert all(b.radius > gal.horizon for b in gal.bodies)
-
-
-def test_project_to_angles_shape():
-    vecs = [list(np.random.default_rng(i).normal(size=6)) for i in range(5)]
-    angles = project_to_angles(vecs)
-    assert angles.shape == (5,)
-    assert np.all(np.abs(angles) <= math.pi)
 
 
 def test_replay_births_facts_across_the_timeline():
@@ -244,16 +236,20 @@ def test_hawking_emit_is_none_when_nothing_swallowed():
     assert Galaxy().hawking_emit() is None
 
 
-def test_projector_is_consistent():
+def test_projector_projects_to_unit_directions():
     rng = np.random.default_rng(7)
     vecs = [list(rng.normal(size=10)) for _ in range(8)]
-    projector = Projector.fit(vecs)
+    projector = Projector.fit(vecs, dim=2)
     assert projector is not None
-    assert projector.dim == 10
-    assert projector.angle(vecs[0]) == projector.angle(vecs[0])
-    assert -math.pi <= projector.angle(vecs[3]) <= math.pi
-    # Too little data to fit a 2D basis.
+    assert projector.out_dim == 2
+    d = projector.direction(vecs[0])
+    assert d.shape == (2,)
+    assert abs(float(np.linalg.norm(d)) - 1.0) < 1e-6
+    # Too little data to fit a basis.
     assert Projector.fit([[1.0, 2.0]]) is None
+    # A 3-D projection.
+    proj3 = Projector.fit(vecs, dim=3)
+    assert proj3 is not None and proj3.out_dim == 3
 
 
 def test_attention_mass_attracts_a_body():
@@ -275,6 +271,44 @@ def test_attention_mass_attracts_a_body():
     # Without attention the body just falls toward the hole (-x);
     # the attention mass at x=12 drags it the other way.
     assert pulled_body.pos[0] > plain_body.pos[0]
+
+
+def test_galaxy_runs_in_3d():
+    """The engine integrates a 3-D galaxy — orbits stay bounded."""
+    gal = Galaxy(dim=3, drag=0.0)
+    body = gal.place_in_orbit(
+        "f", radius=10.0, direction=np.array([1.0, 0.0, 0.0]), mass=1.0)
+    assert body.pos.shape == (3,)
+    gal.run(300)
+    assert 8.0 < body.radius < 12.0
+
+
+def test_3d_orbits_lie_in_different_planes():
+    """Different directions give orbits in different planes — a real 3-D
+    structure, not one flat disk."""
+    gal = Galaxy(dim=3, drag=0.0)
+    flat = gal.place_in_orbit("a", 10.0, np.array([1.0, 0.0, 0.0]), 1.0)
+    steep = gal.place_in_orbit("b", 10.0, np.array([0.0, 0.0, 1.0]), 1.0)
+    z_flat, z_steep = [], []
+    for _ in range(200):
+        gal.step()
+        z_flat.append(abs(float(flat.pos[2])))
+        z_steep.append(abs(float(steep.pos[2])))
+    assert max(z_flat) < 1.0      # 'a' orbits flat in the x-y plane
+    assert max(z_steep) > 3.0     # 'b' genuinely uses the z axis
+
+
+def test_build_history_carries_3d_directions():
+    now = time.time()
+    facts = []
+    for i in range(6):
+        f = FactPassport(f"s{i}", "p", "o")
+        f.created_at = now - 5 * 86400
+        f.vector = list(np.random.default_rng(i).normal(size=8))
+        facts.append(f)
+    history = build_history(facts, [], steps=200, now=now, dim=3)
+    assert history.dim == 3
+    assert all(b.direction.shape == (3,) for b in history.births)
 
 
 def test_build_history_schedules_attention_from_sessions():
