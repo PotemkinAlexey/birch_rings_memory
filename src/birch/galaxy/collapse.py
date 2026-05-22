@@ -75,7 +75,12 @@ def is_jeans_unstable(group: list[Body], g: float, min_group: int) -> bool:
 
 
 def collapse_group(group: list[Body]) -> Body:
-    """Fuse a group into one MetaFact body — mass and momentum conserved."""
+    """Fuse a group into one MetaFact body — mass and momentum conserved.
+
+    A group that contains MetaFacts collapses recursively: the new body's
+    ``depth`` is one above the deepest member, and ``source_ids`` flattens
+    every original fact, however many collapse layers deep it sits.
+    """
     mass = np.array([b.mass for b in group])
     pos = np.array([b.pos for b in group])
     vel = np.array([b.vel for b in group])
@@ -84,15 +89,18 @@ def collapse_group(group: list[Body]) -> Body:
     sources: list[str] = []
     for b in group:
         sources.extend(b.source_ids if b.kind == "meta" else [b.fact_id])
+    depth = 1 + max((b.depth for b in group), default=0)
+    tier = "meta" if depth == 1 else f"meta^{depth}"
 
     return Body(
         fact_id=f"meta-{uuid.uuid4().hex[:8]}",
         pos=(mass[:, None] * pos).sum(axis=0) / total,
         vel=(mass[:, None] * vel).sum(axis=0) / total,
         mass=total,
-        label=f"meta · {len(sources)} facts",
+        label=f"{tier} · {len(sources)} facts",
         kind="meta",
         source_ids=sources,
+        depth=depth,
     )
 
 

@@ -185,6 +185,29 @@ def test_jeans_collapse_fuses_a_cold_clump():
     assert gal.bodies == metas
 
 
+def test_metafacts_recursively_collapse():
+    """Cold, clustered MetaFacts collapse into a deeper MetaFact — every
+    original fact flattened, depth incremented."""
+    gal = Galaxy()
+    for i in range(4):
+        gal.add_body(Body(
+            f"m{i}",
+            np.array([5.0 + 0.2 * i, 0.0]),
+            np.array([0.0, 0.04 * i - 0.06]),   # cold
+            mass=8.0,
+            kind="meta",
+            source_ids=[f"f{i}a", f"f{i}b"],
+            depth=1,
+        ))
+    metas = collapse_step(gal, linking_length=2.0, min_group=4)
+    assert len(metas) == 1
+    super_meta = metas[0]
+    assert super_meta.kind == "meta"
+    assert super_meta.depth == 2
+    assert sorted(super_meta.source_ids) == sorted(
+        f"f{i}{x}" for i in range(4) for x in ("a", "b"))
+
+
 def test_hot_group_resists_collapse():
     """A clump with large velocity dispersion is too hot to collapse."""
     gal = Galaxy()
@@ -198,6 +221,27 @@ def test_hot_group_resists_collapse():
     metas = collapse_step(gal, linking_length=2.0, min_group=4)
     assert metas == []
     assert len(gal.bodies) == 4
+
+
+def test_hawking_emission_returns_a_swallowed_body():
+    """The black hole leaks a swallowed body back onto an orbit."""
+    gal = Galaxy()
+    gal.add_body(Body("doomed", np.array([0.5, 0.0]), np.zeros(2), 1.0))
+    gal.step()  # crosses the horizon, is absorbed
+    assert gal.bodies == []
+    assert "doomed" in gal.absorbed
+
+    emitted = gal.hawking_emit()
+    assert emitted is not None
+    assert emitted.fact_id == "doomed"
+    assert emitted in gal.bodies
+    assert "doomed" not in gal.absorbed
+    assert emitted.radius > gal.horizon
+    assert gal.hawking_count == 1
+
+
+def test_hawking_emit_is_none_when_nothing_swallowed():
+    assert Galaxy().hawking_emit() is None
 
 
 def test_projector_is_consistent():

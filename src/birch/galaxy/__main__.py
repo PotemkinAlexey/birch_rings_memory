@@ -44,6 +44,7 @@ def main() -> None:
     report = diagnose(galaxy, absorbed_ids=absorbed, fact_labels=labels)
     print()
     print(format_report(report))
+    print(f"\nHawking emissions during the replay: {galaxy.hawking_count}")
 
 
 if __name__ == "__main__":

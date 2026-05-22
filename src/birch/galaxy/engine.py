@@ -30,6 +30,8 @@ class Body:
 
     ``kind`` is "fact" for an ordinary body or "meta" for a MetaFact formed
     by a Jeans collapse; ``source_ids`` lists the facts a MetaFact swallowed.
+    ``depth`` is 0 for a fact, 1 for a MetaFact, 2+ for a MetaFact that
+    collapsed out of other MetaFacts — recursive structure formation.
     """
 
     fact_id: str
@@ -39,6 +41,7 @@ class Body:
     label: str = ""          # short human label, for rendering only
     kind: str = "fact"       # "fact" | "meta"
     source_ids: list[str] = field(default_factory=list)
+    depth: int = 0           # 0 fact, 1 meta, 2+ meta-of-metas
 
     @property
     def radius(self) -> float:
@@ -95,6 +98,10 @@ class Galaxy:
         self.bodies: list[Body] = []
         self.absorbed: list[str] = []
         self.steps = 0
+        # Bodies that crossed the horizon, kept so Hawking emission can
+        # leak them back out; absorbed holds their ids for the record.
+        self._swallowed: list[Body] = []
+        self.hawking_count = 0
         # A second, externally-driven attractor: the user's current focus.
         # Set by the replay; None means no attention pull is active.
         self.attention_pos: np.ndarray | None = None
@@ -203,11 +210,36 @@ class Galaxy:
         for b in self.bodies:
             if b.radius < self.horizon:
                 fell_in.append(b.fact_id)
+                self._swallowed.append(b)
             else:
                 survivors.append(b)
         self.bodies = survivors
         self.absorbed.extend(fell_in)
         return fell_in
+
+    def hawking_emit(self) -> Body | None:
+        """Spontaneously leak the oldest swallowed body back onto an orbit.
+
+        The galaxy's analogue of Hawking radiation: the black hole is not
+        perfectly final. A long-forgotten body occasionally returns to a
+        precarious inner-kinetic orbit, where it must earn a kick or sink
+        straight back in. Returns the emitted body, or None if empty.
+        """
+        if not self._swallowed:
+            return None
+        body = self._swallowed.pop(0)
+        while body.fact_id in self.absorbed:
+            self.absorbed.remove(body.fact_id)
+        angle = (math.atan2(body.pos[1], body.pos[0])
+                 if body.radius > 1e-6 else 0.0)
+        direction = np.array([math.cos(angle), math.sin(angle)])
+        tangent = np.array([-direction[1], direction[0]])
+        radius = self.r_core + 1.0
+        body.pos = direction * radius
+        body.vel = tangent * self.circular_speed(radius)
+        self.bodies.append(body)
+        self.hawking_count += 1
+        return body
 
     def kick(self, fact_id: str, strength: float) -> bool:
         """Apply an orbital impulse to a body — the thrust of a resonance hit.
