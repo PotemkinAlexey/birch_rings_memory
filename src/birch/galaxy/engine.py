@@ -208,6 +208,13 @@ class Galaxy:
             return True
         return False
 
+    def find(self, fact_id: str) -> Body | None:
+        """Return the live body for a fact, or None if it is gone."""
+        for b in self.bodies:
+            if b.fact_id == fact_id:
+                return b
+        return None
+
     # ── Observation ─────────────────────────────────────────────────────────
 
     def ring_of(self, body: Body) -> str:

@@ -67,3 +67,73 @@ def render(galaxy: Galaxy, path: str, title: str = "BirchKM memory galaxy") -> s
     fig.savefig(path, dpi=110, facecolor="#0b0b14", bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+def render_animation(
+    galaxy: Galaxy,
+    history: object,
+    path: str,
+    frames: int = 150,
+) -> str:
+    """Replay ``history`` and write an animated GIF of the galaxy forming.
+
+    ``history`` is a replay.History; typed loosely to keep render.py free
+    of a hard import cycle with replay.py.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    from .replay import replay
+
+    total_steps = getattr(history, "steps", 1)
+    interval = max(1, total_steps // frames)
+    snaps: list[tuple[int, int, list]] = []
+
+    def capture(step: int, gal: Galaxy) -> None:
+        if step % interval == 0 or step == total_steps - 1:
+            snaps.append((
+                step,
+                len(gal.absorbed),
+                [(float(b.pos[0]), float(b.pos[1]), gal.ring_of(b), b.mass)
+                 for b in gal.bodies],
+            ))
+
+    replay(galaxy, history, on_step=capture)  # type: ignore[arg-type]
+
+    fig, ax = plt.subplots(figsize=(9, 9), facecolor="#0b0b14")
+    span = galaxy.r_surface * 1.6
+
+    def draw(frame_idx: int) -> None:
+        ax.clear()
+        ax.set_facecolor("#0b0b14")
+        step, absorbed, bodies = snaps[frame_idx]
+        for radius in (galaxy.horizon, galaxy.r_core, galaxy.r_surface):
+            ax.add_patch(plt.Circle((0, 0), radius, fill=False, color="#333344",
+                                    linestyle="--", linewidth=0.8))
+        ax.add_patch(plt.Circle((0, 0), galaxy.horizon, color="black", zorder=3))
+        ax.scatter([0], [0], s=12, color="#ff5555", zorder=4)
+        for ring, colour in _RING_COLOUR.items():
+            pts = [(x, y, m) for (x, y, r, m) in bodies if r == ring]
+            if pts:
+                ax.scatter([p[0] for p in pts], [p[1] for p in pts],
+                           s=[12 + 26 * p[2] for p in pts], c=colour,
+                           alpha=0.82, edgecolors="none")
+        ax.set_xlim(-span, span)
+        ax.set_ylim(-span, span)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(
+            f"BirchKM memory galaxy — step {step}   ·   "
+            f"{len(bodies)} live   ·   {absorbed} absorbed",
+            color="#dddddd", fontsize=12,
+        )
+
+    # draw returns None (no blitting) — matplotlib's stub wants artists.
+    anim = FuncAnimation(fig, draw, frames=len(snaps), interval=80)  # type: ignore[arg-type]
+    anim.save(path, writer=PillowWriter(fps=12))
+    plt.close(fig)
+    return path

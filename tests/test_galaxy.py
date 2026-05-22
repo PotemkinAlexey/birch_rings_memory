@@ -1,11 +1,13 @@
-"""Galaxy N-body engine — orbital physics."""
+"""Galaxy N-body engine — orbital physics and history replay."""
 import math
+import time
 
 import numpy as np
 
 from birch.fact import FactPassport
 from birch.galaxy.engine import CORE, KINETIC, SURFACE, Body, Galaxy
 from birch.galaxy.loader import build_galaxy, project_to_angles
+from birch.galaxy.replay import build_history, replay
 
 
 def test_circular_orbit_is_stable():
@@ -92,3 +94,55 @@ def test_project_to_angles_shape():
     angles = project_to_angles(vecs)
     assert angles.shape == (5,)
     assert np.all(np.abs(angles) <= math.pi)
+
+
+def test_replay_births_facts_across_the_timeline():
+    """Facts created at different times are born at different sim steps."""
+    now = time.time()
+    facts = []
+    for i in range(5):
+        f = FactPassport(f"s{i}", "p", "o")
+        f.created_at = now - (10 - i) * 86400      # 10, 9, 8, 7, 6 days old
+        facts.append(f)
+    history = build_history(facts, [], steps=200, now=now)
+    steps = sorted(b.step for b in history.births)
+    assert steps[0] < steps[-1], steps
+
+
+def test_replay_resonance_keeps_a_fact_alive():
+    """A fact a positive session resonates survives higher than an identical
+    fact that is never touched."""
+    now = time.time()
+    kept = FactPassport("kept", "is", "useful")
+    lost = FactPassport("lost", "is", "ignored")
+    for f in (kept, lost):
+        f.created_at = now - 20 * 86400
+    sessions = [{
+        "recorded_at": now - 9 * 86400,
+        "r_score": 0.85,
+        "fact_weights": {kept.fact_id: 1.0},
+    }]
+    history = build_history([kept, lost], sessions, steps=900, now=now)
+    galaxy = Galaxy()
+    replay(galaxy, history)
+
+    kept_body = galaxy.find(kept.fact_id)
+    lost_body = galaxy.find(lost.fact_id)
+    assert kept_body is not None, "the resonated fact should survive"
+    if lost_body is not None:
+        assert kept_body.radius > lost_body.radius
+
+
+def test_replay_on_empty_store():
+    galaxy = Galaxy()
+    assert replay(galaxy, build_history([], [], steps=50)) == []
+
+
+def test_replay_on_step_callback_fires_each_step():
+    now = time.time()
+    fact = FactPassport("a", "b", "c")
+    fact.created_at = now - 86400
+    history = build_history([fact], [], steps=30, now=now)
+    seen: list[int] = []
+    replay(Galaxy(), history, on_step=lambda step, gal: seen.append(step))
+    assert seen == list(range(30))
