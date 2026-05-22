@@ -18,6 +18,8 @@ class GravityBody(Protocol):
     layer: int
     access_count: int
     last_accessed: float
+    created_at: float
+    resonance_count: int
 
     @property
     def fact_id(self) -> str: ...
@@ -34,10 +36,20 @@ class GravityBody(Protocol):
 _LAYER_UP = 0.70    # gravity > 0.70 → promote to faster layer
 _LAYER_DOWN = 0.30  # gravity < 0.30 → demote to slower layer
 
-# Weights for the three components
-_W_ACCESS = 0.35
-_W_RESONANCE = 0.45
-_W_GRAPH = 0.20
+# Component weights — sum to 1.0
+_W_FRESHNESS = 0.35   # how recently the fact was created
+_W_ACCESS = 0.20      # recency-weighted access frequency
+_W_RESONANCE = 0.35   # avg resonance of sessions that used it
+_W_GRAPH = 0.10       # connectivity in the knowledge graph
+
+# Freshness half-life — a new fact is presumed relevant and rides high,
+# then sinks as it ages untouched. This is the grace period: a fresh fact
+# is not archived before it has had a chance to prove itself.
+_FRESHNESS_HALFLIFE_HOURS = 336.0   # ~2 weeks
+# Access half-life — how fast an un-revisited fact loses its access boost.
+_ACCESS_HALFLIFE_HOURS = 72.0       # ~3 days
+
+_LN2 = math.log(2)
 
 
 def compute_gravity(
@@ -47,31 +59,46 @@ def compute_gravity(
     now: float | None = None,
 ) -> float:
     """
-    Compute gravity_score for a fact.
+    Compute gravity_score for a memory body. Returns a float in [0.0, 1.0].
 
-    Components:
-      access_score   — recency-weighted access frequency
-      resonance_score — avg R of sessions that used this fact, normalized to [0,1]
-      graph_score    — relative connectivity in the knowledge graph
+    Four components:
+      freshness  — decays from 1.0 by age since creation. A new fact starts
+                   buoyant; this is the grace period that keeps a just-created
+                   fact out of the cold core before it can prove itself.
+      access     — log-scaled access count, decayed by time since last touch.
+      resonance  — avg R of sessions that used it; 0 until a session scores it,
+                   so an un-resonated fact is not propped up by a neutral 0.5.
+      graph      — connectivity relative to the most-connected fact.
 
-    Returns float in [0.0, 1.0].
+    A fact rides high while fresh, climbs to the surface when used and
+    resonant, and sinks through the core toward the black hole as it ages
+    untouched.
     """
     now = now or time.time()
 
-    # Access score: log-scaled count, decayed by time since last access
-    age_hours = max(1.0, (now - fact.last_accessed) / 3600)
-    access_raw = math.log1p(fact.access_count) / math.log1p(100)  # saturates at 100 hits
-    decay = math.exp(-0.05 * age_hours)                            # half-life ~14h
-    access_score = min(1.0, access_raw * decay)
+    # Freshness: exponential decay from creation time.
+    age_hours = max(0.0, (now - fact.created_at) / 3600)
+    freshness = math.exp(-age_hours * _LN2 / _FRESHNESS_HALFLIFE_HOURS)
 
-    # Resonance score: avg_resonance lives in [-1, +1], map to [0, 1]
-    resonance_score = (fact.avg_resonance + 1.0) / 2.0
+    # Access: log-scaled count, decayed by time since last access.
+    idle_hours = max(0.0, (now - fact.last_accessed) / 3600)
+    access_raw = math.log1p(fact.access_count) / math.log1p(100)  # saturates at 100
+    access_decay = math.exp(-idle_hours * _LN2 / _ACCESS_HALFLIFE_HOURS)
+    access_score = min(1.0, access_raw * access_decay)
 
-    # Graph score: degree relative to max in the store
+    # Resonance: avg_resonance lives in [-1, +1] → [0, 1]. Only counts once a
+    # session has actually scored the fact.
+    if fact.resonance_count > 0:
+        resonance_score = (fact.avg_resonance + 1.0) / 2.0
+    else:
+        resonance_score = 0.0
+
+    # Graph: degree relative to the most-connected fact in the store.
     graph_score = min(1.0, graph_degree / max(1, max_degree))
 
     gravity = (
-        _W_ACCESS * access_score
+        _W_FRESHNESS * freshness
+        + _W_ACCESS * access_score
         + _W_RESONANCE * resonance_score
         + _W_GRAPH * graph_score
     )

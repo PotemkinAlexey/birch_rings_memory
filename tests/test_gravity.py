@@ -1,59 +1,85 @@
-"""Gravity engine — fact migration between layers."""
+"""Gravity engine — fact migration across the surface / kinetic / core rings."""
+import time
+
 from birch.fact import FactPassport
 from birch.gravity import GravityEngine
 
+_DAY = 86400.0
 
-def _build_engine():
+
+def _aged(fact: FactPassport, days: float) -> FactPassport:
+    """Backdate a fact's creation and last-access by ``days``."""
+    past = time.time() - days * _DAY
+    fact.created_at = past
+    fact.last_accessed = past
+    return fact
+
+
+def test_hot_fact_promotes_to_surface():
+    """Fresh, frequently used and positively resonant → surface (layer 0)."""
     engine = GravityEngine()
-    f_hot       = FactPassport("mailer service", "runs on",    "Go",      source_session="s1")
-    f_cold      = FactPassport("legacy script",  "written in", "Python",  source_session="s1")
-    f_connected = FactPassport(
-        "Go", "used by", "mailer service", source_session="s1"
-    )
-
-    for f in (f_hot, f_cold, f_connected):
-        engine.register(f)
-
-    engine.link(f_hot.fact_id, f_connected.fact_id)
-    engine.link(f_connected.fact_id, f_hot.fact_id)
+    f_hot = FactPassport("mailer service", "runs on", "Go")
+    f_other = FactPassport("legacy script", "written in", "Python")
+    engine.register(f_hot)
+    engine.register(f_other)
+    engine.link(f_other.fact_id, f_hot.fact_id)  # f_hot gains graph degree
 
     for _ in range(15):
         f_hot.touch()
         engine.apply_session_resonance([f_hot.fact_id], r=+0.8)
 
-    for _ in range(2):
-        f_cold.touch()
-        engine.apply_session_resonance([f_cold.fact_id], r=-0.7)
+    engine.tick()
+    assert f_hot.gravity_score > 0.70, f_hot.gravity_score
+    assert f_hot.layer == 0, f"expected surface, got layer {f_hot.layer}"
 
-    for _ in range(3):
-        f_connected.touch()
-        engine.apply_session_resonance([f_connected.fact_id], r=+0.6)
+
+def test_fresh_fact_survives_a_bad_session():
+    """The grace period: a brand-new fact scored by a negative session must
+    NOT drop to the cold core — freshness keeps it in kinetic."""
+    engine = GravityEngine()
+    f = FactPassport("new idea", "scored", "badly")
+    engine.register(f)
+    for _ in range(2):
+        f.touch()
+        engine.apply_session_resonance([f.fact_id], r=-0.7)
 
     engine.tick()
-    return f_hot, f_cold, f_connected
+    assert f.layer == 1, f"fresh fact must stay kinetic, got layer {f.layer}"
+    assert f.gravity_score >= 0.30, f.gravity_score
 
 
-def test_hot_fact_promotes():
-    f_hot, _, _ = _build_engine()
-    assert f_hot.gravity_score > 0.70, f"expected gravity > 0.70, got {f_hot.gravity_score}"
-    assert f_hot.layer == 0, f"expected layer 0 (surface), got {f_hot.layer}"
+def test_aged_unused_fact_demotes_to_core():
+    """A fact nobody has touched for weeks sinks out of kinetic into core."""
+    engine = GravityEngine()
+    f = _aged(FactPassport("stale note", "is", "forgotten"), days=14)
+    engine.register(f)
+
+    engine.tick()
+    assert f.gravity_score < 0.30, f.gravity_score
+    assert f.layer == 2, f"expected core, got layer {f.layer}"
 
 
-def test_cold_fact_demotes():
-    _, f_cold, _ = _build_engine()
-    assert f_cold.gravity_score < 0.30, f"expected gravity < 0.30, got {f_cold.gravity_score}"
-    assert f_cold.layer == 2, f"expected layer 2 (core), got {f_cold.layer}"
+def test_aged_unused_fact_sinks_below_black_hole_threshold():
+    """Given enough age with no use or resonance, gravity falls under the
+    0.10 absorption floor — the fact becomes black-hole eligible."""
+    engine = GravityEngine()
+    f = _aged(FactPassport("ancient", "long", "gone"), days=120)
+    engine.register(f)
+
+    engine.tick()
+    assert f.gravity_score < 0.10, f.gravity_score
 
 
-def test_graph_degree_helps():
-    _, f_cold, f_connected = _build_engine()
-    assert f_connected.gravity_score > f_cold.gravity_score, (
-        f"f_connected ({f_connected.gravity_score}) should outrank f_cold ({f_cold.gravity_score})"
-    )
+def test_graph_degree_lifts_gravity():
+    """Connectivity raises gravity: a linked fact outranks an identical
+    unlinked one, all else equal."""
+    engine = GravityEngine()
+    f_linked = FactPassport("Go", "used by", "mailer service")
+    f_lonely = FactPassport("perl", "used by", "nobody")
+    hub = FactPassport("hub", "node", "x")
+    for f in (f_linked, f_lonely, hub):
+        engine.register(f)
+    engine.link(hub.fact_id, f_linked.fact_id)
 
-
-if __name__ == "__main__":
-    f_hot, f_cold, f_connected = _build_engine()
-    for f in (f_hot, f_cold, f_connected):
-        layer = {0: "surface", 1: "kinetic", 2: "core"}[f.layer]
-        print(f"  {f!r}  gravity={f.gravity_score:.3f}  layer={layer}")
+    engine.tick()
+    assert f_linked.gravity_score > f_lonely.gravity_score
