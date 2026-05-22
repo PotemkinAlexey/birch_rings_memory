@@ -10,6 +10,7 @@ from birch.galaxy.engine import CORE, KINETIC, SURFACE, Body, Galaxy
 from birch.galaxy.loader import build_galaxy, project_to_angles
 from birch.galaxy.projection import Projector
 from birch.galaxy.replay import build_history, replay
+from birch.galaxy.report import GalaxyReport, diagnose, format_report, run_diagnosis
 
 
 def test_circular_orbit_is_stable():
@@ -249,3 +250,43 @@ def test_build_history_schedules_attention_from_sessions():
     history = build_history(facts, sessions, steps=300, now=now)
     assert len(history.attention) == 1
     assert 0 <= history.attention[0].step < 300
+
+
+def test_diagnose_flags_core_facts_as_at_risk():
+    """A fact decayed into the core ring is reported at risk; a far one is not."""
+    gal = Galaxy()
+    gal.add_body(Body("a", np.array([3.0, 0.0]), np.zeros(2), 1.0, label="risky"))
+    gal.add_body(Body("b", np.array([20.0, 0.0]), np.zeros(2), 1.0, label="safe"))
+    report = diagnose(gal, absorbed_ids=[], fact_labels={})
+    risky = [label for label, _radius in report.at_risk]
+    assert "risky" in risky
+    assert "safe" not in risky
+
+
+def test_run_diagnosis_produces_a_report():
+    now = time.time()
+    facts = []
+    for i in range(20):
+        f = FactPassport(f"fact{i}", "is", f"thing{i}")
+        f.created_at = now - 15 * 86400
+        f.vector = list(np.random.default_rng(i).normal(size=8))
+        facts.append(f)
+    report = run_diagnosis(facts, [], steps=600, now=now)
+    assert isinstance(report, GalaxyReport)
+    assert report.total == 20
+    assert isinstance(report.topics, list)
+
+
+def test_format_report_is_text():
+    report = GalaxyReport(
+        at_risk=[("x is y", 2.4)],
+        topics=[["a", "b"]],
+        metafacts=[["c", "d", "e"]],
+        absorbed=["f"],
+        live=3,
+        total=6,
+    )
+    text = format_report(report)
+    assert isinstance(text, str)
+    assert "At risk" in text
+    assert "Emergent topics" in text

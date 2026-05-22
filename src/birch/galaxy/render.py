@@ -94,11 +94,12 @@ def render_animation(
     history: object,
     path: str,
     frames: int = 150,
-) -> str:
-    """Replay ``history`` and write an animated GIF of the galaxy forming.
+) -> tuple[str, list[str]]:
+    """Replay ``history``, write an animated GIF, and return (path, absorbed).
 
-    ``history`` is a replay.History; typed loosely to keep render.py free
-    of a hard import cycle with replay.py.
+    The absorbed fact_ids are handed back so a caller can diagnose the same
+    settled galaxy without replaying it a second time. ``history`` is a
+    replay.History; typed loosely to keep render.py free of an import cycle.
     """
     import matplotlib
 
@@ -124,7 +125,7 @@ def render_animation(
                   b.mass, b.kind) for b in gal.bodies],
             ))
 
-    replay(galaxy, history, on_step=capture)  # type: ignore[arg-type]
+    absorbed = replay(galaxy, history, on_step=capture)  # type: ignore[arg-type]
 
     fig, ax = plt.subplots(figsize=(9, 9), facecolor="#0b0b14")
     span = galaxy.r_surface * 1.6
@@ -170,4 +171,4 @@ def render_animation(
     anim = FuncAnimation(fig, draw, frames=len(snaps), interval=80)  # type: ignore[arg-type]
     anim.save(path, writer=PillowWriter(fps=12))
     plt.close(fig)
-    return path
+    return path, absorbed
