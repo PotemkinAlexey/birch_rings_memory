@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..fact import FactPassport
+from .collapse import collapse_step
 from .engine import Galaxy
 from .loader import project_to_angles
 
@@ -104,11 +105,13 @@ def replay(
     galaxy: Galaxy,
     history: History,
     on_step: Callable[[int, Galaxy], None] | None = None,
+    collapse_every: int = 80,
 ) -> list[str]:
     """Run ``history`` against ``galaxy``. Returns every fact_id absorbed.
 
-    ``on_step(step, galaxy)`` is invoked after each step — used by the
-    renderer to capture animation frames.
+    Every ``collapse_every`` steps, cold bound clumps are checked for Jeans
+    collapse into MetaFacts. ``on_step(step, galaxy)`` is invoked after each
+    step — used by the renderer to capture animation frames.
     """
     births: dict[int, list[_Birth]] = {}
     for b in history.births:
@@ -128,6 +131,8 @@ def replay(
                 if body is not None:
                     body.mass += _ACCRETION
         absorbed.extend(galaxy.step())
+        if collapse_every > 0 and step > 0 and step % collapse_every == 0:
+            collapse_step(galaxy)
         if on_step is not None:
             on_step(step, galaxy)
     return absorbed

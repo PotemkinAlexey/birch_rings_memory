@@ -5,6 +5,7 @@ import time
 import numpy as np
 
 from birch.fact import FactPassport
+from birch.galaxy.collapse import collapse_step, friends_of_friends
 from birch.galaxy.engine import CORE, KINETIC, SURFACE, Body, Galaxy
 from birch.galaxy.loader import build_galaxy, project_to_angles
 from birch.galaxy.replay import build_history, replay
@@ -146,3 +147,52 @@ def test_replay_on_step_callback_fires_each_step():
     seen: list[int] = []
     replay(Galaxy(), history, on_step=lambda step, gal: seen.append(step))
     assert seen == list(range(30))
+
+
+def test_friends_of_friends_separates_distant_clumps():
+    bodies = [
+        Body("a", np.array([0.0, 0.0]), np.zeros(2), 1.0),
+        Body("b", np.array([0.5, 0.0]), np.zeros(2), 1.0),
+        Body("c", np.array([20.0, 0.0]), np.zeros(2), 1.0),
+    ]
+    groups = friends_of_friends(bodies, linking_length=1.0)
+    assert sorted(len(g) for g in groups) == [1, 2]
+
+
+def test_jeans_collapse_fuses_a_cold_clump():
+    """A tight, near-co-moving clump collapses into one MetaFact, conserving
+    total mass and momentum."""
+    gal = Galaxy()
+    for i in range(4):
+        gal.add_body(Body(
+            f"f{i}",
+            np.array([5.0 + 0.2 * i, 0.0]),
+            np.array([0.0, 0.05 * i - 0.075]),   # tiny dispersion — cold
+            2.0,
+        ))
+    mass_before = sum(b.mass for b in gal.bodies)
+    momentum_before = sum((b.mass * b.vel for b in gal.bodies), np.zeros(2))
+
+    metas = collapse_step(gal, linking_length=2.0, min_group=4)
+    assert len(metas) == 1
+    meta = metas[0]
+    assert meta.kind == "meta"
+    assert sorted(meta.source_ids) == ["f0", "f1", "f2", "f3"]
+    assert abs(meta.mass - mass_before) < 1e-9
+    np.testing.assert_allclose(meta.mass * meta.vel, momentum_before, atol=1e-9)
+    assert gal.bodies == metas
+
+
+def test_hot_group_resists_collapse():
+    """A clump with large velocity dispersion is too hot to collapse."""
+    gal = Galaxy()
+    for i in range(4):
+        gal.add_body(Body(
+            f"f{i}",
+            np.array([5.0 + 0.2 * i, 0.0]),
+            np.array([9.0 * (i - 1.5), 7.0 * (i % 2 - 0.5)]),   # hot
+            1.0,
+        ))
+    metas = collapse_step(gal, linking_length=2.0, min_group=4)
+    assert metas == []
+    assert len(gal.bodies) == 4

@@ -19,20 +19,26 @@ The picture:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 
 @dataclass
 class Body:
-    """A fact rendered as an orbiting body."""
+    """A fact rendered as an orbiting body.
+
+    ``kind`` is "fact" for an ordinary body or "meta" for a MetaFact formed
+    by a Jeans collapse; ``source_ids`` lists the facts a MetaFact swallowed.
+    """
 
     fact_id: str
     pos: np.ndarray          # shape (2,) — position in the galactic plane
     vel: np.ndarray          # shape (2,) — velocity
     mass: float              # accumulated value — heavier = more valued
     label: str = ""          # short human label, for rendering only
+    kind: str = "fact"       # "fact" | "meta"
+    source_ids: list[str] = field(default_factory=list)
 
     @property
     def radius(self) -> float:

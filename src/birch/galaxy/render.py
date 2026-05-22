@@ -35,9 +35,10 @@ def render(galaxy: Galaxy, path: str, title: str = "BirchKM memory galaxy") -> s
     ax.add_patch(plt.Circle((0, 0), galaxy.horizon, color="black", zorder=3))
     ax.scatter([0], [0], s=12, color="#ff5555", zorder=4)
 
-    # Bodies, coloured by ring, sized by mass.
+    # Ordinary facts, coloured by ring, sized by mass.
     for ring, colour in _RING_COLOUR.items():
-        members = [b for b in galaxy.bodies if galaxy.ring_of(b) == ring]
+        members = [b for b in galaxy.bodies
+                   if b.kind == "fact" and galaxy.ring_of(b) == ring]
         if not members:
             continue
         ax.scatter(
@@ -45,6 +46,17 @@ def render(galaxy: Galaxy, path: str, title: str = "BirchKM memory galaxy") -> s
             [b.pos[1] for b in members],
             s=[12 + 26 * b.mass for b in members],
             c=colour, alpha=0.82, edgecolors="none", label=ring,
+        )
+
+    # MetaFacts — collapsed clumps — drawn as bright stars.
+    metas = [b for b in galaxy.bodies if b.kind == "meta"]
+    if metas:
+        ax.scatter(
+            [b.pos[0] for b in metas],
+            [b.pos[1] for b in metas],
+            s=[min(420.0, 70 + 22 * b.mass) for b in metas],
+            c="#ffffff", marker="*", edgecolors="#b070ff",
+            linewidths=1.0, zorder=5, label="metafact",
         )
 
     span = galaxy.r_surface * 1.6
@@ -97,8 +109,8 @@ def render_animation(
             snaps.append((
                 step,
                 len(gal.absorbed),
-                [(float(b.pos[0]), float(b.pos[1]), gal.ring_of(b), b.mass)
-                 for b in gal.bodies],
+                [(float(b.pos[0]), float(b.pos[1]), gal.ring_of(b),
+                  b.mass, b.kind) for b in gal.bodies],
             ))
 
     replay(galaxy, history, on_step=capture)  # type: ignore[arg-type]
@@ -116,19 +128,26 @@ def render_animation(
         ax.add_patch(plt.Circle((0, 0), galaxy.horizon, color="black", zorder=3))
         ax.scatter([0], [0], s=12, color="#ff5555", zorder=4)
         for ring, colour in _RING_COLOUR.items():
-            pts = [(x, y, m) for (x, y, r, m) in bodies if r == ring]
+            pts = [(x, y, m) for (x, y, r, m, k) in bodies
+                   if k == "fact" and r == ring]
             if pts:
                 ax.scatter([p[0] for p in pts], [p[1] for p in pts],
                            s=[12 + 26 * p[2] for p in pts], c=colour,
                            alpha=0.82, edgecolors="none")
+        metas = [(x, y, m) for (x, y, r, m, k) in bodies if k == "meta"]
+        if metas:
+            ax.scatter([p[0] for p in metas], [p[1] for p in metas],
+                       s=[min(420.0, 70 + 22 * p[2]) for p in metas],
+                       c="#ffffff", marker="*", edgecolors="#b070ff",
+                       linewidths=1.0, zorder=5)
         ax.set_xlim(-span, span)
         ax.set_ylim(-span, span)
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_title(
-            f"BirchKM memory galaxy — step {step}   ·   "
-            f"{len(bodies)} live   ·   {absorbed} absorbed",
+            f"BirchKM memory galaxy — step {step}   ·   {len(bodies)} live   "
+            f"·   {len(metas)} metafacts   ·   {absorbed} absorbed",
             color="#dddddd", fontsize=12,
         )
 
