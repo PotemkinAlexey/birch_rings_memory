@@ -15,6 +15,7 @@ import numpy as np
 
 from ..fact import FactPassport
 from .engine import Galaxy
+from .projection import Projector
 
 # Freshness half-life — matches the live gravity formula's grace period.
 _FRESHNESS_HALFLIFE_HOURS = 336.0
@@ -24,19 +25,13 @@ _LN2 = math.log(2)
 def project_to_angles(vectors: list[list[float]]) -> np.ndarray:
     """PCA every embedding to 2D and return each one's polar angle.
 
-    Only the angle is kept: it carries the semantic direction. Magnitude is
-    discarded — a body's radius comes from vitality, not from how far its
-    embedding sits from the centroid. Missing vectors get angle 0.0.
+    Only the angle is kept — it carries the semantic direction; a body's
+    radius comes from vitality, not from the embedding magnitude.
     """
-    dim = max((len(v) for v in vectors), default=0)
-    if dim == 0:
+    projector = Projector.fit(vectors)
+    if projector is None:
         return np.zeros(len(vectors))
-    mat = np.array([v if len(v) == dim else [0.0] * dim for v in vectors])
-    centered = mat - mat.mean(axis=0)
-    # The top-2 right singular vectors are the principal axes.
-    _, _, vt = np.linalg.svd(centered, full_matrices=False)
-    coords = centered @ vt[:2].T
-    return np.arctan2(coords[:, 1], coords[:, 0])
+    return np.array([projector.angle(v) for v in vectors])
 
 
 def _vitality(fact: FactPassport, value: float, now: float) -> float:

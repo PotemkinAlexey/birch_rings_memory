@@ -59,6 +59,14 @@ def render(galaxy: Galaxy, path: str, title: str = "BirchKM memory galaxy") -> s
             linewidths=1.0, zorder=5, label="metafact",
         )
 
+    # The attention mass — the user's current focus.
+    if galaxy.attention_pos is not None:
+        ax_x = float(galaxy.attention_pos[0])
+        ax_y = float(galaxy.attention_pos[1])
+        ax.scatter([ax_x], [ax_y], s=900, facecolors="none", edgecolors="#ff44cc",
+                   linewidths=2.2, zorder=6, label="attention")
+        ax.scatter([ax_x], [ax_y], s=40, c="#ff44cc", zorder=6)
+
     span = galaxy.r_surface * 1.6
     ax.set_xlim(-span, span)
     ax.set_ylim(-span, span)
@@ -102,13 +110,16 @@ def render_animation(
 
     total_steps = getattr(history, "steps", 1)
     interval = max(1, total_steps // frames)
-    snaps: list[tuple[int, int, list]] = []
+    snaps: list[tuple] = []
 
     def capture(step: int, gal: Galaxy) -> None:
         if step % interval == 0 or step == total_steps - 1:
+            attn = (None if gal.attention_pos is None
+                    else (float(gal.attention_pos[0]), float(gal.attention_pos[1])))
             snaps.append((
                 step,
                 len(gal.absorbed),
+                attn,
                 [(float(b.pos[0]), float(b.pos[1]), gal.ring_of(b),
                   b.mass, b.kind) for b in gal.bodies],
             ))
@@ -121,12 +132,16 @@ def render_animation(
     def draw(frame_idx: int) -> None:
         ax.clear()
         ax.set_facecolor("#0b0b14")
-        step, absorbed, bodies = snaps[frame_idx]
+        step, absorbed, attn, bodies = snaps[frame_idx]
         for radius in (galaxy.horizon, galaxy.r_core, galaxy.r_surface):
             ax.add_patch(plt.Circle((0, 0), radius, fill=False, color="#333344",
                                     linestyle="--", linewidth=0.8))
         ax.add_patch(plt.Circle((0, 0), galaxy.horizon, color="black", zorder=3))
         ax.scatter([0], [0], s=12, color="#ff5555", zorder=4)
+        if attn is not None:
+            ax.scatter([attn[0]], [attn[1]], s=850, facecolors="none",
+                       edgecolors="#ff44cc", linewidths=2.0, zorder=6)
+            ax.scatter([attn[0]], [attn[1]], s=34, c="#ff44cc", zorder=6)
         for ring, colour in _RING_COLOUR.items():
             pts = [(x, y, m) for (x, y, r, m, k) in bodies
                    if k == "fact" and r == ring]

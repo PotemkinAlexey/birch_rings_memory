@@ -76,6 +76,8 @@ class Galaxy:
         horizon: float = 1.5,
         r_core: float = 6.0,
         r_surface: float = 14.0,
+        attention_mass: float = 0.0,
+        attention_softening: float = 4.0,
     ) -> None:
         self.g = g
         self.central_mass = central_mass
@@ -85,10 +87,17 @@ class Galaxy:
         self.horizon = horizon
         self.r_core = r_core
         self.r_surface = r_surface
+        self.attention_mass = attention_mass
+        # Attention is softened heavily on purpose: a broad, gentle bias
+        # toward the current focus, never a slingshot at close range.
+        self.attention_softening = attention_softening
 
         self.bodies: list[Body] = []
         self.absorbed: list[str] = []
         self.steps = 0
+        # A second, externally-driven attractor: the user's current focus.
+        # Set by the replay; None means no attention pull is active.
+        self.attention_pos: np.ndarray | None = None
 
     # ── Construction ────────────────────────────────────────────────────────
 
@@ -146,6 +155,13 @@ class Galaxy:
         inv = dist2 ** -1.5
         np.fill_diagonal(inv, 0.0)                         # no self-force
         acc = acc + self.g * (inv[:, :, None] * diff * mass[None, :, None]).sum(axis=1)
+
+        # Pull of the attention mass — the user's current focus — if active.
+        if self.attention_pos is not None and self.attention_mass > 0.0:
+            to_attn = self.attention_pos[None, :] - pos    # (n, 2)
+            soft = self.attention_softening * self.attention_softening
+            r2_attn = (to_attn * to_attn).sum(axis=1) + soft
+            acc = acc + self.g * self.attention_mass * to_attn / (r2_attn[:, None] ** 1.5)
         return acc
 
     def step(self) -> list[str]:

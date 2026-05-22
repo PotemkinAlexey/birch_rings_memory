@@ -27,7 +27,7 @@ def main() -> None:
     print(f"loaded {len(facts)} facts and {len(sessions)} sessions from {_DB}")
 
     history = build_history(facts, sessions, steps=_STEPS)
-    galaxy = Galaxy()
+    galaxy = Galaxy(attention_mass=40.0)
     _OUT.mkdir(parents=True, exist_ok=True)
 
     gif = render_animation(galaxy, history, str(_OUT / "galaxy.gif"))

@@ -8,6 +8,7 @@ from birch.fact import FactPassport
 from birch.galaxy.collapse import collapse_step, friends_of_friends
 from birch.galaxy.engine import CORE, KINETIC, SURFACE, Body, Galaxy
 from birch.galaxy.loader import build_galaxy, project_to_angles
+from birch.galaxy.projection import Projector
 from birch.galaxy.replay import build_history, replay
 
 
@@ -196,3 +197,55 @@ def test_hot_group_resists_collapse():
     metas = collapse_step(gal, linking_length=2.0, min_group=4)
     assert metas == []
     assert len(gal.bodies) == 4
+
+
+def test_projector_is_consistent():
+    rng = np.random.default_rng(7)
+    vecs = [list(rng.normal(size=10)) for _ in range(8)]
+    projector = Projector.fit(vecs)
+    assert projector is not None
+    assert projector.dim == 10
+    assert projector.angle(vecs[0]) == projector.angle(vecs[0])
+    assert -math.pi <= projector.angle(vecs[3]) <= math.pi
+    # Too little data to fit a 2D basis.
+    assert Projector.fit([[1.0, 2.0]]) is None
+
+
+def test_attention_mass_attracts_a_body():
+    """A body at rest is dragged toward the attention mass."""
+    pos0 = np.array([9.0, 0.0])
+
+    plain = Galaxy(drag=0.0)
+    plain.add_body(Body("f", pos0.copy(), np.zeros(2), 1.0))
+    plain.run(15)
+
+    pulled = Galaxy(drag=0.0, attention_mass=800.0)
+    pulled.add_body(Body("f", pos0.copy(), np.zeros(2), 1.0))
+    pulled.attention_pos = np.array([12.0, 0.0])
+    pulled.run(15)
+
+    plain_body = plain.find("f")
+    pulled_body = pulled.find("f")
+    assert plain_body is not None and pulled_body is not None
+    # Without attention the body just falls toward the hole (-x);
+    # the attention mass at x=12 drags it the other way.
+    assert pulled_body.pos[0] > plain_body.pos[0]
+
+
+def test_build_history_schedules_attention_from_sessions():
+    now = time.time()
+    facts = []
+    for i in range(4):
+        f = FactPassport(f"s{i}", "p", "o")
+        f.created_at = now - 5 * 86400
+        f.vector = list(np.random.default_rng(i).normal(size=6))
+        facts.append(f)
+    sessions = [{
+        "recorded_at": now - 2 * 86400,
+        "r_score": 0.5,
+        "fact_weights": {},
+        "centroids": [list(np.random.default_rng(99).normal(size=6))],
+    }]
+    history = build_history(facts, sessions, steps=300, now=now)
+    assert len(history.attention) == 1
+    assert 0 <= history.attention[0].step < 300
