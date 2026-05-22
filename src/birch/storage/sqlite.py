@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from ..fact import FactPassport
 from ..meta_fact import MetaFact
-
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -70,14 +71,71 @@ CREATE TABLE IF NOT EXISTS meta_facts (
 
 
 class SQLiteBackend:
-    """Write-through SQLite backend. Thread-safe for single-process use."""
+    """Write-through SQLite backend.
+
+    Safe for concurrent processes sharing one database file: WAL mode allows
+    N readers alongside a single writer, and ``transaction()`` serializes
+    writers via ``BEGIN IMMEDIATE``. Callers detect another process' commits
+    through ``data_version()`` and reload their caches.
+    """
 
     def __init__(self, db_path: str | Path) -> None:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # WAL: concurrent readers + one writer. busy_timeout: a writer that
+        # finds the lock held waits instead of failing with "database is locked".
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        # Reentrancy depth for transaction(); nested save_* calls defer their
+        # commit to the outermost block.
+        self._txn_depth = 0
         self._conn.executescript(_SCHEMA)
         self._migrate_echo_sessions()
         self._conn.commit()
+
+    # ── Cross-process coordination ───────────────────────────────────────────
+
+    def data_version(self) -> int:
+        """Return SQLite's ``PRAGMA data_version``.
+
+        The value changes whenever the database is modified by *another*
+        connection — including other processes and out-of-band edits — but
+        not for commits on this connection. A caller that caches state in
+        memory compares this against the value seen at its last load: a
+        change means the cache is stale and must be reloaded.
+        """
+        return int(self._conn.execute("PRAGMA data_version").fetchone()[0])
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Reentrant exclusive transaction.
+
+        The outermost ``with`` issues ``BEGIN IMMEDIATE`` (grabbing the write
+        lock up front so no other writer can interleave) and commits on exit;
+        nested blocks are no-ops on the transaction boundary. ``save_*`` calls
+        made inside defer their commit to the outermost block via
+        ``_maybe_commit``.
+        """
+        outermost = self._txn_depth == 0
+        if outermost:
+            self._conn.execute("BEGIN IMMEDIATE")
+        self._txn_depth += 1
+        try:
+            yield
+        except BaseException:
+            self._txn_depth -= 1
+            if outermost:
+                self._conn.rollback()
+            raise
+        else:
+            self._txn_depth -= 1
+            if outermost:
+                self._conn.commit()
+
+    def _maybe_commit(self) -> None:
+        """Commit only when not inside an open transaction() block."""
+        if self._txn_depth == 0:
+            self._conn.commit()
 
     def _migrate_echo_sessions(self) -> None:
         """Forward-compatible schema migration for pre-existing DBs."""
@@ -105,22 +163,22 @@ class SQLiteBackend:
             "INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             self._fact_row(fact),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def save_facts(self, facts: list[FactPassport]) -> None:
         """One transaction, one commit — orders of magnitude faster on bulk dumps."""
         if not facts:
             return
         rows = [self._fact_row(f) for f in facts]
-        with self._conn:
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                rows,
-            )
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        self._maybe_commit()
 
     def delete_fact(self, fact_id: str) -> None:
         self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
-        self._conn.commit()
+        self._maybe_commit()
 
     def load_facts(self) -> list[FactPassport]:
         rows = self._conn.execute("SELECT * FROM facts").fetchall()
@@ -145,7 +203,7 @@ class SQLiteBackend:
             "INSERT OR IGNORE INTO edges (from_id, to_id) VALUES (?,?)",
             (from_id, to_id),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def load_edges(self) -> list[tuple[str, str]]:
         rows = self._conn.execute("SELECT from_id, to_id FROM edges").fetchall()
@@ -179,13 +237,13 @@ class SQLiteBackend:
                 echo_penalty,
             ),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def delete_echo_session(self, session_id: str) -> None:
         self._conn.execute(
             "DELETE FROM echo_sessions WHERE session_id = ?", (session_id,)
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def load_echo_sessions(self) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM echo_sessions").fetchall()
@@ -233,13 +291,13 @@ class SQLiteBackend:
                 started_at,
             ),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def delete_open_session(self, session_id: str) -> None:
         self._conn.execute(
             "DELETE FROM open_sessions WHERE session_id = ?", (session_id,)
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def load_open_sessions(self) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM open_sessions").fetchall()
@@ -277,18 +335,18 @@ class SQLiteBackend:
 
     def save_meta_fact(self, meta: MetaFact) -> None:
         self._conn.execute(self._META_INSERT, self._meta_row(meta))
-        self._conn.commit()
+        self._maybe_commit()
 
     def save_meta_facts(self, metas: list[MetaFact]) -> None:
         if not metas:
             return
         rows = [self._meta_row(m) for m in metas]
-        with self._conn:
-            self._conn.executemany(self._META_INSERT, rows)
+        self._conn.executemany(self._META_INSERT, rows)
+        self._maybe_commit()
 
     def delete_meta_fact(self, meta_id: str) -> None:
         self._conn.execute("DELETE FROM meta_facts WHERE meta_id = ?", (meta_id,))
-        self._conn.commit()
+        self._maybe_commit()
 
     def load_meta_facts(self) -> list[MetaFact]:
         rows = self._conn.execute("SELECT * FROM meta_facts").fetchall()

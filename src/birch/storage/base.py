@@ -1,7 +1,8 @@
 """StorageBackend protocol — implement this to plug in any storage engine."""
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from contextlib import contextmanager
+from typing import Iterator, Protocol, runtime_checkable
 
 from ..fact import FactPassport
 from ..meta_fact import MetaFact
@@ -79,5 +80,21 @@ class StorageBackend(Protocol):
     def delete_meta_fact(self, meta_id: str) -> None: ...
 
     def load_meta_facts(self) -> list[MetaFact]: ...
+
+    # ── Cross-process coordination (optional) ───────────────────────────────
+    #
+    # A backend shared by concurrent processes should implement both so
+    # callers can detect another process' writes and serialize their own.
+    # Backends used single-process only may omit them — MemoryStore probes
+    # with getattr and degrades to a plain in-memory store.
+
+    def data_version(self) -> int:
+        """Return a counter that changes when another connection commits."""
+        ...
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Reentrant exclusive transaction; nested writes share one commit."""
+        yield
 
     def close(self) -> None: ...
