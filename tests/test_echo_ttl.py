@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import time
 
+from birch.resonance.cluster import ClusterBundle
 from birch.resonance.echo import (
-    EchoStore,
-    StoredSession,
     TTL_DEFAULT,
     TTL_PENALIZED,
     TTL_RESOLVED,
+    EchoStore,
+    StoredSession,
 )
-from birch.resonance.cluster import ClusterBundle
 
 
 def _store_with(sessions: list[StoredSession]) -> EchoStore:

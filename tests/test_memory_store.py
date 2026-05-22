@@ -174,8 +174,10 @@ def test_concurrent_sessions_attribute_facts_to_the_correct_agent():
         target=agent,
         args=("b", "mailer beta Rust programming", "still not working", "sid_B"),
     )
-    t_a.start(); t_b.start()
-    t_a.join();  t_b.join()
+    t_a.start()
+    t_b.start()
+    t_a.join()
+    t_b.join()
 
     assert results["a"]["label"] == "resonant"
     assert results["b"]["label"] == "toxic"
@@ -392,7 +394,6 @@ def test_add_facts_batch_single_embed_call(monkeypatch):
 
 
 if __name__ == "__main__":
-    import traceback
     tests = [
         test_deprecated_fact_absorbed_on_resonant_session,
         test_query_returns_relevant_facts,

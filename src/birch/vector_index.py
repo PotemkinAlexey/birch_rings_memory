@@ -52,6 +52,8 @@ class VectorIndex:
         if v.shape[0] != self._dim:
             # Silently skip mismatched dims rather than corrupting the matrix.
             return
+        # _matrix is allocated together with _dim above — both set or both None.
+        assert self._matrix is not None
         if fact_id in self._id_to_row:
             self._matrix[self._id_to_row[fact_id]] = v
             return

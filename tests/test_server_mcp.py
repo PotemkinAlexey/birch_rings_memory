@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from birch.fact import FactPassport
-from birch.meta_fact import MetaFact
 from birch.memory_store import QueryResult
+from birch.meta_fact import MetaFact
+
+
 def test_query_result_fact_payload():
     f = FactPassport(
         fact_id="f-1",

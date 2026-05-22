@@ -1,8 +1,9 @@
 """Echo Validation — cross-session topic matching with retroactive penalty."""
 import pytest
+
 from birch.resonance.detector import compute_resonance
-from birch.resonance.embeddings import embed_batch, embed
 from birch.resonance.echo import EchoStore
+from birch.resonance.embeddings import embed, embed_batch
 from tests.fixtures.echo_sessions import ECHO_PAIRS
 
 
@@ -12,7 +13,9 @@ def _run_pair(pair):
 
     msgs1 = s1["messages"]
     vecs1 = embed_batch(msgs1)
-    result1 = compute_resonance(msgs1, start_vector=vecs1[0], end_vector=vecs1[-1], all_vectors=vecs1)
+    result1 = compute_resonance(
+        msgs1, start_vector=vecs1[0], end_vector=vecs1[-1], all_vectors=vecs1
+    )
     store.record(s1["id"], vecs1, result1.r)
 
     vec2 = embed(s2["messages"][0])

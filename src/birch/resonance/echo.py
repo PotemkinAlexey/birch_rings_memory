@@ -4,7 +4,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from .cluster import ClusterBundle, bundle as _bundle, nearest_similarity
+from .cluster import ClusterBundle, nearest_similarity
+from .cluster import bundle as _bundle
 
 
 @dataclass

@@ -7,7 +7,9 @@ def _build_engine():
     engine = GravityEngine()
     f_hot       = FactPassport("mailer service", "runs on",    "Go",      source_session="s1")
     f_cold      = FactPassport("legacy script",  "written in", "Python",  source_session="s1")
-    f_connected = FactPassport("Go",             "used by",    "mailer service", source_session="s1")
+    f_connected = FactPassport(
+        "Go", "used by", "mailer service", source_session="s1"
+    )
 
     for f in (f_hot, f_cold, f_connected):
         engine.register(f)

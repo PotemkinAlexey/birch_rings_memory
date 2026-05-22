@@ -1,12 +1,33 @@
-"""Gravity engine — computes and updates gravity_score for FactPassports."""
+"""Gravity engine — computes and updates gravity_score for memory bodies."""
 from __future__ import annotations
 
 import math
 import time
-from typing import TYPE_CHECKING
+from typing import Protocol
 
-if TYPE_CHECKING:
-    from .fact import FactPassport
+
+class GravityBody(Protocol):
+    """The gravity-relevant surface shared by FactPassport and MetaFact.
+
+    Both types expose this duck-typed interface (see MetaFact's module
+    docstring), so GravityEngine treats live facts and emitted MetaFacts
+    uniformly without caring which concrete class it holds.
+    """
+
+    gravity_score: float
+    layer: int
+    access_count: int
+    last_accessed: float
+
+    @property
+    def fact_id(self) -> str: ...
+    @property
+    def avg_resonance(self) -> float: ...
+    @property
+    def is_deprecated(self) -> bool: ...
+    @property
+    def is_expired(self) -> bool: ...
+    def apply_resonance(self, r: float) -> None: ...
 
 
 # Layer thresholds — facts migrate when gravity crosses these boundaries
@@ -20,7 +41,7 @@ _W_GRAPH = 0.20
 
 
 def compute_gravity(
-    fact: "FactPassport",
+    fact: GravityBody,
     graph_degree: int = 0,
     max_degree: int = 1,
     now: float | None = None,
@@ -58,7 +79,7 @@ def compute_gravity(
 
 
 def update_gravity(
-    fact: "FactPassport",
+    fact: GravityBody,
     graph_degree: int = 0,
     max_degree: int = 1,
     now: float | None = None,
@@ -88,10 +109,10 @@ class GravityEngine:
     """Manages gravity computation across a collection of facts."""
 
     def __init__(self) -> None:
-        self._facts: dict[str, "FactPassport"] = {}
+        self._facts: dict[str, GravityBody] = {}
         self._degrees: dict[str, int] = {}     # fact_id → graph degree
 
-    def register(self, fact: "FactPassport") -> None:
+    def register(self, fact: GravityBody) -> None:
         self._facts[fact.fact_id] = fact
         self._degrees.setdefault(fact.fact_id, 0)
 

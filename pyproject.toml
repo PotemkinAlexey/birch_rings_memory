@@ -12,7 +12,7 @@ requires-python = ">=3.9"
 dependencies = ["mcp[cli]", "numpy>=1.21"]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff", "mypy"]
 
 [project.scripts]
 birch-mcp = "birch.server:mcp.run"
@@ -29,3 +29,8 @@ target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.mypy]
+files = ["src/birch"]
+python_version = "3.11"
+ignore_missing_imports = true

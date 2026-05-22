@@ -1,6 +1,5 @@
 """MetaFact — round-trip serialisation, feedback-loop surface, Hawking math."""
 import json
-import math
 
 from birch.meta_fact import MetaFact
 

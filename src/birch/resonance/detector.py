@@ -4,8 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .behavioral import score_session_decay
-from .semantic import SemanticScore, score_semantic_shift
 from .repetition import RepetitionScore, score_repetition
+from .semantic import SemanticScore, score_semantic_shift
 
 
 @dataclass

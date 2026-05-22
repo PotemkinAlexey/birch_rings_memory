@@ -1,5 +1,6 @@
 """Resonance detector — baseline vs embeddings vs full (+ repetition)."""
 import pytest
+
 from birch.resonance.detector import compute_resonance
 from birch.resonance.embeddings import embed_batch
 from tests.fixtures.sessions import SESSIONS
@@ -13,7 +14,9 @@ def _run_session(s, mode):
         start_vec, end_vec = vecs[0], vecs[-1]
         if mode == "full":
             all_vecs = vecs
-    result = compute_resonance(messages, start_vector=start_vec, end_vector=end_vec, all_vectors=all_vecs)
+    result = compute_resonance(
+        messages, start_vector=start_vec, end_vector=end_vec, all_vectors=all_vecs
+    )
     return result
 
 

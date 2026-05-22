@@ -6,8 +6,8 @@ from birch.meta_fact import MetaFact
 
 
 def test_query_result_kind_property_classifies_polymorphic_hits():
-    from birch.memory_store import QueryResult
     from birch.fact import FactPassport
+    from birch.memory_store import QueryResult
 
     f = FactPassport("x", "is", "y", fact_id="f1")
     r_fact = QueryResult(similarity=0.9, source="kinetic", fact=f)

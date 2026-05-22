@@ -12,7 +12,6 @@ import os
 import urllib.error
 import urllib.request
 
-
 _BASE_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 _MODEL = os.environ.get("BIRCH_EMBED_MODEL", "nomic-embed-text")
 

@@ -50,7 +50,7 @@ def query_memory(
     """
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     if layers:
-        layer_ints = [layer_map[l] for l in layers if l in layer_map]
+        layer_ints = [layer_map[name] for name in layers if name in layer_map]
         min_layer = min(layer_ints) if layer_ints else 0
         max_layer = max(layer_ints) if layer_ints else 2
     else:
@@ -66,7 +66,10 @@ def query_memory(
     )
     hits = [r.to_mcp_dict() for r in results]
     if not session_id:
-        hint = "pass session_id to attribute these reads to a session so gravity updates on session_close"
+        hint = (
+            "pass session_id to attribute these reads to a session "
+            "so gravity updates on session_close"
+        )
     else:
         hint = "call session_close when the conversation ends to propagate resonance to gravity"
     return {"results": hits, "_hint": hint}
@@ -97,7 +100,10 @@ def record_fact(
     already_existed = _store.fact_exists(subject, predicate, object)
     fact = _store.add_fact(subject, predicate, object, session_id=session_id)
     if not session_id:
-        hint = "open a session with session_open and pass session_id here so gravity updates when the session closes"
+        hint = (
+            "open a session with session_open and pass session_id here "
+            "so gravity updates when the session closes"
+        )
     else:
         hint = "call session_close when the conversation ends to propagate resonance to gravity"
     return {
@@ -139,7 +145,10 @@ def record_facts(
     sid = session_id
     results_facts = _store.add_facts(triples, session_id=sid)
     if not session_id:
-        hint = "open a session with session_open and pass session_id here so gravity updates when the session closes"
+        hint = (
+            "open a session with session_open and pass session_id here "
+            "so gravity updates when the session closes"
+        )
     else:
         hint = "call session_close when the conversation ends to propagate resonance to gravity"
     return {
@@ -213,7 +222,10 @@ def session_open(session_id: Optional[str] = None, agent_id: str = "default") ->
     _store.session_start(sid)
     return {
         "session_id": sid,
-        "_hint": "pass this session_id to record_fact, record_facts, query_memory, and session_push — then call session_close when done",
+        "_hint": (
+            "pass this session_id to record_fact, record_facts, query_memory, "
+            "and session_push — then call session_close when done"
+        ),
     }
 
 
@@ -230,7 +242,10 @@ def session_push(text: str, session_id: str) -> dict:
     return {
         "session_id": session_id,
         "ok": True,
-        "_hint": "call session_close when the conversation ends to score resonance and update gravity",
+        "_hint": (
+            "call session_close when the conversation ends to score resonance "
+            "and update gravity"
+        ),
     }
 
 

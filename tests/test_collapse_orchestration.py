@@ -1,8 +1,6 @@
 """Counter-triggered collapse orchestration on MemoryStore."""
 from __future__ import annotations
 
-import time
-
 from birch.fact import FactPassport
 from birch.memory_store import MemoryStore
 
