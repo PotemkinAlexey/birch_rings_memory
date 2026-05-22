@@ -1,31 +1,41 @@
 """python -m birch.galaxy — replay the real BirchKM store and diagnose it.
 
-Read-only: loads facts and session history from the store, replays them as
-births, resonance kicks and a moving attention mass, writes an animated GIF
-and a final still to ~/.birch/galaxy/, then prints a diagnosis — what the
-settled galaxy says about the store. The store itself is never modified.
+  python -m birch.galaxy            one replay: GIF, final still, diagnosis
+  python -m birch.galaxy --watch    live: re-render whenever the store changes
+
+Read-only. Loads facts and session history from the store, replays them as
+births, resonance kicks and a moving attention mass, and writes its output
+to ~/.birch/galaxy/. The store itself is never modified.
 """
 from __future__ import annotations
 
 import os
+import sys
+import time
 from pathlib import Path
 
 from ..storage.sqlite import SQLiteBackend
 from .engine import Galaxy
 from .render import render, render_animation
-from .replay import build_history
+from .replay import build_history, replay
 from .report import diagnose, format_report
 
 _DB = os.environ.get("BIRCH_DB", str(Path.home() / ".birch" / "memory.db"))
 _OUT = Path.home() / ".birch" / "galaxy"
 _STEPS = 1400
+_POLL_SECONDS = 3.0
 
 
-def main() -> None:
+def _load() -> tuple[list, list]:
     backend = SQLiteBackend(_DB)
     facts = backend.load_facts()
     sessions = backend.load_echo_sessions()
     backend.close()
+    return facts, sessions
+
+
+def main() -> None:
+    facts, sessions = _load()
     print(f"loaded {len(facts)} facts and {len(sessions)} sessions from {_DB}")
 
     history = build_history(facts, sessions, steps=_STEPS)
@@ -47,5 +57,44 @@ def main() -> None:
     print(f"\nHawking emissions during the replay: {galaxy.hawking_count}")
 
 
+def _db_mtime() -> float:
+    """Latest modification time across the DB and its WAL/SHM sidecars."""
+    latest = 0.0
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(_DB + suffix)
+        if path.exists():
+            latest = max(latest, path.stat().st_mtime)
+    return latest
+
+
+def watch() -> None:
+    """Re-render the galaxy as a still every time the store changes."""
+    print(f"watching {_DB} — re-renders on every change, Ctrl-C to stop")
+    _OUT.mkdir(parents=True, exist_ok=True)
+    last = -1.0
+    try:
+        while True:
+            mtime = _db_mtime()
+            if mtime != last:
+                last = mtime
+                facts, sessions = _load()
+                history = build_history(facts, sessions, steps=_STEPS)
+                galaxy = Galaxy(attention_mass=40.0)
+                absorbed = replay(galaxy, history)
+                still = render(
+                    galaxy, str(_OUT / "galaxy_live.png"),
+                    title="BirchKM memory galaxy — live",
+                )
+                stamp = time.strftime("%H:%M:%S")
+                print(f"[{stamp}] {len(facts)} facts -> {galaxy.ring_counts()}"
+                      f" · {len(absorbed)} absorbed · wrote {still}")
+            time.sleep(_POLL_SECONDS)
+    except KeyboardInterrupt:
+        print("\nstopped watching")
+
+
 if __name__ == "__main__":
-    main()
+    if "--watch" in sys.argv:
+        watch()
+    else:
+        main()
