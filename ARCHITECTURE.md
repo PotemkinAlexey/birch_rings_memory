@@ -69,52 +69,74 @@ startup and is updated on deprecation and on black-hole absorption.
 
 ## Gravity engine
 
-Gravity is recomputed every `tick()`:
+Gravity is recomputed every `tick()` from four components:
 
 ```
-gravity = 0.35 × access_score
-        + 0.45 × resonance_score
-        + 0.20 × graph_score
+gravity = 0.35 × freshness   (decays from creation, ~2-week half-life)
+        + 0.20 × access      (log-scaled hits, decays from last touch)
+        + 0.35 × resonance   (avg session R, 0 until a session scores it)
+        + 0.10 × graph       (degree relative to the most-connected fact)
 ```
 
-### access_score
+### freshness
 
 ```
-access_score = log1p(access_count) / log1p(100)
-             × exp(−0.05 × age_hours)
+freshness = exp(−age_hours × ln2 / 336)        # age since created_at
 ```
 
-Logarithmic so a single hot fact doesn't dominate. Exponential decay with
-half-life ~14h — facts not queried gradually lose buoyancy without manual
-cleanup.
+A new fact is presumed relevant and rides high; it sinks as it ages
+untouched. This is the **grace period** — a fact is not archived to the
+cold core before it has had a chance to prove itself — expressed as a
+smooth decay term rather than a hard cliff.
 
-### resonance_score
-
-```
-resonance_score = (avg_resonance + 1.0) / 2.0
-avg_resonance   = resonance_sum / resonance_count
-```
-
-Normalized from `[-1, +1]` to `[0, 1]`. A fact that only appeared in toxic
-sessions converges toward 0.0; a fact that only appeared in resonant sessions
-converges toward 1.0.
-
-### graph_score
+### access
 
 ```
-graph_score = degree(fact) / max_degree_in_graph
+access = log1p(access_count) / log1p(100)
+       × exp(−idle_hours × ln2 / 72)            # idle since last_accessed
 ```
 
-Facts with more `link()` connections are harder to sink. Encodes the intuition
-that well-connected knowledge is more structural and harder to invalidate.
+Logarithmic so one hot fact doesn't dominate; the ~3-day half-life lets an
+un-revisited fact shed its access boost.
+
+### resonance
+
+```
+resonance = (avg_resonance + 1.0) / 2.0    if resonance_count > 0
+          = 0.0                            otherwise
+avg_resonance = resonance_sum / resonance_count
+```
+
+Normalized from `[-1, +1]` to `[0, 1]`. Crucially it contributes **0** until
+a session has actually scored the fact — an un-resonated fact is not propped
+up by a neutral 0.5 baseline, which would otherwise hold junk above the
+black-hole floor forever.
+
+### graph
+
+```
+graph = degree(fact) / max_degree_in_graph
+```
+
+Facts with more `link()` connections are harder to sink. Encodes the
+intuition that well-connected knowledge is more structural.
 
 ### Layer migration (per tick)
 
+Each tick a fact steps **one layer toward the layer its gravity belongs in**:
+
 ```
-gravity > 0.70  →  promote one layer up (layer - 1, floor 0)
-gravity < 0.30  →  demote one layer down (layer + 1, ceiling 2)
-gravity < 0.10  →  absorbed by black hole (layer = -1, removed from live index)
+target = surface  if gravity > 0.70
+       = core      if gravity < 0.30
+       = kinetic   otherwise
+layer moves one step toward target
+gravity < 0.10  →  absorbed by the black hole (layer = -1)
 ```
+
+The one-step cap keeps movement gradual. Migrating toward the band — not
+only on the extremes — means a fact stranded in the core climbs back out
+once its gravity recovers into the kinetic range, instead of being trapped
+there because promotion once required clearing 0.70 outright.
 
 ---
 
@@ -439,7 +461,9 @@ store the per-fact weight map as a JSON dict in the same column.
 
 ## Concurrency
 
-`MemoryStore` is designed for several agents sharing one process.
+### Within a process
+
+`MemoryStore` supports several agents sharing one process.
 
 ```
 MemoryStore
@@ -462,6 +486,60 @@ server (`server.py`) always passes `session_id` explicitly, so any two
 agents talking to the same server stay isolated.
 
 For visibility, `MemoryStore.stats` includes `active_sessions`.
+
+### Across processes
+
+Each MCP client spawns its own `birch.server`, so several `MemoryStore`
+instances share one SQLite file. The in-memory state is therefore a
+**cache, not the source of truth**:
+
+- `SQLiteBackend` runs in WAL mode and exposes `data_version()` —
+  SQLite's counter of commits made by *other* connections.
+- At the start of every operation `MemoryStore` checks `data_version`;
+  if another process has written, it reloads every cache from disk
+  before proceeding.
+- Every write runs inside a reentrant exclusive transaction
+  (`BEGIN IMMEDIATE`), so reload + mutate + persist cannot interleave
+  with another writer.
+- A single active process never sees `data_version` move, so it never
+  reloads — the common case stays hot.
+
+This is what stops a process with a stale cache from clobbering another
+process's gravity ticks — the failure mode a write-behind in-memory
+store hits as soon as a second client connects.
+
+---
+
+## Galaxy — the N-body research model
+
+`birch/galaxy/` is a research model that sits *beside* the live engine,
+not inside it — the MCP server still scores facts with `compute_gravity`.
+The galaxy makes the metaphor literal: instead of a scoring formula,
+facts are bodies in orbit and the physics is simulated directly.
+
+- **engine.py** — a 2D N-body integrator: a central black hole, leapfrog
+  integration, softened gravity, dynamical friction. A body's orbital
+  radius is its ring (far = surface, near = core); crossing the event
+  horizon is absorption.
+- **loader.py / projection.py** — turn facts into bodies. A shared PCA
+  basis (`Projector`) sets each body's angle from its embedding;
+  freshness and earned value set its starting orbit and mass.
+- **replay.py** — runs the galaxy along the store's real timeline: facts
+  are born at their `created_at`, closed sessions become orbital kicks
+  (resonance is thrust), and the current topic places a moving attention
+  mass.
+- **collapse.py** — friends-of-friends finds clumps; a bound, sub-virial
+  group (`2·KE < |PE|`) collapses into a MetaFact — Jeans instability in
+  place of a cosine Union-Find.
+- **report.py** — reads the settled galaxy back as a diagnosis of the
+  store: facts at forgetting-risk, emergent topic clusters, MetaFact
+  candidates.
+- **render.py** — matplotlib stills and animated GIFs.
+
+Run `python -m birch.galaxy` to replay and diagnose the real store. One
+finding from the model: an off-centre attractor in a black-hole-dominated
+disk cannot *gather* facts into a standing clump — there is no stable
+off-centre point — so the attention mass ships as a gentle perturber.
 
 ---
 
@@ -489,6 +567,14 @@ src/birch/
     centroid.py             centroid() + dispersion() utilities
     cluster.py              K-means++ ClusterBundle
     embeddings.py           Ollama batch (/api/embed) + single fallback
+  galaxy/                   N-body research model (beside the live engine)
+    engine.py               Galaxy — 2D N-body integrator, rings, absorption
+    loader.py               build a Galaxy from facts
+    projection.py           Projector — shared 2D PCA basis
+    replay.py               replay the store's history as births + kicks
+    collapse.py             friends-of-friends + Jeans collapse into MetaFacts
+    report.py               diagnose the settled galaxy
+    render.py               matplotlib stills and animated GIFs
 ```
 
 ---

@@ -66,20 +66,25 @@ into toxic territory, pulling down the gravity of facts it used.
 ### Gravity engine
 
 ```
-gravity = 0.35 × access_score   (log-scaled, decays with time, half-life ~14h)
-        + 0.45 × avg_resonance  (normalized from [-1, +1] to [0, 1])
-        + 0.20 × graph_degree   (relative to max degree in the graph)
+gravity = 0.35 × freshness   (decays from creation, ~2-week half-life)
+        + 0.20 × access      (log-scaled hits, decays from last touch)
+        + 0.35 × resonance   (avg session R, 0 until a session scores it)
+        + 0.10 × graph       (degree relative to the most-connected fact)
 ```
 
-Resonance reaches a fact **weighted by the fact's relevance to the session**.
-A fact returned by `query_memory` at cosine 0.95 absorbs almost the full
-session R; a fact returned at 0.10 absorbs almost none. Facts explicitly
-added or re-confirmed via `record_fact` are pinned at weight 1.0.
+The **freshness** term is a grace period — a new fact rides high and is not
+archived to the cold core before it has had a chance to prove itself.
+**Resonance** reaches a fact weighted by its relevance to the session: a
+fact returned by `query_memory` at cosine 0.95 absorbs almost the full
+session R, one returned at 0.10 almost none; facts added or re-confirmed
+via `record_fact` are pinned at weight 1.0. Resonance contributes 0 until a
+session has actually scored the fact.
 
-Layer migration happens automatically on every `session_close()`:
-- `gravity > 0.70` → promote one layer up (toward surface)
-- `gravity < 0.30` → demote one layer down (toward core)
-- `gravity < 0.10` → absorbed by black hole
+Layer migration happens on every `session_close()`. Each tick a fact steps
+one layer **toward the layer its gravity belongs in** — surface above 0.70,
+core below 0.30, kinetic between — so a fact stranded in the core climbs
+back out once its gravity recovers. Below 0.10 it is absorbed by the
+black hole.
 
 ### Hawking emission
 
@@ -166,6 +171,7 @@ so polymorphic `query()` does four scans without ID collisions.
 | `resonance/echo.py` | Cross-session echo detection + retroactive penalty + TTL sweep |
 | `resonance/cluster.py` | K-means++ bundle for session storage |
 | `resonance/embeddings.py` | Ollama batch embedding client |
+| `galaxy/` | N-body research model — facts as orbiting bodies (see below) |
 
 ---
 
@@ -284,6 +290,14 @@ Embedding HTTP calls happen outside the internal lock, so concurrent agents
 do not serialize on Ollama. The MCP server already threads `session_id`
 through `record_session`, so concurrent calls are safe by default.
 
+**Across processes.** Each MCP client spawns its own `birch.server`, so
+several `MemoryStore` instances share one SQLite file. The in-memory state
+is treated as a cache, not the source of truth: `SQLiteBackend` runs in WAL
+mode and exposes `data_version()`, every operation reloads from disk when
+another process has written, and every write runs inside an exclusive
+transaction. A lone process never reloads and stays hot; a stale process
+can no longer clobber another's gravity ticks.
+
 ---
 
 ## Connecting to Claude agents (MCP)
@@ -340,6 +354,34 @@ they actually proved. Four properties distinguish it:
 
 ---
 
+## The galaxy — an N-body research model
+
+`birch/galaxy/` is a research model that sits beside the live engine — the
+MCP server still scores facts with the gravity formula above; the galaxy
+makes the metaphor literal. Facts become bodies in orbit around the black
+hole, and the physics is simulated rather than scored:
+
+- a body's orbital **radius** is its ring — far is surface, near is core;
+- **dynamical friction** decays an unused orbit inward;
+- a closed session is an orbital **kick** — resonance is thrust;
+- a cold, gravitationally bound clump undergoes a **Jeans collapse** into a
+  MetaFact;
+- the current topic places a moving **attention mass** that bends the disk.
+
+Run it on the real store:
+
+```bash
+pip install -e ".[galaxy]"      # adds matplotlib
+python -m birch.galaxy
+```
+
+It replays the store's whole history, writes an animated GIF, and prints a
+diagnosis — which facts are spiralling toward the black hole (forgetting
+risk), which friends-of-friends clusters are emergent topics, and which
+clumps the store wants compacted into MetaFacts. See [ARCHITECTURE.md](ARCHITECTURE.md).
+
+---
+
 ## Test results
 
 ```
@@ -380,14 +422,15 @@ Environment knobs:
 Working proof of concept. All of the following are functional and covered
 by the test suite: resonance pipeline, gravity engine, black hole with
 polymorphic singularity (facts + MetaFacts), SQLite persistence, numpy
-vector index, per-session concurrency, auto-linking on `add_fact`,
-counter-triggered background collapse with lineage, EchoStore TTL, and
-the MCP server.
+vector index, per-session concurrency, **cross-process safety** (WAL +
+`data_version` cache invalidation), auto-linking on `add_fact`,
+counter-triggered background collapse with lineage, EchoStore TTL, the MCP
+server, and the `galaxy` N-body research model. CI runs ruff and mypy on
+every push.
 
 Next natural steps: a persistent similarity index for very large stores
-(FAISS / hnswlib), an LLM-driven `MetaFact.summary` writer that runs
-async after collapse, recursive collapse (MetaFacts colliding with
-MetaFacts), and shared multi-agent memory across processes.
+(FAISS / hnswlib), an LLM-driven `MetaFact.summary` writer that runs async
+after collapse, and recursive collapse (MetaFacts colliding with MetaFacts).
 
 ## License
 
