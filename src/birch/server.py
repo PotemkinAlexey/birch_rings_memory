@@ -44,6 +44,40 @@ def _validate_text(
     return None
 
 
+def _validate_id(value, field_name: str = "fact_id") -> Optional[dict]:
+    """Reject non-string or empty id arguments at the MCP boundary.
+
+    ID-based tools (``delete_fact``, ``delete_body``, ``supersede_fact``,
+    ``retire_fact``, ``explain_fact``) used to accept whatever the
+    caller passed and forward it to core. None / int / dict / "" /
+    whitespace silently returned "not found" (mostly benign) or, for
+    ``explain_fact``, crashed deep inside a dict lookup. Catching here
+    gives a single structured failure shape per field — symmetric with
+    ``_validate_text`` and ``_validate_spo_strings``.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return {
+            "ok": False,
+            "error": "invalid_id",
+            "field": field_name,
+            "got_type": type(value).__name__,
+            "hint": f"{field_name} must be a non-empty string",
+        }
+    return None
+
+
+# Cap on the per-call ``record_facts`` batch. Each item carries a string
+# embedding round-trip and a SQLite write — a 50k-item payload is one
+# accidental copy-paste away from a many-minute embed call + a huge
+# transaction. 500 is a comfortable upper bound for batch embed
+# endpoints (well under Ollama's default) and well above any agent's
+# legitimate single-call write. Override via env if you really need
+# bigger batches and have audited the cost.
+_RECORD_FACTS_BATCH_CAP = max(
+    1, int(os.environ.get("BIRCH_RECORD_FACTS_BATCH_CAP", "500"))
+)
+
+
 def _validate_spo_strings(
     subject, predicate, obj,
 ) -> Optional[dict]:
@@ -313,6 +347,22 @@ def record_facts(
                 "predicate, object"
             ),
         }
+    # Batch-size cap: an agent that accidentally pastes 50k items would
+    # otherwise issue one huge embed batch + one giant SQLite
+    # transaction with no progress signal. Return a structured error so
+    # the caller can split the work and retry.
+    if len(facts) > _RECORD_FACTS_BATCH_CAP:
+        return {
+            "ok": False,
+            "error": "batch_too_large",
+            "limit": _RECORD_FACTS_BATCH_CAP,
+            "got": len(facts),
+            "hint": (
+                f"Split into batches of at most {_RECORD_FACTS_BATCH_CAP} "
+                "items. Override the cap with "
+                "BIRCH_RECORD_FACTS_BATCH_CAP if you really need bigger."
+            ),
+        }
     # Per-item validation: a malformed entry used to raise a raw KeyError
     # straight through MCP. Now we collect the issues and return a typed
     # response the agent can parse and fix in one round trip.
@@ -348,6 +398,24 @@ def record_facts(
                     k: type(f[k]).__name__ for k in bad_type
                 },
             })
+            continue
+        # Per-item session_id type check: items can override the
+        # top-level session_id, and the override flows straight into
+        # _resolve_sid. A non-string (int, list, dict) would silently
+        # mis-attribute the fact to a session id of the wrong type
+        # or skip attribution entirely. Catch here so the agent gets
+        # a structured error per item instead of a quiet
+        # mis-attribution.
+        if "session_id" in f and f["session_id"] is not None:
+            if (
+                not isinstance(f["session_id"], str)
+                or not f["session_id"].strip()
+            ):
+                invalid.append({
+                    "index": i,
+                    "error": "invalid_session_id",
+                    "got_type": type(f["session_id"]).__name__,
+                })
     if invalid:
         return {
             "ok": False,
@@ -462,6 +530,12 @@ def supersede_fact(old_fact_id: str, new_fact_id: str) -> dict:
 
     Returns {"superseded": true, "old_id", "new_id", "absorbed": [...]}.
     """
+    err = _validate_id(old_fact_id, "old_fact_id")
+    if err is not None:
+        return err
+    err = _validate_id(new_fact_id, "new_fact_id")
+    if err is not None:
+        return err
     return _store.supersede_fact(old_fact_id, new_fact_id)
 
 
@@ -482,6 +556,9 @@ def retire_fact(fact_id: str) -> dict:
 
     Returns {"retired": true, "fact_id", "absorbed": [...]}.
     """
+    err = _validate_id(fact_id, "fact_id")
+    if err is not None:
+        return err
     return _store.retire_fact(fact_id)
 
 
@@ -579,6 +656,9 @@ def delete_fact(fact_id: str) -> dict:
 
     Returns {"deleted": true} if found, {"deleted": false} if not found.
     """
+    err = _validate_id(fact_id, "fact_id")
+    if err is not None:
+        return err
     deleted = _store.delete_fact(fact_id)
     return {"deleted": deleted, "fact_id": fact_id}
 
@@ -604,6 +684,9 @@ def delete_body(body_id: str) -> dict:
     rescue, no MetaFact lineage. Prefer supersede_fact / retire_fact
     for stale data — both preserve the body for resonance feedback.
     """
+    err = _validate_id(body_id, "body_id")
+    if err is not None:
+        return err
     return _store.delete_body(body_id)
 
 
@@ -752,6 +835,9 @@ def explain_fact(fact_id: str) -> dict:
     ``deprecated_by`` so you can tell whether the fact is even live.
     Read-only debug; never mutates.
     """
+    err = _validate_id(fact_id, "fact_id")
+    if err is not None:
+        return err
     return _store.explain_fact(fact_id)
 
 

@@ -182,12 +182,12 @@ def test_delete_body_bumps_mutation_version(tmp_path):
 
 def test_readme_lists_check_echo_with_correct_tool_count():
     """README's MCP-tool table now includes check_echo and says
-    seventeen tools (was sixteen + missing check_echo)."""
+    eighteen tools (was seventeen + missing delete_body row)."""
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text()
-    assert "seventeen tools" in readme
+    assert "eighteen tools" in readme
     assert "`check_echo`" in readme
     # forecast wording updated to per-body.
     assert "per-body stability" in readme

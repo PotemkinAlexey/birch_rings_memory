@@ -39,6 +39,7 @@ class SessionsMixin:
         _txn: Callable[[], Any]
         _absorb_dead: Callable[[], list[str]]
         _maybe_trigger_collapse_locked: Callable[[int], None]
+        _bump_mutation_locked: Callable[[], None]
 
     # ── Back-compat shims for the legacy single-session API ────────────────
     #
@@ -414,7 +415,7 @@ class SessionsMixin:
                 # Counter-triggered collapse. Held inside the lock so the
                 # collapse counter and the trigger decision are consistent.
                 self._maybe_trigger_collapse_locked(len(absorbed))
-                self._mutation_version += 1
+                self._bump_mutation_locked()
 
                 summary = {
                     "session_id": sid,

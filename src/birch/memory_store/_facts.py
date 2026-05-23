@@ -221,7 +221,7 @@ class FactsMixin:
                     if ctx is not None:
                         self._attribute_to(ctx, fact.fact_id, 1.0)
                         self._persist_session_locked(ctx)
-                self._mutation_version += 1
+                self._bump_mutation_locked()
                 return (fact, True) if return_status else fact
 
     def _bump_mutation_locked(self) -> None:
@@ -407,7 +407,7 @@ class FactsMixin:
                 # Persist every open session whose attribution changed.
                 for sid in touched_ctxs:
                     self._persist_session_locked(self._sessions.get(sid))
-                self._mutation_version += 1
+                self._bump_mutation_locked()
 
         if return_status:
             return [
@@ -510,7 +510,7 @@ class FactsMixin:
                     # depress graph_score for healthy facts.
                     if hasattr(self._storage, "delete_edges_for_fact"):
                         self._storage.delete_edges_for_fact(fact_id)
-                self._mutation_version += 1
+                self._bump_mutation_locked()
                 return True
 
     def delete_body(self, body_id: str) -> dict:
@@ -547,7 +547,7 @@ class FactsMixin:
                         self._storage.delete_fact(body_id)
                         if hasattr(self._storage, "delete_edges_for_fact"):
                             self._storage.delete_edges_for_fact(body_id)
-                    self._mutation_version += 1
+                    self._bump_mutation_locked()
                     return {"deleted": True, "kind": "fact",
                             "body_id": body_id}
                 # 2. Live MetaFact.
@@ -558,7 +558,7 @@ class FactsMixin:
                     if (self._storage
                             and hasattr(self._storage, "delete_meta_fact")):
                         self._storage.delete_meta_fact(body_id)
-                    self._mutation_version += 1
+                    self._bump_mutation_locked()
                     return {"deleted": True, "kind": "meta",
                             "body_id": body_id}
                 # 3. Singularity FactPassport.
@@ -573,7 +573,7 @@ class FactsMixin:
                         # _degrees on next load.
                         if hasattr(self._storage, "delete_edges_for_fact"):
                             self._storage.delete_edges_for_fact(body_id)
-                    self._mutation_version += 1
+                    self._bump_mutation_locked()
                     return {"deleted": True,
                             "kind": "singularity_fact",
                             "body_id": body_id}
@@ -584,7 +584,7 @@ class FactsMixin:
                     if (self._storage
                             and hasattr(self._storage, "delete_meta_fact")):
                         self._storage.delete_meta_fact(body_id)
-                    self._mutation_version += 1
+                    self._bump_mutation_locked()
                     return {"deleted": True,
                             "kind": "singularity_meta",
                             "body_id": body_id}
@@ -680,7 +680,7 @@ class FactsMixin:
         if self._storage:
             self._storage.save_fact(old)
         absorbed = self._absorb_dead()
-        self._mutation_version += 1
+        self._bump_mutation_locked()
         return {
             "superseded": True,
             "old_id": old_id,
@@ -796,7 +796,7 @@ class FactsMixin:
                 if self._storage:
                     self._storage.save_fact(fact)
                 absorbed = self._absorb_dead()
-                self._mutation_version += 1
+                self._bump_mutation_locked()
         return {
             "retired": True,
             "fact_id": fact_id,

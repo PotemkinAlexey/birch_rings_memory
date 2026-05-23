@@ -362,6 +362,26 @@ class SQLiteBackend:
         )
         self._maybe_commit()
 
+    def prune_orphan_edges(self) -> int:
+        """Drop edge rows whose endpoints are no longer in the facts
+        table. Returns the number of rows deleted.
+
+        The schema has no FOREIGN KEY constraint on edges → facts (the
+        graph is FactPassport-only, but MetaFact polymorphism makes
+        retroactive FKs awkward), so a missed cleanup path leaves
+        orphan rows on disk. The in-memory load already filters
+        orphans, so this is on-disk hygiene only — call from a
+        maintenance / doctor path, not the hot path. Idempotent.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM edges WHERE "
+            "from_id NOT IN (SELECT fact_id FROM facts) "
+            "OR to_id NOT IN (SELECT fact_id FROM facts)"
+        )
+        removed = cur.rowcount or 0
+        self._maybe_commit()
+        return removed
+
     # ── Echo sessions ─────────────────────────────────────────────────────────
 
     def save_echo_session(

@@ -362,7 +362,7 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Claude then has seventeen tools:
+Claude then has eighteen tools:
 
 | Tool | What it does |
 |---|---|
@@ -373,7 +373,8 @@ Claude then has seventeen tools:
 | `find_similar` | Read-only paraphrase search — surface candidates before writing or for planning `set_fact` / `supersede_fact` cleanup |
 | `supersede_fact` | Mark `old_id` superseded by `new_id` — old body goes to the singularity with `deprecated_by` set; lineage preserved, MetaFact / Hawking still possible |
 | `retire_fact` | Send a no-longer-relevant fact to the singularity (no replacement) — `ttl=now`, same singularity benefits as supersede |
-| `delete_fact` | Hard-delete a live FactPassport — data is GONE, no singularity, no lineage. Use only for secrets / accidental writes; prefer supersede or retire for stale data |
+| `delete_fact` | Legacy hard-delete — handles ONLY live FactPassports. Kept for backward compat; prefer `delete_body` for polymorphic ids from `query_memory` |
+| `delete_body` | Polymorphic hard-delete — handles live FactPassports, live MetaFacts, singularity FactPassports, and singularity MetaFacts under a single `body_id` (the kind `query_memory` returns). Same destructive contract as `delete_fact` |
 | `list_facts` | List live facts with filters (`subject_prefix`, `min_gravity`, `layer`, `exclude_deprecated`); sorted by gravity — audit without a query |
 | `explain_fact` | Decompose a fact's gravity into per-feature contributions — debug "why is this gravity so low" |
 | `session_open` | Open a named session so reads and writes can be attributed to it |

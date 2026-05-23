@@ -622,7 +622,7 @@ class QueryMixin:
                                 fact_weights=past.fact_weights,
                                 echo_penalty=past.echo_penalty,
                             )
-                    self._mutation_version += 1
+                    self._bump_mutation_locked()
 
                 return {
                     "echo": result.label == "echo",
