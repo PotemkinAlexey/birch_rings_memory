@@ -166,14 +166,62 @@ def record_facts(
 
 
 @mcp.tool()
+def supersede_fact(old_fact_id: str, new_fact_id: str) -> dict:
+    """
+    Mark a fact as superseded by a newer one — the canonical "we now know better".
+
+    The old fact's deprecated_by pointer is set (lineage preserved), the SPO
+    slot is freed for the new claim, and the body is sent to the singularity
+    immediately. The row stays in storage, so the deprecated fact can still
+    fuel singularity collapse (MetaFact compression) and be Hawking-emitted
+    if a future query reopens the topic.
+
+    Use this whenever you record a replacement fact for an older one — it is
+    the right path for "stale / wrong / outdated" data. Do NOT use
+    delete_fact for that; delete_fact is a destructive primitive for
+    secrets and accidental writes.
+
+    Returns {"superseded": true, "old_id", "new_id", "absorbed": [...]}.
+    """
+    return _store.supersede_fact(old_fact_id, new_fact_id)
+
+
+@mcp.tool()
+def retire_fact(fact_id: str) -> dict:
+    """
+    Send a no-longer-relevant fact to the singularity with no replacement.
+
+    Use when the fact's topic is simply over (a project ended, a feature
+    was removed) and there is no newer fact replacing it. The body is
+    marked expired and absorbed into the black hole in the same call. The
+    row stays in storage, so the fact can still feed singularity collapse
+    and Hawking emission.
+
+    Prefer supersede_fact when you DO have a replacement — that preserves
+    the "we used to think X, now Y" lineage. Use delete_fact only for
+    truly destructive removal.
+
+    Returns {"retired": true, "fact_id", "absorbed": [...]}.
+    """
+    return _store.retire_fact(fact_id)
+
+
+@mcp.tool()
 def delete_fact(fact_id: str) -> dict:
     """
-    Permanently delete a fact by its fact_id.
+    Hard-delete a fact — destructive primitive, the data is GONE.
 
     Removes the fact from all live layers, the vector index, the SPO dedup
-    index, and storage. Does NOT send it to the black hole — the data is gone.
+    index, AND storage. Does NOT send it to the black hole; there is no
+    lineage, no MetaFact compression, no Hawking rescue. Use only for:
 
-    Use this to correct mistakes or remove stale/wrong facts.
+      - Secrets / sensitive data that must not exist (GDPR-style removal)
+      - Facts you just recorded by accident in the same session
+
+    For "stale / wrong / outdated" data, prefer supersede_fact (when there
+    is a replacement) or retire_fact (when there is not) — both preserve
+    the body in the singularity so the brain can still learn from it.
+
     Returns {"deleted": true} if found, {"deleted": false} if not found.
     """
     deleted = _store.delete_fact(fact_id)

@@ -119,6 +119,26 @@ fact's current value; `access_count` will have incremented by one. That is a
 safety net, not a license — still search before writing, since paraphrases
 (`"runs on" Go` vs `"is written in" Go`) will not be de-duped automatically.
 
+### Retiring a fact — pick the right path
+
+Three operations exist for "this fact should leave the live layers". They
+are NOT interchangeable; pick by intent.
+
+| Situation | Tool | What happens |
+|---|---|---|
+| There is a newer fact that *replaces* this one | `supersede_fact(old_id, new_id)` | Old fact's `deprecated_by` is set, body goes to the singularity. Lineage preserved; can feed MetaFact compression and Hawking emission. |
+| The topic is over, no replacement | `retire_fact(fact_id)` | `ttl` set to now, body goes to the singularity. Same singularity benefits as supersede. |
+| Hard removal (secrets / accidental write) | `delete_fact(fact_id)` | Row deleted from storage. **No lineage, no singularity, no Hawking rescue.** Use sparingly. |
+
+The default for "we now know better" is **`supersede_fact`**, not
+`delete_fact`. Hard delete loses the "we used to think X" record and
+denies the body to singularity collapse, which is how BirchKM compresses
+related stale facts into MetaFacts. Use `delete_fact` only when the data
+must genuinely cease to exist.
+
+If a fact's gravity decays naturally below `0.10`, the runtime absorbs
+it into the singularity on the next tick — no tool call needed.
+
 ---
 
 ## Session scoring

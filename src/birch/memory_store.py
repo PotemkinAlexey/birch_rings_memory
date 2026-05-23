@@ -608,6 +608,70 @@ class MemoryStore:
                     if self._storage:
                         self._storage.save_fact(old)
 
+    def supersede_fact(self, old_id: str, new_id: str) -> dict:
+        """Mark ``old_id`` as superseded by ``new_id`` and send it to the singularity.
+
+        This is the canonical path for "we now know better": the old fact's
+        ``deprecated_by`` is set (lineage preserved), the SPO slot is freed
+        for the new claim, and an immediate ``_absorb_dead`` pass moves the
+        body into the black hole on the same call — so the caller sees the
+        effect synchronously instead of waiting for the next session_close.
+
+        Unlike ``delete_fact``, the body is **not** removed from storage —
+        it stays in the ``facts`` table with ``deprecated_by`` set, and the
+        runtime treats it as a singularity resident on every restart. This
+        keeps it available for singularity collapse (MetaFact compression)
+        and Hawking emission, and preserves the "we used to think X" record.
+        """
+        with self._lock:
+            with self._txn():
+                self._sync()
+                if old_id not in self._facts:
+                    return {"superseded": False, "reason": "old_id not found"}
+                old = self._facts[old_id]
+                old.deprecated_by = new_id
+                key = self._normalize_spo(old.subject, old.predicate, old.object)
+                if self._spo_index.get(key) == old_id:
+                    del self._spo_index[key]
+                if self._storage:
+                    self._storage.save_fact(old)
+                absorbed = self._absorb_dead()
+        return {
+            "superseded": True,
+            "old_id": old_id,
+            "new_id": new_id,
+            "absorbed": absorbed,
+        }
+
+    def retire_fact(self, fact_id: str) -> dict:
+        """Mark a fact as no longer relevant and send it to the singularity.
+
+        Use when a fact is stale but has no direct replacement (the topic
+        is just over). The fact's ``ttl`` is set to "now" so the next
+        absorption pass treats it as expired; an immediate ``_absorb_dead``
+        runs in the same call so the caller sees the effect synchronously.
+
+        Like ``supersede_fact``, the row stays in storage so the body can
+        feed singularity collapse and be Hawking-emitted if a future query
+        wakes it up. Use ``delete_fact`` only when the data must truly
+        cease to exist (secrets, accidental insertions).
+        """
+        with self._lock:
+            with self._txn():
+                self._sync()
+                if fact_id not in self._facts:
+                    return {"retired": False, "reason": "fact_id not found"}
+                fact = self._facts[fact_id]
+                fact.ttl = time.time()
+                if self._storage:
+                    self._storage.save_fact(fact)
+                absorbed = self._absorb_dead()
+        return {
+            "retired": True,
+            "fact_id": fact_id,
+            "absorbed": absorbed,
+        }
+
     # ── Session lifecycle ────────────────────────────────────────────────────
 
     def session_start(self, session_id: str) -> None:
