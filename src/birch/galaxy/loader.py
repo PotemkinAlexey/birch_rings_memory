@@ -7,6 +7,7 @@ over from there. Pure: reads facts, writes nothing.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 
@@ -21,8 +22,18 @@ _LN2 = math.log(2)
 
 
 def fallback_direction(fact_id: str, dim: int) -> np.ndarray:
-    """A deterministic unit direction for a fact with no usable embedding."""
-    rng = np.random.default_rng(abs(hash(fact_id)) & 0xFFFFFFFF)
+    """A deterministic unit direction for a fact with no usable embedding.
+
+    Uses sha256 instead of Python's built-in hash() because hash() is
+    salted per-process for strings (PYTHONHASHSEED defaults to random),
+    which would give the same fact a different fallback direction on
+    every restart. The forecast for vectorless bodies would change
+    across reboots with no actual data change. sha256 is stable across
+    processes and across Python versions.
+    """
+    digest = hashlib.sha256(fact_id.encode("utf-8")).digest()
+    seed = int.from_bytes(digest[:8], "big")
+    rng = np.random.default_rng(seed)
     vec = rng.normal(size=dim)
     norm = float(np.linalg.norm(vec))
     if norm < 1e-9:

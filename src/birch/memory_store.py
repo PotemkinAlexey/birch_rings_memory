@@ -1,6 +1,7 @@
 """MemoryStore — unified entry point for the BirchKM memory system."""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -23,7 +24,9 @@ from .singularity_compactor import (
 )
 from .storage import SQLiteBackend, StorageBackend
 from .thresholds import Thresholds
-from .vector_index import VectorIndex
+from .vector_index import DimensionMismatchError, VectorIndex
+
+_logger = logging.getLogger(__name__)
 
 # Module-level aliases kept for the existing call sites; the values
 # now come from the centralised env-overridable Thresholds module.
@@ -440,7 +443,23 @@ class MemoryStore:
                 continue
             self._facts[fact.fact_id] = fact
             self._engine.register(fact)
-            self._index.add(fact.fact_id, fact.vector)
+            # Mixed-dim live facts (after an embedding-model swap
+            # without reindex) must not take startup down. The fact
+            # stays registered with gravity engine for layer-only ops;
+            # its vector is cleared so downstream consumers can't try
+            # to use a dim that won't match anything else. The fact
+            # remains visible through list_facts and gravity migrations
+            # but won't appear in semantic search until reindexed.
+            try:
+                self._index.add(fact.fact_id, fact.vector)
+            except DimensionMismatchError:
+                _logger.warning(
+                    "fact %r loaded but not indexed (vector dim "
+                    "mismatch — embedding model likely changed; "
+                    "rebuild the store with a single BIRCH_EMBED_MODEL)",
+                    fact.fact_id,
+                )
+                fact.vector = []
             if not fact.is_deprecated:
                 key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
                 self._spo_index.setdefault(key, fact.fact_id)
@@ -452,7 +471,14 @@ class MemoryStore:
                     self._hole.restore_meta(meta)
                 else:
                     self._meta_facts[meta.meta_id] = meta
-                    self._meta_index.add(meta.meta_id, meta.vector)
+                    try:
+                        self._meta_index.add(meta.meta_id, meta.vector)
+                    except DimensionMismatchError:
+                        _logger.warning(
+                            "metafact %r loaded but not indexed "
+                            "(vector dim mismatch)", meta.meta_id,
+                        )
+                        meta.vector = []
                     self._engine.register(meta)
         # Edges between live facts only — orphan endpoints (referenced fact
         # was deleted) used to inflate _degrees and skew max_deg, which
@@ -588,6 +614,22 @@ class MemoryStore:
                     return (fact, False) if return_status else fact
 
                 sid = self._resolve_sid(session_id)
+                # Preflight: if the embedding model changed under the
+                # store, _index.add() will raise DimensionMismatchError.
+                # Doing it BEFORE we mutate _facts/_engine means a
+                # mismatch leaves no half-state behind (otherwise the
+                # fact would live in _facts + _engine but not in the
+                # vector index, and storage rollback wouldn't undo
+                # the in-memory writes).
+                if (vec and self._index._dim is not None
+                        and len(vec) != self._index._dim):
+                    raise DimensionMismatchError(
+                        f"Embedding dimension mismatch: index has "
+                        f"dim={self._index._dim}, incoming vector has "
+                        f"dim={len(vec)}. The embedding model probably "
+                        f"changed under the store. Pin BIRCH_EMBED_MODEL "
+                        f"or rebuild the store before writing facts."
+                    )
                 fact = FactPassport(
                     subject=subject,
                     predicate=predicate,
@@ -756,6 +798,17 @@ class MemoryStore:
                         seen_in_batch.setdefault(key, idx)
                         continue
 
+                    # Preflight dimension to keep mutations atomic per
+                    # item — same pattern as add_fact above.
+                    if (vec and self._index._dim is not None
+                            and len(vec) != self._index._dim):
+                        raise DimensionMismatchError(
+                            f"Embedding dimension mismatch in batch: "
+                            f"index has dim={self._index._dim}, "
+                            f"incoming vector has dim={len(vec)} for "
+                            f"({s!r}, {p!r}, {o!r}). The embedding "
+                            f"model probably changed under the store."
+                        )
                     fact = FactPassport(
                         subject=s,
                         predicate=p,
@@ -1174,10 +1227,34 @@ class MemoryStore:
     # ── Session lifecycle ────────────────────────────────────────────────────
 
     def session_start(self, session_id: str) -> None:
-        """Open a session context. Safe to call concurrently."""
+        """Open a session context. Safe to call concurrently.
+
+        Idempotent: if the session already exists, the existing
+        context is preserved (messages, vectors, fact attribution
+        intact) and just promoted to the current session. An agent
+        that calls session_open twice with the same id — typically
+        on retry after a failed embed — does NOT lose its in-flight
+        trajectory or the gravity signal it accumulated. Previously
+        a second session_start silently overwrote the context with
+        an empty one, which lost the conversation's resonance
+        attribution before close.
+        """
         with self._lock:
             with self._txn():
                 self._sync()
+                if session_id in self._sessions:
+                    # Already open — preserve in-flight state. Just
+                    # promote to current and skip re-persistence
+                    # (storage row is already there, and overwriting
+                    # would clobber any attribution accumulated since
+                    # the first session_start).
+                    self._current_session_id = session_id
+                    _logger.info(
+                        "session_start: %r already open — preserving "
+                        "in-flight context (idempotent open)",
+                        session_id,
+                    )
+                    return
                 ctx = SessionContext(session_id=session_id)
                 self._sessions[session_id] = ctx
                 self._current_session_id = session_id
