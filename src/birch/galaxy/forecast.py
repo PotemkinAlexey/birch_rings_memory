@@ -1,18 +1,19 @@
-"""Forecast — turn a settled galaxy into a per-fact stability prediction.
+"""Forecast — turn a settled galaxy into a per-body stability prediction.
 
 The galaxy started life as a telescope: a research model that ran beside the
 live engine to make the physics literal. This module hands the galaxy a
-*producer* role too. Given a snapshot of live facts, build the galaxy, run
-it forward for a short horizon, and report — per fact — how far each body
-ended up from the event horizon.
+*producer* role too. Given a snapshot of live bodies (FactPassports and
+MetaFacts), build the galaxy, run it forward for a short horizon, and
+report — per body — how far each ended up from the event horizon.
 
-The result, ``forecast_stability ∈ [0, 1]``, lands on the FactPassport and
-is consumed by the adaptive gravity formula as a 5th learnable feature:
+The result, ``forecast_stability ∈ [0, 1]``, lands on the body (FactPassport
+or MetaFact — both carry the field) and is consumed by the adaptive gravity
+formula as a 5th learnable feature:
 
     1.0   body finished safely on the surface ring or beyond
     0.0   body crossed the horizon (absorbed)
     0.5   no usable prediction (default neutral prior — what an untouched
-          fact carries before ``run_forecast`` has been called)
+          body carries before ``run_forecast`` has been called)
 
 This makes the galaxy more than a picture: the formula now has access to
 a forecast — a signal local features cannot produce by themselves —
@@ -23,32 +24,35 @@ contributes only the neutral 0.5 to gravity.
 """
 from __future__ import annotations
 
-from ..fact import FactPassport
 from .engine import Galaxy
 from .loader import build_galaxy
 
 
 def forecast_stability(
-    facts: list[FactPassport],
+    bodies: list,
     *,
     horizon_ticks: int = 50,
     galaxy: Galaxy | None = None,
 ) -> dict[str, float]:
-    """Run the galaxy forward and report per-fact stability.
+    """Run the galaxy forward and report per-body stability.
+
+    Accepts a polymorphic list of ``FactPassport`` and ``MetaFact`` bodies.
+    The returned dict is keyed by ``fact_id`` (which on a MetaFact is an
+    alias for ``meta_id``), so callers can dispatch updates back to the
+    right store. Bodies missing from the dict should be treated as the
+    neutral 0.5 prior (what an untouched body carries before this
+    function has been called).
 
     ``horizon_ticks`` is how many integrator steps to advance. 50 is a
     cheap default; larger horizons see more decay but cost more compute.
 
-    Facts without an embedding land in the galaxy via a deterministic
-    fallback direction, so every fact gets a forecast. The returned dict
-    is keyed by ``fact_id``; callers that want the symmetric "stability
-    by default" semantics for facts missing from the dict should treat
-    the absence as 0.5 (the neutral prior on FactPassport).
+    Bodies without an embedding land in the galaxy via a deterministic
+    fallback direction, so every body gets a forecast.
     """
-    if not facts:
+    if not bodies:
         return {}
 
-    gal = build_galaxy(facts, galaxy=galaxy)
+    gal = build_galaxy(bodies, galaxy=galaxy)
     absorbed_during_run: set[str] = set()
 
     for _ in range(max(0, int(horizon_ticks))):

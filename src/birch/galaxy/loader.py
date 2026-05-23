@@ -73,9 +73,26 @@ def build_galaxy(
     Accepts a polymorphic list of FactPassport and MetaFact bodies. Both
     expose the surface the placement needs (``fact_id``, ``vector``,
     ``access_count``, ``resonance_sum``, ``created_at``).
+
+    Raises ``DimensionMismatchError`` if the non-empty input vectors do
+    not all share one dimensionality — that usually means BIRCH_EMBED_MODEL
+    changed (or singularity holds rows from an older model) and the
+    forecast would silently produce wrong geometry. Bodies with empty
+    vectors get a deterministic fallback direction and are not counted
+    toward the dimension check.
     """
     now = now if now is not None else time.time()
     gal = galaxy if galaxy is not None else Galaxy()
+
+    non_empty_dims = {len(b.vector) for b in facts if b.vector}
+    if len(non_empty_dims) > 1:
+        from ..vector_index import DimensionMismatchError
+        raise DimensionMismatchError(
+            "build_galaxy received bodies with mixed embedding dimensions "
+            f"{sorted(non_empty_dims)}. The forecast would silently use "
+            "the max-dim subset and project the rest to zero coords — fix "
+            "the store (pin BIRCH_EMBED_MODEL or reindex) before retrying."
+        )
 
     projector = Projector.fit([f.vector for f in facts], dim=gal.dim)
     for body in facts:

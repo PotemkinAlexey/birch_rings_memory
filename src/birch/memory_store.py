@@ -300,6 +300,37 @@ class MemoryStore:
             return
         self._attribute_to(ctx, fact_id, weight)
 
+    # EWMA half-life for recent_utility: ~7 events to half-life. Slow
+    # enough that a single outlier session does not swing the prior, fast
+    # enough that a meaningful streak shows up within a week.
+    _RECENT_UTILITY_ALPHA: float = 0.15
+
+    def _apply_recent_utility_locked(
+        self,
+        body_weights: dict[str, float],
+        r: float,
+    ) -> None:
+        """Caller must hold self._lock. Update the EWMA recent_utility of
+        every touched body (FactPassport or MetaFact) by the per-body
+        realised value ``target = clamp((r·weight + 1) / 2, 0, 1)``.
+
+        Used by both ``session_close`` (positive/negative R from the just-
+        closed session) and ``check_echo`` (retroactive negative penalty
+        from an echo). Without sharing the EWMA path, the resonance signal
+        would change but recent_utility would not — gravity formula would
+        see contradictory inputs.
+        """
+        alpha = self._RECENT_UTILITY_ALPHA
+        for bid, attr_weight in body_weights.items():
+            body = self._facts.get(bid) or self._meta_facts.get(bid)
+            if body is None:
+                continue
+            per_body_r = r * float(attr_weight)
+            target = max(0.0, min(1.0, (per_body_r + 1.0) / 2.0))
+            body.recent_utility = (
+                (1.0 - alpha) * body.recent_utility + alpha * target
+            )
+
     def _persist_session_locked(self, ctx: Optional[SessionContext]) -> None:
         """Caller must hold self._lock AND be inside a write transaction.
 
@@ -439,7 +470,8 @@ class MemoryStore:
         obj: str,
         layer: int = 1,
         session_id: Optional[str] = None,
-    ) -> FactPassport:
+        return_status: bool = False,
+    ):
         """
         Create, embed, and register a new fact.
 
@@ -448,6 +480,13 @@ class MemoryStore:
         creating a duplicate. The existing fact is touched and attributed
         to the named session (or the current one), so the caller's intent
         still propagates to gravity at weight 1.0.
+
+        ``return_status=True`` returns ``(fact, created)`` where ``created``
+        is True only when this call actually inserted a new row in its
+        authoritative transaction. A race that loses (another process
+        inserted the same SPO between our embed and our write lock)
+        returns ``created=False`` with the winner's fact. This is what
+        ``set_fact`` uses to report ``already_existed`` honestly.
 
         Embedding happens outside the lock so concurrent agents don't
         serialize on the slow HTTP roundtrip to Ollama.
@@ -463,7 +502,8 @@ class MemoryStore:
                     self._sync()
                     eid = self._spo_index.get(key)
                     if eid and eid in self._facts:
-                        return self._touch_existing(eid, session_id)
+                        fact = self._touch_existing(eid, session_id)
+                        return (fact, False) if return_status else fact
                 # Raced away between sync and the write lock — fall through.
 
         # Slow path: embed without holding the lock.
@@ -477,7 +517,8 @@ class MemoryStore:
                 # triple while we were embedding.
                 existing_id = self._spo_index.get(key)
                 if existing_id and existing_id in self._facts:
-                    return self._touch_existing(existing_id, session_id)
+                    fact = self._touch_existing(existing_id, session_id)
+                    return (fact, False) if return_status else fact
 
                 sid = self._resolve_sid(session_id)
                 fact = FactPassport(
@@ -500,7 +541,7 @@ class MemoryStore:
                     if ctx is not None:
                         self._attribute_to(ctx, fact.fact_id, 1.0)
                         self._persist_session_locked(ctx)
-                return fact
+                return (fact, True) if return_status else fact
 
     def _touch_existing(
         self,
@@ -950,16 +991,18 @@ class MemoryStore:
         primitive for atomic relations where multiple objects can coexist
         ("api uses Postgres" + "api uses Redis"). Pick by intent.
         """
-        # already_existed must reflect "this exact SPO was in the store
-        # BEFORE this call ran". Capturing it AFTER add_fact would be
-        # always-True (the new fact is now in the store) — the agent
-        # would lose the signal "did I just create this or confirm it".
-        # fact_exists takes the lock and syncs, so it's race-honest.
-        already_existed = self.fact_exists(subject, predicate, obj)
-
-        # add_fact handles its own embedding, lock and SPO dedup. If the
-        # full triple already exists it returns the existing fact unchanged.
-        new_fact = self.add_fact(subject, predicate, obj, session_id=session_id)
+        # add_fact returns an authoritative ``created`` flag from inside
+        # its own write transaction: True only when this call actually
+        # inserted the row, False when a dedup branch (pre-existing SPO
+        # or race-winner from another process) returned the existing
+        # fact. ``already_existed = not created`` is therefore
+        # transaction-honest — no race window between a pre-check and
+        # the insert.
+        new_fact, created = self.add_fact(
+            subject, predicate, obj,
+            session_id=session_id, return_status=True,
+        )
+        already_existed = not created
 
         # AUTHORITATIVE slot recompute inside a write transaction — the
         # pre-add snapshot is not enough in multi-process: another writer
@@ -1119,29 +1162,17 @@ class MemoryStore:
                 # relevant each fact was to the session's queries.
                 self._engine.apply_session_resonance(facts_snapshot, result.r)
 
-                # Update recent_utility EWMA per touched fact. Target is the
-                # per-fact realised value: (R · attribution_weight + 1) / 2,
-                # mapped from [-1, 1] into [0, 1] so the EWMA stays in [0, 1].
-                # α = 0.15 — roughly seven sessions to half-life. Slow enough
-                # that one outlier session doesn't swing the prior, fast
-                # enough that a meaningful streak shows up within a week.
-                _EWMA_ALPHA = 0.15
-                for fid, attr_weight in facts_snapshot.items():
-                    # Symmetric for FactPassport and MetaFact — both
-                    # implement touch() and carry recent_utility, so the
-                    # EWMA update must apply to whichever body the agent
-                    # actually consulted in this session.
+                # Touch every body the session actually consulted (so
+                # access_count / last_accessed reflect the read), then
+                # update recent_utility EWMA via the shared helper —
+                # symmetric with check_echo which now applies the same
+                # EWMA update on retroactive negative penalty.
+                for fid in facts_snapshot:
                     body = (self._facts.get(fid)
                             or self._meta_facts.get(fid))
-                    if body is None:
-                        continue
-                    body.touch()
-                    per_fact_r = result.r * float(attr_weight)
-                    target = max(0.0, min(1.0, (per_fact_r + 1.0) / 2.0))
-                    body.recent_utility = (
-                        (1.0 - _EWMA_ALPHA) * body.recent_utility
-                        + _EWMA_ALPHA * target
-                    )
+                    if body is not None:
+                        body.touch()
+                self._apply_recent_utility_locked(facts_snapshot, result.r)
 
                 self._echo.record(
                     sid,
@@ -1376,7 +1407,9 @@ class MemoryStore:
                     if (updated_metas
                             and hasattr(self._storage, "save_meta_facts")):
                         self._storage.save_meta_facts(updated_metas)
-                updated = len(updated_facts) + len(updated_metas)
+                facts_updated_n = len(updated_facts)
+                metas_updated_n = len(updated_metas)
+                updated = facts_updated_n + metas_updated_n
 
         # Quick distribution snapshot so the caller can see what landed.
         ranges = {"safe": 0, "kinetic": 0, "near_horizon": 0, "predicted_fall": 0}
@@ -1391,8 +1424,16 @@ class MemoryStore:
                 ranges["predicted_fall"] += 1
         return {
             "horizon_ticks": horizon_ticks,
+            # Kept for wire-format stability; aliases of the new keys.
             "facts_forecasted": len(scores),
             "facts_updated": updated,
+            # Clearer keys: forecast now covers both FactPassports and
+            # MetaFacts (both carry forecast_stability), so the operator
+            # can see how the update split across body types.
+            "bodies_forecasted": len(scores),
+            "bodies_updated": updated,
+            "facts_updated_count": facts_updated_n,
+            "metas_updated_count": metas_updated_n,
             "distribution": ranges,
         }
 
@@ -1543,8 +1584,14 @@ class MemoryStore:
             # touch/attribution to land — otherwise the feedback loop
             # silently breaks for embedded / test usage. Persistence is a
             # later concern, gated separately inside the txn block.
+            #
+            # Hawking-only triggering of the write path is skipped when
+            # the singularity is empty — pointless BEGIN IMMEDIATE that
+            # blocks other writers for no work. The hole is empty in the
+            # common read-only case, so this is a meaningful perf win.
+            needs_hawking_pass = hawking and self._hole.mass > 0
             need_write_path = (
-                hawking
+                needs_hawking_pass
                 or touched_fact_ids
                 or touched_meta_ids
                 or sid is not None
@@ -1605,6 +1652,73 @@ class MemoryStore:
                             continue
                         r.meta = live_meta
                         revalidated_top.append(r)
+                # Backfill: if revalidation dropped any hits, re-run the
+                # live search on the now-authoritative state so the caller
+                # gets up to top_k results instead of a short list. Only
+                # runs when we actually lost something — the common case
+                # (nothing was racing) costs nothing.
+                if len(revalidated_top) < len(top):
+                    already_in_top = {r.body_id for r in revalidated_top}
+                    backfill_candidates: list[QueryResult] = []
+                    fresh_sims = self._index.all_similarities(vec)
+                    for fid, sim in fresh_sims.items():
+                        if fid in already_in_top:
+                            continue
+                        fact = self._facts.get(fid)
+                        if fact is None or fact.is_deprecated or fact.is_expired:
+                            continue
+                        if not (min_layer <= fact.layer <= max_layer):
+                            continue
+                        if (allowed_layers is not None
+                                and fact.layer not in allowed_layers):
+                            continue
+                        if fact.gravity_score < min_gravity:
+                            continue
+                        if prefix and not fact.subject.lower().startswith(prefix):
+                            continue
+                        if sim < min_similarity:
+                            continue
+                        backfill_candidates.append(QueryResult(
+                            fact=fact,
+                            similarity=round(sim, 4),
+                            source=layer_labels.get(fact.layer, "kinetic"),
+                        ))
+                    fresh_meta_sims = self._meta_index.all_similarities(vec)
+                    for mid, sim in fresh_meta_sims.items():
+                        if mid in already_in_top:
+                            continue
+                        meta = self._meta_facts.get(mid)
+                        if meta is None:
+                            continue
+                        if not (min_layer <= meta.layer <= max_layer):
+                            continue
+                        if (allowed_layers is not None
+                                and meta.layer not in allowed_layers):
+                            continue
+                        if meta.gravity_score < min_gravity:
+                            continue
+                        if prefix and not any(
+                                (st or "").lower().startswith(prefix)
+                                for st in meta.source_texts):
+                            continue
+                        if sim < min_similarity:
+                            continue
+                        backfill_candidates.append(QueryResult(
+                            meta=meta,
+                            similarity=round(sim, 4),
+                            source=layer_labels.get(meta.layer, "kinetic"),
+                        ))
+                    backfill_candidates.sort(
+                        key=lambda r: r.similarity, reverse=True)
+                    needed = len(top) - len(revalidated_top)
+                    for picked in backfill_candidates[:needed]:
+                        revalidated_top.append(picked)
+                        if picked.fact is not None:
+                            touched_fact_ids.append(picked.fact.fact_id)
+                        elif picked.meta is not None:
+                            touched_meta_ids.append(picked.meta.meta_id)
+                        attribution_pairs.append(
+                            (picked.body_id, picked.similarity))
                 top = revalidated_top
                 # Re-derive the touched / attribution lists from the
                 # surviving top so the persist step does not try to update
@@ -1758,6 +1872,14 @@ class MemoryStore:
                     # FactPassport changes, losing MetaFact penalty
                     # updates on restart.
                     self._engine.apply_session_resonance(
+                        result.fact_weights, result.penalty)
+                    # Mirror the EWMA update too: an echo penalty is
+                    # retroactive realised-negative-utility, so leaving
+                    # recent_utility unchanged would make the gravity
+                    # formula see contradictory signals (resonance got
+                    # worse, utility stayed where it was). Same helper
+                    # session_close uses.
+                    self._apply_recent_utility_locked(
                         result.fact_weights, result.penalty)
                     penalized_body_ids = list(result.fact_weights.keys())
 
