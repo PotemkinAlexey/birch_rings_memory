@@ -82,3 +82,39 @@ def test_filter_compose_with_layer_and_min_similarity(tmp_path):
     ids = {h.body_id for h in hits}
     # a is excluded by min_gravity, noise is excluded by subject_prefix.
     assert ids == {b.fact_id}
+
+
+def test_scoped_query_does_not_resurrect_out_of_scope_hawking_facts(tmp_path):
+    """A scoped query must NOT side-effect-resurrect a black-hole body that
+    fails the scope predicate. The Hawking emission path used to ignore
+    subject_prefix / min_gravity and resurrect any sufficiently-cosine match,
+    so an agent doing query(..., subject_prefix="needle") would silently
+    promote a "wrong-scope" body back to kinetic.
+    """
+    mem = MemoryStore(db_path=str(tmp_path / "m.db"))
+    # Plant a fact and force it into the singularity by retiring it.
+    out_of_scope = mem.add_fact("wrong-scope", "is", "in singularity")
+    mem.retire_fact(out_of_scope.fact_id)
+    assert out_of_scope.fact_id in mem._hole._singularity
+
+    # Live target inside scope so the query has something legitimate to find.
+    target = mem.add_fact("needle inside scope", "is", "live target")
+
+    hits = mem.query(
+        "wrong-scope needle inside scope is",
+        top_k=5,
+        subject_prefix="needle",
+        hawking=True,
+        min_similarity=0.0,
+    )
+    ids = {h.body_id for h in hits}
+
+    # The out-of-scope body must NOT appear in results …
+    assert out_of_scope.fact_id not in ids
+    # … must NOT be silently resurrected into the live store …
+    assert out_of_scope.fact_id not in mem._facts
+    # … and must remain in the singularity, untouched.
+    assert out_of_scope.fact_id in mem._hole._singularity
+
+    # The legitimately-scoped target is still served.
+    assert target.fact_id in ids

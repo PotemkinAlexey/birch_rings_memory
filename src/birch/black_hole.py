@@ -79,6 +79,7 @@ class BlackHole:
     def hawking_emit(
         self,
         query_vector: list[float],
+        predicate=None,
     ) -> list["FactPassport"]:
         """
         Attempt Hawking emission of single FactPassports similar enough to
@@ -86,15 +87,29 @@ class BlackHole:
         gravity reset to _HAWKING_GRAVITY and removed from the singularity.
         The caller re-registers them in the live store.
 
+        ``predicate`` is an optional ``Callable[[FactPassport], bool]`` that
+        must return True for a body to be emitted. Bodies that fail the
+        predicate stay in the singularity — Hawking emission is a state
+        mutation, and a scoped read (e.g. with ``subject_prefix``) must not
+        resurrect bodies outside the requested scope as a side effect.
+
         MetaFact emission lives behind ``hawking_emit_metas`` so the typed
         return value stays narrow for the legacy call site.
         """
         sims = self._index.all_similarities(query_vector)
-        to_emit = [fid for fid, score in sims.items() if score >= self._hawking_threshold]
-
+        # Filter BEFORE pop — so a rejected body stays in the singularity
+        # entirely, with no mutation.
         emitted: list["FactPassport"] = []
-        for fid in to_emit:
-            rec = self._singularity.pop(fid)
+        for fid, score in sims.items():
+            if score < self._hawking_threshold:
+                continue
+            rec = self._singularity.get(fid)
+            if rec is None:
+                continue
+            if predicate is not None and not predicate(rec.fact):
+                continue
+            # Now commit: pop from singularity, reset gravity, return.
+            self._singularity.pop(fid)
             self._index.remove(fid)
             rec.fact.gravity_score = _HAWKING_GRAVITY
             rec.fact.layer = 1
@@ -106,6 +121,7 @@ class BlackHole:
         self,
         query_vector: list[float],
         threshold: float | None = None,
+        predicate=None,
     ) -> list["MetaFact"]:
         """
         Attempt Hawking emission of MetaFacts.
@@ -115,14 +131,23 @@ class BlackHole:
         its sources. The caller can pass a looser threshold (typical: 0.85);
         a MetaFact's gravity on emission is set by its own
         ``gravity_on_emission()`` (log-scaled in its weight).
+
+        ``predicate`` is an optional ``Callable[[MetaFact], bool]`` that
+        gates which bodies actually emerge — see ``hawking_emit`` for the
+        scope-respecting motivation.
         """
         thr = self._hawking_threshold if threshold is None else threshold
         sims = self._meta_index.all_similarities(query_vector)
-        to_emit = [mid for mid, score in sims.items() if score >= thr]
-
         emitted: list["MetaFact"] = []
-        for mid in to_emit:
-            rec = self._meta_singularity.pop(mid)
+        for mid, score in sims.items():
+            if score < thr:
+                continue
+            rec = self._meta_singularity.get(mid)
+            if rec is None:
+                continue
+            if predicate is not None and not predicate(rec.meta):
+                continue
+            self._meta_singularity.pop(mid)
             self._meta_index.remove(mid)
             rec.meta.gravity_score = rec.meta.gravity_on_emission(_HAWKING_GRAVITY)
             rec.meta.layer = 1

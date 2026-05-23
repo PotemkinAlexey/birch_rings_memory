@@ -1325,13 +1325,35 @@ class MemoryStore:
 
             # Hawking emission: black hole returns facts AND removes them from
             # the singularity. We must re-register them in the live store and
-            # persist the resurrection.
+            # persist the resurrection. Scope filters (subject_prefix /
+            # min_gravity) act as a predicate so a scoped query does NOT
+            # resurrect bodies outside the requested scope as a side effect.
             if hawking:
-                emitted = self._hole.hawking_emit(vec)
+                def _fact_predicate(f) -> bool:
+                    if f.gravity_score < min_gravity:
+                        return False
+                    if prefix and prefix not in f.subject.lower():
+                        return False
+                    return True
+
+                def _meta_predicate(m) -> bool:
+                    if m.gravity_score < min_gravity:
+                        return False
+                    if prefix:
+                        # No single subject on a meta — only emit if any
+                        # source_text actually contains the prefix.
+                        if not any(prefix in (st or "").lower()
+                                   for st in m.source_texts):
+                            return False
+                    return True
+
+                emitted = self._hole.hawking_emit(vec, predicate=_fact_predicate)
                 # MetaFact Hawking emission — looser threshold so a centroid
                 # actually fires on a topically close query.
                 meta_emitted = self._hole.hawking_emit_metas(
-                    vec, threshold=_META_HAWKING_THRESHOLD
+                    vec,
+                    threshold=_META_HAWKING_THRESHOLD,
+                    predicate=_meta_predicate,
                 )
                 # Only take the write lock when something was actually
                 # resurrected — the common read-only query persists nothing.
