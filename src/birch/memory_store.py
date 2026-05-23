@@ -1252,12 +1252,19 @@ class MemoryStore:
         hawking: bool = True,
         session_id: Optional[str] = None,
         min_similarity: float = 0.0,
+        subject_prefix: Optional[str] = None,
+        min_gravity: float = 0.0,
     ) -> list[QueryResult]:
         """
         Retrieve relevant facts by cosine similarity.
 
         Searches live layers first. If hawking=True, also attempts
         Hawking emission from the black hole for extreme matches.
+
+        Filters (``subject_prefix``, ``min_gravity``, ``min_similarity``)
+        are applied **before** the top_k slice, so a narrow scope still
+        returns its top hits instead of an empty list when the matching
+        facts sit beyond top_k in the full ranking.
 
         Side effects on every returned fact:
           - access_count is incremented (touch)
@@ -1266,6 +1273,7 @@ class MemoryStore:
         """
         # Embed outside the lock.
         vec = embed(text)
+        prefix = subject_prefix.lower() if subject_prefix else None
 
         with self._lock:
             self._sync()
@@ -1280,6 +1288,10 @@ class MemoryStore:
                     continue
                 if not (min_layer <= fact.layer <= max_layer):
                     continue
+                if fact.gravity_score < min_gravity:
+                    continue
+                if prefix and prefix not in fact.subject.lower():
+                    continue
                 results.append(QueryResult(
                     fact=fact,
                     similarity=round(sim, 4),
@@ -1288,6 +1300,8 @@ class MemoryStore:
 
             # Live MetaFacts — promoted out of the black hole by past
             # Hawking emissions; share the same layer machinery as facts.
+            # MetaFacts have no single "subject" so subject_prefix never
+            # filters them in; min_gravity still applies symmetrically.
             meta_sims = self._meta_index.all_similarities(vec)
             for mid, sim in meta_sims.items():
                 meta = self._meta_facts.get(mid)
@@ -1295,6 +1309,14 @@ class MemoryStore:
                     continue
                 if not (min_layer <= meta.layer <= max_layer):
                     continue
+                if meta.gravity_score < min_gravity:
+                    continue
+                if prefix:
+                    # No single subject on a meta — only include if any
+                    # source_text actually contains the prefix.
+                    if not any(prefix in (st or "").lower()
+                               for st in meta.source_texts):
+                        continue
                 results.append(QueryResult(
                     meta=meta,
                     similarity=round(sim, 4),

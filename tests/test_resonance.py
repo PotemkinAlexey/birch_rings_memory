@@ -3,6 +3,7 @@ import pytest
 
 from birch.resonance.detector import compute_resonance
 from birch.resonance.embeddings import embed_batch
+from tests.conftest import needs_real_embeddings
 from tests.fixtures.sessions import SESSIONS
 
 
@@ -31,6 +32,7 @@ def test_baseline(session):
     )
 
 
+@needs_real_embeddings
 @pytest.mark.parametrize("session", SESSIONS, ids=[s["name"] for s in SESSIONS])
 def test_full(session):
     result = _run_session(session, "full")

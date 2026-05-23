@@ -192,7 +192,7 @@ so polymorphic `query()` does four scans without ID collisions.
 |---|---|
 | `fact.py` | `FactPassport` — subject/predicate/object triple + gravity metadata (incl. `recent_utility`) |
 | `meta_fact.py` | `MetaFact` — dense centroid bundle with lineage + feedback-loop fields |
-| `adaptive_gravity.py` | `AdaptiveWeights` — four learned pre-resonance weights, regularised SGD with budget renormalisation |
+| `adaptive_gravity.py` | `AdaptiveWeights` — five learned pre-resonance weights (incl. `w_stability` for `forecast_stability`), regularised SGD with budget renormalisation |
 | `gravity.py` | `GravityEngine` — computes scores, triggers layer migration |
 | `black_hole.py` | `BlackHole` — irreversible sink + Hawking emission (facts + metas) |
 | `singularity_compactor.py` | `collapse_singularity()` — Union-Find collapse + center of mass |

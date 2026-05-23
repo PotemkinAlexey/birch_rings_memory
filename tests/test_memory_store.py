@@ -1,5 +1,6 @@
 """MemoryStore — full lifecycle integration test."""
 from birch.memory_store import MemoryStore
+from tests.conftest import needs_real_embeddings
 
 
 def _build_store():
@@ -25,6 +26,7 @@ def test_deprecated_fact_absorbed_on_resonant_session():
     assert mem.stats["black_hole_mass"] >= 1
 
 
+@needs_real_embeddings
 def test_query_returns_relevant_facts():
     mem, f_go, _, f_db = _build_store()
     results = mem.query("how does the mailer service work", top_k=3)
@@ -220,6 +222,7 @@ def test_sqlite_save_facts_batches_in_one_transaction(tmp_path):
     assert by_id[f3.fact_id].gravity_score == 0.13
 
 
+@needs_real_embeddings
 def test_query_attribution_uses_similarity_as_weight():
     """C5: facts returned with high similarity weigh more than near-noise hits."""
     mem = MemoryStore()
@@ -245,6 +248,7 @@ def test_add_fact_pins_weight_to_one():
     assert mem._session_facts[f.fact_id] == 1.0
 
 
+@needs_real_embeddings
 def test_weighted_resonance_propagates_proportionally():
     """A high-weight fact must receive more resonance than a low-weight one."""
     mem = MemoryStore()
@@ -306,6 +310,7 @@ def test_deprecated_fact_frees_spo_slot():
     assert revived.fact_id != old.fact_id, "deprecated fact must release its SPO slot"
 
 
+@needs_real_embeddings
 def test_echo_drags_down_gravity_of_misleading_facts():
     """Fix #2: when echo is detected, facts of the past session lose resonance."""
     mem = MemoryStore()

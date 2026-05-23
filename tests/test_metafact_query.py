@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from birch.memory_store import MemoryStore
 from birch.meta_fact import MetaFact
+from tests.conftest import needs_real_embeddings
 
 
 def test_query_result_kind_property_classifies_polymorphic_hits():
@@ -136,6 +137,7 @@ def test_stats_breaks_down_facts_and_metas(tmp_path):
     assert "black_hole_meta_mass" in s
 
 
+@needs_real_embeddings
 def test_emitted_meta_persists_across_restart(tmp_path):
     """An emitted MetaFact must come back from storage on next open as live."""
     db = tmp_path / "meta-emit.db"

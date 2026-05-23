@@ -64,15 +64,10 @@ def query_memory(
         min_similarity=min_similarity,
         min_layer=min_layer,
         max_layer=max_layer,
+        subject_prefix=subject_prefix,
+        min_gravity=min_gravity,
     )
     hits = [r.to_mcp_dict() for r in results]
-    prefix = subject_prefix.lower() if subject_prefix else None
-    if prefix or min_gravity > 0.0:
-        hits = [
-            h for h in hits
-            if h.get("gravity_score", 0.0) >= min_gravity
-            and (not prefix or prefix in (h.get("subject") or "").lower())
-        ]
 
     # conflict_hints: same (subject, predicate) with different objects.
     conflicts: list[dict] = []

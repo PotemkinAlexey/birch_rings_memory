@@ -23,6 +23,24 @@ jobs:
       - name: Mypy
         run: mypy
 
-  # The pytest suite is intentionally not run here: it exercises the real
-  # embedding path, which needs a live Ollama endpoint. Run `pytest` locally
-  # with Ollama available.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Pytest (mock embedding provider — no Ollama required)
+        env:
+          # The deterministic mock provider auto-selects under pytest, but we
+          # set the env var too so a contributor running pytest under a
+          # different runner (tox, nox) also gets the offline path.
+          BIRCH_EMBED_PROVIDER: mock
+        run: pytest -v
