@@ -120,16 +120,21 @@ def collapse_singularity(
 
     # Snapshot vectors aligned with fact_ids so similarity can be computed
     # in one matmul. Skip facts with empty vectors — they can't be grouped.
-    vec_rows: list[list[float]] = []
-    valid_ids: list[str] = []
+    #
+    # Partition by vector dimension: an embedding-model swap can leave the
+    # singularity with rows from multiple models. numpy would either raise
+    # on a ragged input or, worse, build an object-dtype array silently.
+    # Each dim-group collapses independently — old-model bodies still
+    # compact among themselves, new-model bodies among themselves.
+    dim_groups: dict[int, list[str]] = {}
     for fid in fact_ids:
         rec = hole._singularity.get(fid)
         if rec is None or not rec.fact.vector:
             continue
-        vec_rows.append(rec.fact.vector)
-        valid_ids.append(fid)
+        dim_groups.setdefault(len(rec.fact.vector), []).append(fid)
 
-    if len(valid_ids) < min_group_size:
+    valid_ids_all = sum(dim_groups.values(), [])
+    if len(valid_ids_all) < min_group_size:
         return [], CollapseReport(
             groups=0,
             absorbed_facts=0,
@@ -139,23 +144,26 @@ def collapse_singularity(
             meta_mass_after=meta_mass_before,
         )
 
-    M = np.asarray(vec_rows, dtype=np.float32)
-    norms = np.linalg.norm(M, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0   # avoid div-by-zero; zero-norm rows ignored anyway
-    Mn = M / norms
-
-    # Pairwise cosine — symmetric, so upper triangle is enough.
-    sims = Mn @ Mn.T
-
-    uf = _UnionFind(valid_ids)
-    n = len(valid_ids)
-    for i in range(n):
-        # Use boolean masking on row i to skip the Python loop where possible.
-        row = sims[i, i + 1:]
-        hits = np.where(row >= threshold)[0]
-        for offset in hits:
-            j = i + 1 + int(offset)
-            uf.union(valid_ids[i], valid_ids[j])
+    # Collect Union-Find roots across all dim groups.
+    uf = _UnionFind(valid_ids_all)
+    for _dim, group_ids in dim_groups.items():
+        if len(group_ids) < min_group_size:
+            continue
+        group_vecs = [
+            hole._singularity[fid].fact.vector for fid in group_ids
+        ]
+        M = np.asarray(group_vecs, dtype=np.float32)
+        norms = np.linalg.norm(M, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        Mn = M / norms
+        sims = Mn @ Mn.T
+        n = len(group_ids)
+        for i in range(n):
+            row = sims[i, i + 1:]
+            hits = np.where(row >= threshold)[0]
+            for offset in hits:
+                j = i + 1 + int(offset)
+                uf.union(group_ids[i], group_ids[j])
 
     new_metas: list[MetaFact] = []
     absorbed = 0

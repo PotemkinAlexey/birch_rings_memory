@@ -373,6 +373,23 @@ The penalty is **retroactive and idempotent**:
 Facts that looked good because the user appeared satisfied now get a
 negative signal scaled by their actual involvement.
 
+**Idempotency is per-stored-session, not per-recurrence.** A given
+StoredSession can receive an echo penalty at most once. If the user
+returns to the same unresolved topic a third time, the third visit will
+not deliver additional penalty against that StoredSession — the cap
+prevents penalty stacking against any single record. The matching
+mechanism is still active, so a separate echo against a different past
+session that touched the same problem can still fire. This is a design
+choice biased toward safety over progressive punishment: better to
+under-penalise than to compound a single misleading session into a
+gravity dead zone. If a future use case needs progressive echo
+correction, the natural extension is per-session `echo_count` +
+`last_echo_at` with a decay rule, not removing the cap.
+
+`detect_echo(exclude_session_id=...)` accepts an explicit skip — used
+when `check_echo` is called against an open session that already has its
+own StoredSession (would otherwise match itself).
+
 ---
 
 ## Black hole

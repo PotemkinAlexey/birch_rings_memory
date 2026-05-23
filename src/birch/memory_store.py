@@ -138,8 +138,16 @@ class MemoryStore:
         self._collapse_min_group_size = collapse_min_group_size
         self._collapse_async = collapse_async
         self._collapse_counter = 0       # facts absorbed since last collapse
+        # Distinguish "we ran a collapse pass" from "the pass actually
+        # compressed anything". A pass with report.groups == 0 is an
+        # attempt; only a non-zero pass is a successful collapse.
+        # operators reading memory_stats need both numbers to interpret
+        # "no-op collapses keep firing — singularity is too sparse / too
+        # heterogeneous".
         self._last_collapse_at: Optional[float] = None
+        self._last_collapse_attempt_at: Optional[float] = None
         self._total_collapses = 0
+        self._total_collapse_attempts = 0
         self._collapse_executor: Optional[ThreadPoolExecutor] = None
         self._inflight_collapse: Optional[Future] = None
         self._echo_k = echo_k
@@ -1350,8 +1358,17 @@ class MemoryStore:
                                 self._storage.delete_fact(fid)
                             if hasattr(self._storage, "delete_edges_for_fact"):
                                 self._storage.delete_edges_for_fact(fid)
-                self._last_collapse_at = time.time()
-                self._total_collapses += 1
+                now_ts = time.time()
+                self._last_collapse_attempt_at = now_ts
+                self._total_collapse_attempts += 1
+                # Only count as a successful collapse if something actually
+                # compressed; otherwise total_collapses would lie ("we
+                # collapsed 47 times" when nothing was bundled).
+                if report.groups > 0:
+                    self._last_collapse_at = now_ts
+                    self._total_collapses += 1
+                # Reset counter regardless so we don't re-trigger on the
+                # same empty conditions in a tight loop.
                 self._collapse_counter = 0
                 return report
 
@@ -1918,16 +1935,20 @@ class MemoryStore:
         every fact that the matched past session touched. Affected facts
         are re-persisted.
         """
-        # session_id is accepted for symmetry with the other methods but
-        # echo penalties apply to the matched PAST session, not to the
-        # active one; we keep the param for forward compatibility.
-        _ = session_id  # currently unused — explicit silence
+        # session_id, when provided, is excluded from the match pool —
+        # so an explicit check_echo() called with a currently-open
+        # session id does not match itself. This used to be ignored
+        # ("currently unused") which was harmless in the normal
+        # session_open(first_message=...) flow but a footgun for any
+        # workflow that calls check_echo after the session was
+        # already recorded.
         vec = embed(first_message)
 
         with self._lock:
             with self._txn():
                 self._sync()
-                result = self._echo.detect_echo(vec)
+                result = self._echo.detect_echo(
+                    vec, exclude_session_id=session_id)
                 penalized_body_ids: list[str] = []
                 if result.label == "echo" and result.penalty != 0.0 and result.fact_weights:
                     # engine.apply_session_resonance is polymorphic over
@@ -2013,6 +2034,8 @@ class MemoryStore:
                 "active_sessions": len(self._sessions),
                 "collapse_counter": self._collapse_counter,
                 "total_collapses": self._total_collapses,
+                "total_collapse_attempts": self._total_collapse_attempts,
                 "last_collapse_at": self._last_collapse_at,
+                "last_collapse_attempt_at": self._last_collapse_attempt_at,
                 "adaptive_weights": self._engine.weights.as_dict(),
             }

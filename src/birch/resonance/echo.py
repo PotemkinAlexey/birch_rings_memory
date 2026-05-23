@@ -78,20 +78,32 @@ class EchoStore:
         )
         return b
 
-    def detect_echo(self, new_topic_vector: list[float]) -> EchoResult:
+    def detect_echo(
+        self,
+        new_topic_vector: list[float],
+        exclude_session_id: str | None = None,
+    ) -> EchoResult:
         """
         Check if the new session is returning to a previously unresolved problem.
 
         Matches against the nearest centroid in each session's bundle —
         a multi-topic session won't miss an echo just because the overall
         centroid drifted away from the problematic sub-topic.
+
+        ``exclude_session_id`` skips a known session from the match pool —
+        typically used when ``check_echo`` is called explicitly with a
+        currently-open session id that should not match itself.
         """
-        if not self._sessions:
+        candidates = [
+            sid for sid in self._sessions if sid != exclude_session_id
+        ]
+        if not candidates:
             return EchoResult(None, 0.0, 0.0, "no_history")
 
         best_id = max(
-            self._sessions,
-            key=lambda sid: nearest_similarity(new_topic_vector, self._sessions[sid].bundle),
+            candidates,
+            key=lambda sid: nearest_similarity(
+                new_topic_vector, self._sessions[sid].bundle),
         )
         best_sim = nearest_similarity(new_topic_vector, self._sessions[best_id].bundle)
 

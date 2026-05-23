@@ -2,14 +2,38 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from ..adaptive_gravity import AdaptiveWeights
 from ..fact import FactPassport
 from ..meta_fact import MetaFact
+
+_logger = logging.getLogger(__name__)
+
+
+def _safe_loads(value: Any, default: Any) -> Any:
+    """Parse a JSON cell tolerantly.
+
+    A row corrupted by a partial write, manual SQL fix, or an older
+    schema migration must not bring the entire MemoryStore startup
+    down. Return ``default`` and log instead — the cost of one ignored
+    row is far less than the cost of an unbootable memory server.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        snippet = (value[:120] if isinstance(value, str) else repr(value)[:120])
+        _logger.warning(
+            "SQLite load: corrupted JSON cell, using default: %s | snippet=%r",
+            exc, snippet,
+        )
+        return default
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -259,30 +283,37 @@ class SQLiteBackend:
 
     def load_facts(self) -> list[FactPassport]:
         rows = self._conn.execute("SELECT * FROM facts").fetchall()
-        return [
-            FactPassport(
-                subject=r["subject"], predicate=r["predicate"], object=r["object"],
-                fact_id=r["fact_id"],
-                vector=json.loads(r["vector"]) if r["vector"] else [],
-                gravity_score=r["gravity_score"], layer=r["layer"],
-                created_at=r["created_at"], ttl=r["ttl"],
-                source_session=r["source_session"], deprecated_by=r["deprecated_by"],
-                access_count=r["access_count"], last_accessed=r["last_accessed"],
-                resonance_sum=r["resonance_sum"], resonance_count=r["resonance_count"],
-                recent_utility=(
-                    r["recent_utility"]
-                    if "recent_utility" in r.keys() and r["recent_utility"] is not None
-                    else 0.5
-                ),
-                forecast_stability=(
-                    r["forecast_stability"]
-                    if "forecast_stability" in r.keys()
-                    and r["forecast_stability"] is not None
-                    else 0.5
-                ),
-            )
-            for r in rows
-        ]
+        out: list[FactPassport] = []
+        for r in rows:
+            try:
+                out.append(FactPassport(
+                    subject=r["subject"], predicate=r["predicate"], object=r["object"],
+                    fact_id=r["fact_id"],
+                    vector=_safe_loads(r["vector"], []),
+                    gravity_score=r["gravity_score"], layer=r["layer"],
+                    created_at=r["created_at"], ttl=r["ttl"],
+                    source_session=r["source_session"], deprecated_by=r["deprecated_by"],
+                    access_count=r["access_count"], last_accessed=r["last_accessed"],
+                    resonance_sum=r["resonance_sum"],
+                    resonance_count=r["resonance_count"],
+                    recent_utility=(
+                        r["recent_utility"]
+                        if "recent_utility" in r.keys() and r["recent_utility"] is not None
+                        else 0.5
+                    ),
+                    forecast_stability=(
+                        r["forecast_stability"]
+                        if "forecast_stability" in r.keys()
+                        and r["forecast_stability"] is not None
+                        else 0.5
+                    ),
+                ))
+            except Exception as exc:
+                _logger.warning(
+                    "SQLite load_facts: skipping corrupted row fact_id=%r: %s",
+                    r["fact_id"] if "fact_id" in r.keys() else "?", exc,
+                )
+        return out
 
     # ── Edges ────────────────────────────────────────────────────────────────
 
@@ -345,26 +376,43 @@ class SQLiteBackend:
         rows = self._conn.execute("SELECT * FROM echo_sessions").fetchall()
         out = []
         for r in rows:
-            raw_fact_ids = r["fact_ids"] if "fact_ids" in r.keys() else None
             try:
-                parsed = json.loads(raw_fact_ids) if raw_fact_ids else {}
-            except (TypeError, ValueError):
-                parsed = {}
-            if isinstance(parsed, list):
-                # Legacy rows stored just the ids — treat them as uniform weight 1.0.
-                fact_weights = {fid: 1.0 for fid in parsed}
-            elif isinstance(parsed, dict):
-                fact_weights = {fid: float(w) for fid, w in parsed.items()}
-            else:
-                fact_weights = {}
-            out.append({
-                "session_id": r["session_id"],
-                "centroids": json.loads(r["centroids"]),
-                "r_score": r["r_score"],
-                "recorded_at": r["recorded_at"],
-                "fact_weights": fact_weights,
-                "echo_penalty": r["echo_penalty"] if "echo_penalty" in r.keys() else 0.0,
-            })
+                raw_fact_ids = r["fact_ids"] if "fact_ids" in r.keys() else None
+                parsed = _safe_loads(raw_fact_ids, {})
+                if isinstance(parsed, list):
+                    # Legacy rows stored just the ids — uniform weight 1.0.
+                    fact_weights = {fid: 1.0 for fid in parsed}
+                elif isinstance(parsed, dict):
+                    fact_weights = {fid: float(w) for fid, w in parsed.items()}
+                else:
+                    fact_weights = {}
+                centroids = _safe_loads(r["centroids"], None)
+                if not isinstance(centroids, list) or not centroids:
+                    # Empty/None centroids means corruption — the session
+                    # would be useless for echo matching anyway. Drop.
+                    raise ValueError("centroids missing or not a list")
+                out.append({
+                    "session_id": r["session_id"],
+                    "centroids": centroids,
+                    "r_score": r["r_score"],
+                    "recorded_at": r["recorded_at"],
+                    "fact_weights": fact_weights,
+                    "echo_penalty": (
+                        r["echo_penalty"]
+                        if "echo_penalty" in r.keys() else 0.0
+                    ),
+                })
+            except Exception as exc:
+                _logger.warning(
+                    "SQLite load_echo_sessions: dropping corrupted row "
+                    "session_id=%r: %s",
+                    r["session_id"] if "session_id" in r.keys() else "?", exc,
+                )
+                try:
+                    if "session_id" in r.keys():
+                        self.delete_echo_session(r["session_id"])
+                except Exception:   # pragma: no cover — best effort cleanup
+                    pass
         return out
 
     # ── Open sessions ────────────────────────────────────────────────────────
@@ -397,16 +445,30 @@ class SQLiteBackend:
 
     def load_open_sessions(self) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM open_sessions").fetchall()
-        return [
-            {
-                "session_id": r["session_id"],
-                "messages": json.loads(r["messages"]),
-                "vectors": json.loads(r["vectors"]),
-                "facts": json.loads(r["facts"]),
-                "started_at": r["started_at"],
-            }
-            for r in rows
-        ]
+        out: list[dict] = []
+        for r in rows:
+            try:
+                out.append({
+                    "session_id": r["session_id"],
+                    "messages": _safe_loads(r["messages"], []),
+                    "vectors": _safe_loads(r["vectors"], []),
+                    "facts": _safe_loads(r["facts"], {}),
+                    "started_at": r["started_at"],
+                })
+            except Exception as exc:
+                # Drop the corrupted row so the crashed session does not
+                # block startup. delete the on-disk record too, otherwise
+                # the next open would try it again.
+                _logger.warning(
+                    "SQLite load_open_sessions: dropping corrupted row "
+                    "session_id=%r: %s",
+                    r["session_id"] if "session_id" in r.keys() else "?", exc,
+                )
+                try:
+                    self.delete_open_session(r["session_id"])
+                except Exception:   # pragma: no cover — best effort cleanup
+                    pass
+        return out
 
     # ── MetaFacts ────────────────────────────────────────────────────────────
 
