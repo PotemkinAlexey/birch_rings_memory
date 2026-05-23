@@ -190,6 +190,15 @@ class MemoryStore:
             self._load_from_storage()
             self._data_version = self._data_version_now()
 
+        # run_forecast cache. Keyed by (data_version, body_count, horizon)
+        # so an agent re-calling forecast_memory back-to-back gets the
+        # last result without re-running the O(n²) simulation. Invalidated
+        # automatically the moment ANY write bumps data_version — the
+        # backend's authoritative version counter is the cache key.
+        self._forecast_cache: tuple[
+            tuple[int, int, int], dict
+        ] | None = None
+
     # ── Cross-process cache coherence ────────────────────────────────────────
 
     def _data_version_now(self) -> int:
@@ -1252,6 +1261,20 @@ class MemoryStore:
                     mean_u = sum(f[3] for f in training_features) / n
                     mean_s = sum(f[4] for f in training_features) / n
                     target = max(0.0, min(1.0, (result.r + 1.0) / 2.0))
+                    # Multi-process safety: another process may have stepped
+                    # the weights between our boot and this commit. Reload
+                    # the authoritative row UNDER the write txn so our SGD
+                    # step composes on top of their learning, not on top of
+                    # our stale in-memory copy. Without this, the last
+                    # writer silently overwrites every concurrent process's
+                    # train_count.
+                    if (self._storage
+                            and hasattr(self._storage, "load_adaptive_weights")):
+                        fresh = self._storage.load_adaptive_weights()
+                        if (fresh is not None
+                                and fresh.train_count
+                                    >= self._engine.weights.train_count):
+                            self._engine.weights = fresh
                     self._engine.weights.update(
                         mean_f, mean_a, mean_g, mean_u, mean_s, target=target,
                     )
@@ -1423,6 +1446,21 @@ class MemoryStore:
                 # asymmetric contract.
                 bodies_snapshot: list = list(self._facts.values())
                 bodies_snapshot.extend(self._meta_facts.values())
+                # Cache hit: same data_version + body count + horizon
+                # means the simulation would produce the same result
+                # (forecast_stability is pure over the body snapshot and
+                # horizon). Return the previous response verbatim with
+                # a cached=True marker so callers can tell.
+                cache_key = (
+                    self._data_version_now(),
+                    len(bodies_snapshot),
+                    horizon_ticks,
+                )
+                if (self._forecast_cache is not None
+                        and self._forecast_cache[0] == cache_key):
+                    cached = dict(self._forecast_cache[1])
+                    cached["cached"] = True
+                    return cached
 
         # The simulation itself is pure numpy and reads no shared state —
         # run it OUTSIDE the lock so other agents can keep querying.
@@ -1464,8 +1502,9 @@ class MemoryStore:
                 ranges["near_horizon"] += 1
             else:
                 ranges["predicted_fall"] += 1
-        return {
+        result_payload = {
             "horizon_ticks": horizon_ticks,
+            "cached": False,
             # Kept for wire-format stability; aliases of the new keys.
             "facts_forecasted": len(scores),
             "facts_updated": updated,
@@ -1485,6 +1524,10 @@ class MemoryStore:
                 "metas_updated_count."
             ),
         }
+        # Cache the response keyed by the snapshot we forecasted against.
+        # Subsequent calls with no intervening writes hit the cache.
+        self._forecast_cache = (cache_key, dict(result_payload))
+        return result_payload
 
     def close(self) -> None:
         """Release the background executor and close the storage layer.
@@ -2038,4 +2081,8 @@ class MemoryStore:
                 "last_collapse_at": self._last_collapse_at,
                 "last_collapse_attempt_at": self._last_collapse_attempt_at,
                 "adaptive_weights": self._engine.weights.as_dict(),
+                "echo_sessions": len(self._echo),
+                "total_echoes_detected": self._echo.total_echoes_detected,
+                "total_echoes_applied": self._echo.total_echoes_applied,
+                "total_echoes_ignored": self._echo.total_echoes_ignored,
             }

@@ -52,6 +52,16 @@ class EchoStore:
     def __init__(self, default_k: int = 2) -> None:
         self._sessions: dict[str, StoredSession] = {}
         self._k = default_k
+        # Process-lifetime counters surfaced by MemoryStore.stats. They
+        # answer three questions you need to debug an echo system:
+        # "is detect_echo finding anything at all" (detected),
+        # "is the penalty actually being applied" (applied),
+        # "is the second-hit idempotency hot" (ignored). Reset on
+        # process restart by design — stats are per-instance, not
+        # historical, same contract as collapse_counter.
+        self.total_echoes_detected = 0
+        self.total_echoes_applied = 0
+        self.total_echoes_ignored = 0
 
     def record(
         self,
@@ -111,9 +121,11 @@ class EchoStore:
             return EchoResult(None, round(best_sim, 4), 0.0, "clean")
 
         past = self._sessions[best_id]
+        self.total_echoes_detected += 1
 
         # Idempotent: do not stack penalties if echo was already applied.
         if past.echo_penalty != 0.0:
+            self.total_echoes_ignored += 1
             return EchoResult(
                 matched_session_id=best_id,
                 similarity=round(best_sim, 4),
@@ -133,6 +145,7 @@ class EchoStore:
         past.echo_penalty = penalty
         new_score = past.r_score + penalty
         past.r_score = min(-0.2, max(-1.0, new_score))
+        self.total_echoes_applied += 1
 
         return EchoResult(
             matched_session_id=best_id,
