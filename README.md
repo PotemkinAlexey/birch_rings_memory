@@ -80,6 +80,16 @@ session R, one returned at 0.10 almost none; facts added or re-confirmed
 via `record_fact` are pinned at weight 1.0. Resonance contributes 0 until a
 session has actually scored the fact.
 
+**The three pre-resonance weights are learned, not hand-set.** Freshness,
+access and graph each carry a weight that starts at the values above (the
+prior) and adapts to the user's own resonance feedback — one regularised
+SGD step per closed session, fit against (R+1)/2 as ground truth. The
+resonance weight stays fixed at 0.35: resonance is observation, not
+prediction. `memory_stats` exposes the live weights and the training count
+so the formula stays legible — at zero data behaviour is identical to the
+hand-tuned formula, and as the store is used the weights drift toward
+what predicts value *for you*.
+
 Layer migration happens on every `session_close()`. Each tick a fact steps
 one layer **toward the layer its gravity belongs in** — surface above 0.70,
 core below 0.30, kinetic between — so a fact stranded in the core climbs
@@ -323,7 +333,20 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Claude then has four tools: `query_memory`, `record_fact`, `record_session`, `memory_stats`.
+Claude then has ten tools:
+
+| Tool | What it does |
+|---|---|
+| `query_memory` | Semantic search — returns facts and MetaFacts ranked by similarity |
+| `record_fact` | Store one subject-predicate-object triple |
+| `record_facts` | Store many triples in one batch (one Ollama round-trip) |
+| `delete_fact` | Permanently remove a fact by `fact_id` — bypasses the black hole |
+| `list_facts` | List live facts by subject/predicate, sorted by gravity — audit without a query |
+| `session_open` | Open a named session so reads and writes can be attributed to it |
+| `session_push` | Append a user message to an open session |
+| `session_close` | Close a session — score resonance, update gravity, detect echo |
+| `record_session` | Score a completed session in one call (open + push messages + close) |
+| `memory_stats` | Report layer distribution and black hole status |
 
 `query_memory` returns polymorphic hits. Every item has `kind`, `body_id`, `similarity`,
 `source`, `layer`, `gravity_score`. Fact hits (`kind: "fact"`) include `subject`,
@@ -420,13 +443,14 @@ Environment knobs:
 ## Status
 
 Working proof of concept. All of the following are functional and covered
-by the test suite: resonance pipeline, gravity engine, black hole with
-polymorphic singularity (facts + MetaFacts), SQLite persistence, numpy
-vector index, per-session concurrency, **cross-process safety** (WAL +
-`data_version` cache invalidation), auto-linking on `add_fact`,
-counter-triggered background collapse with lineage, EchoStore TTL, the MCP
-server, and the `galaxy` N-body research model. CI runs ruff and mypy on
-every push.
+by the test suite: resonance pipeline, **adaptive gravity engine**
+(pre-resonance weights learned from session resonance — no hand-set
+magic numbers), black hole with polymorphic singularity (facts +
+MetaFacts), SQLite persistence, numpy vector index, per-session
+concurrency, **cross-process safety** (WAL + `data_version` cache
+invalidation), auto-linking on `add_fact`, counter-triggered background
+collapse with lineage, EchoStore TTL, the MCP server, and the `galaxy`
+N-body research model. CI runs ruff and mypy on every push.
 
 Next natural steps: a persistent similarity index for very large stores
 (FAISS / hnswlib), an LLM-driven `MetaFact.summary` writer that runs async

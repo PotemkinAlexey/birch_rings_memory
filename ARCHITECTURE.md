@@ -121,6 +121,33 @@ graph = degree(fact) / max_degree_in_graph
 Facts with more `link()` connections are harder to sink. Encodes the
 intuition that well-connected knowledge is more structural.
 
+### Adaptive weights — the formula learns
+
+The three pre-resonance weights (freshness, access, graph) are not
+hand-set magic numbers any more. They live in ``AdaptiveWeights`` and
+are learned from the user's own resonance feedback:
+
+- Behaviour at zero data is identical to the prior `(0.35, 0.20, 0.10)`,
+  so flipping the switch is safe.
+- Each `session_close` snapshots `(freshness, access, graph)` for every
+  fact about to receive its *first* resonance, averages those, and takes
+  one regularised SGD step toward `(R + 1) / 2`. The non-circularity is
+  the point: the weights learn what predicts realised value *before* a
+  fact has been reacted to.
+- A regularisation term pulls each weight back toward the prior every
+  step; a budget renormalisation keeps `w_freshness + w_access + w_graph
+  = 0.65` so the formula stays in `[0, 1]`.
+- The resonance weight stays fixed at `0.35`: resonance is observation,
+  not prediction.
+
+Weights persist in a singleton SQLite row and round-trip via the
+`StorageBackend` protocol's `save_adaptive_weights` / `load_adaptive_weights`.
+`memory_stats` returns them, so the user can read `freshness 0.41,
+access 0.17, graph 0.07 — trained on 47 sessions` and see exactly what
+the formula has learned. Magic numbers that needed personalisation are
+fit to the user; the only remaining constants are the learner's `lr`
+and `reg` — standard, robust hyperparameters with safe defaults.
+
 ### Layer migration (per tick)
 
 Each tick a fact steps **one layer toward the layer its gravity belongs in**:
@@ -547,6 +574,7 @@ off-centre point — so the attention mass ships as a gentle perturber.
 
 ```
 src/birch/
+  adaptive_gravity.py       AdaptiveWeights — learned pre-resonance weights
   fact.py                   FactPassport dataclass
   meta_fact.py              MetaFact dataclass + lineage + Hawking gravity helper
   gravity.py                GravityEngine — score computation + migration
