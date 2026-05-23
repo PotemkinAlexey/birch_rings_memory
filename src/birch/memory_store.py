@@ -201,8 +201,16 @@ class MemoryStore:
         # automatically the moment ANY write bumps data_version — the
         # backend's authoritative version counter is the cache key.
         self._forecast_cache: tuple[
-            tuple[int, int, int], dict
+            tuple[int, int, int, int], dict
         ] | None = None
+        # Process-local mutation counter. SQLite's PRAGMA data_version
+        # only changes for writes from OTHER connections — same-process
+        # writes leave it untouched. Without this counter, run_forecast
+        # could serve a stale cached result after the same process
+        # added a fact (body count unchanged → cache_key unchanged).
+        # Bumped by every method that mutates _facts / _meta_facts /
+        # _hole — see _bump_mutation calls below.
+        self._mutation_version: int = 0
 
     # ── Cross-process cache coherence ────────────────────────────────────────
 
@@ -587,6 +595,7 @@ class MemoryStore:
                     if ctx is not None:
                         self._attribute_to(ctx, fact.fact_id, 1.0)
                         self._persist_session_locked(ctx)
+                self._mutation_version += 1
                 return (fact, True) if return_status else fact
 
     def _touch_existing(
@@ -729,6 +738,7 @@ class MemoryStore:
                 # Persist every open session whose attribution changed.
                 for sid in touched_ctxs:
                     self._persist_session_locked(self._sessions.get(sid))
+                self._mutation_version += 1
 
         if return_status:
             return [
@@ -900,6 +910,7 @@ class MemoryStore:
                     # depress graph_score for healthy facts.
                     if hasattr(self._storage, "delete_edges_for_fact"):
                         self._storage.delete_edges_for_fact(fact_id)
+                self._mutation_version += 1
                 return True
 
     def list_facts(
@@ -992,6 +1003,7 @@ class MemoryStore:
         if self._storage:
             self._storage.save_fact(old)
         absorbed = self._absorb_dead()
+        self._mutation_version += 1
         return {
             "superseded": True,
             "old_id": old_id,
@@ -1107,6 +1119,7 @@ class MemoryStore:
                 if self._storage:
                     self._storage.save_fact(fact)
                 absorbed = self._absorb_dead()
+                self._mutation_version += 1
         return {
             "retired": True,
             "fact_id": fact_id,
@@ -1355,6 +1368,7 @@ class MemoryStore:
                 # Counter-triggered collapse. Held inside the lock so the
                 # collapse counter and the trigger decision are consistent.
                 self._maybe_trigger_collapse_locked(len(absorbed))
+                self._mutation_version += 1
 
                 summary = {
                     "session_id": sid,
@@ -1492,22 +1506,27 @@ class MemoryStore:
         )
 
     def run_forecast(self, horizon_ticks: int = 50) -> dict:
-        """Run a galaxy forecast and write ``forecast_stability`` back to facts.
+        """Run a galaxy forecast and write ``forecast_stability`` back to bodies.
 
-        The galaxy module models a fact as a body in orbit around a central
-        black hole; running it forward gives a per-fact prediction of how
+        The galaxy module models every live body (FactPassport AND MetaFact
+        — both carry ``forecast_stability``) as an N-body orbiting a central
+        black hole. Running it forward gives a per-body prediction of how
         close that body will be to the event horizon after ``horizon_ticks``
         steps. Stability ∈ [0, 1]: 1.0 = predicted safely on surface,
-        0.0 = predicted to fall, 0.5 = neutral prior (default for facts the
-        galaxy could not place).
+        0.0 = predicted to fall, 0.5 = neutral prior (default for bodies
+        the galaxy could not place).
 
-        The value is stored on FactPassport.forecast_stability and consumed
-        by the adaptive gravity formula via ``w_stability`` — so this call
-        materially feeds back into how the formula scores facts on the next
-        tick. The galaxy build + simulation is O(n²) per step in fact count
-        and pure numpy, fine for the few hundred to few thousand facts a
-        personal store holds. Returns a small summary; full per-fact values
-        are persisted, not returned.
+        The value is stored on FactPassport.forecast_stability /
+        MetaFact.forecast_stability and consumed by the adaptive gravity
+        formula via ``w_stability`` — so this call materially feeds back
+        into how the formula scores bodies on the next tick. The galaxy
+        build + simulation is O(n²) per step in body count and pure numpy,
+        fine for the few hundred to few thousand bodies a personal store
+        holds. Returns a small summary with ``bodies_*`` keys and a
+        per-type split (``facts_updated_count`` / ``metas_updated_count``);
+        full per-body values are persisted, not returned. Legacy
+        ``facts_forecasted`` / ``facts_updated`` keys are aliases for
+        wire-format stability but actually count BODIES.
         """
         from .galaxy.forecast import forecast_stability
 
@@ -1528,6 +1547,7 @@ class MemoryStore:
                 # a cached=True marker so callers can tell.
                 cache_key = (
                     self._data_version_now(),
+                    self._mutation_version,
                     len(bodies_snapshot),
                     horizon_ticks,
                 )
@@ -2123,6 +2143,7 @@ class MemoryStore:
                                 fact_weights=past.fact_weights,
                                 echo_penalty=past.echo_penalty,
                             )
+                    self._mutation_version += 1
 
                 return {
                     "echo": result.label == "echo",

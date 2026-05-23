@@ -20,6 +20,39 @@ _store = MemoryStore(db_path=_DB_PATH)
 mcp = FastMCP("BirchKM")
 
 
+def _validate_spo_strings(
+    subject, predicate, obj,
+) -> Optional[dict]:
+    """Type-validate the SPO triple at the MCP boundary.
+
+    Round 11 added this validator for ``record_facts`` (batch path).
+    Round 12 mirrors it to ``record_fact`` / ``set_fact`` (single
+    paths) so the failure mode is symmetric: subject=123 fails the
+    same way it would in a batch.
+
+    Returns ``None`` if all three fields are non-empty strings;
+    otherwise a structured error dict with ``bad_fields`` and
+    ``got_types``. Whitespace-only counts as empty.
+    """
+    required = (("subject", subject), ("predicate", predicate),
+                ("object", obj))
+    bad: list[str] = []
+    types: dict[str, str] = {}
+    for name, val in required:
+        if not isinstance(val, str) or not val.strip():
+            bad.append(name)
+            types[name] = type(val).__name__
+    if not bad:
+        return None
+    return {
+        "ok": False,
+        "error": "invalid_fact_fields",
+        "bad_fields": bad,
+        "got_types": types,
+        "hint": "subject, predicate, object must be non-empty strings.",
+    }
+
+
 def _embedding_error_response(exc: EmbeddingError) -> dict:
     """Wrap an EmbeddingError as the structured failure shape MCP tools
     return when the embedding provider is unreachable / misconfigured.
@@ -185,6 +218,9 @@ def record_fact(
     "consider supersede_fact or set_fact"; the dedup in this call only catches
     exact normalised SPO matches, not "X uses Postgres" vs "X is on Postgres".
     """
+    err = _validate_spo_strings(subject, predicate, object)
+    if err is not None:
+        return err
     # Transaction-honest: add_fact returns created from inside its own
     # write txn, so there's no race window between a fact_exists probe and
     # the insert (same pattern set_fact uses since round 5).
@@ -351,7 +387,19 @@ def set_fact(
 
     Returns ``{"set": true, "fact_id", "already_existed", "superseded": [...]}``.
     """
-    return _store.set_fact(subject, predicate, object, session_id=session_id)
+    err = _validate_spo_strings(subject, predicate, object)
+    if err is not None:
+        return err
+    # set_fact -> add_fact -> embed(); wrap so an unreachable embedding
+    # provider produces a structured failure instead of raw stacktrace
+    # at the MCP boundary (round 12, completes the wrap coverage that
+    # round 11 started for record_fact / record_facts / query_memory).
+    try:
+        return _store.set_fact(
+            subject, predicate, object, session_id=session_id,
+        )
+    except EmbeddingError as exc:
+        return _embedding_error_response(exc)
 
 
 @mcp.tool()
@@ -445,6 +493,22 @@ def forecast_memory(horizon_ticks: int = 50) -> dict:
                 "or rebuild/reindex before running the forecast."
             ),
             "detail": str(exc),
+        }
+    except (ValueError, TypeError) as exc:
+        # Deterministic input issues — bad vector shape sneaking past
+        # _safe_vector, numpy raising on malformed body, galaxy refusing
+        # a zero-mass body. Structured response so the agent gets an
+        # actionable diagnostic instead of a raw stacktrace. NOT
+        # catching BaseException — we don't want to hide programmer
+        # bugs or KeyboardInterrupt.
+        return {
+            "ok": False,
+            "error": "forecast_failed",
+            "detail": str(exc),
+            "hint": (
+                "Check fact / metafact vectors for shape consistency; "
+                "run memory_stats to inspect body counts."
+            ),
         }
 
 
@@ -656,13 +720,20 @@ def session_open(
         ),
     }
     if first_message:
-        response["echo"] = _store.check_echo(first_message, session_id=sid)
-        if record_first_message:
-            # Push the opening message into the trajectory so the resonance
-            # engine sees it on close. Without this, an agent that uses
-            # session_open(first_message=...) loses the opening turn from
-            # the semantic-shift and repetition signals.
-            _store.session_message(first_message, session_id=sid)
+        # Both check_echo and session_message embed the first message.
+        # An unreachable provider here would abort session_open after
+        # the session was already started — wrap so the agent gets a
+        # structured failure and can retry. The session is left open
+        # (session_start already ran); a follow-up close will be a
+        # no-op or get a recoverable empty session.
+        try:
+            response["echo"] = _store.check_echo(
+                first_message, session_id=sid,
+            )
+            if record_first_message:
+                _store.session_message(first_message, session_id=sid)
+        except EmbeddingError as exc:
+            response["echo_error"] = _embedding_error_response(exc)
     return response
 
 
@@ -679,7 +750,10 @@ def check_echo(first_message: str, session_id: Optional[str] = None) -> dict:
     this tool is the explicit form when you want the check without opening a
     new session, or when you've already opened one and want a late check.
     """
-    return _store.check_echo(first_message, session_id=session_id)
+    try:
+        return _store.check_echo(first_message, session_id=session_id)
+    except EmbeddingError as exc:
+        return _embedding_error_response(exc)
 
 
 @mcp.tool()
@@ -692,7 +766,10 @@ def session_push(text: str, session_id: str) -> dict:
     behavioural / semantic / repetition signals score user closure, not
     your replies.
     """
-    _store.session_message(text, session_id=session_id)
+    try:
+        _store.session_message(text, session_id=session_id)
+    except EmbeddingError as exc:
+        return _embedding_error_response(exc)
     return {
         "session_id": session_id,
         "ok": True,
@@ -771,11 +848,14 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
     # an agent that records a whole session in one call never benefits
     # from echo, which is the main retroactive correction feature.
     echo = None
-    if messages:
-        echo = _store.check_echo(messages[0], session_id=session_id)
-    for msg in messages:
-        _store.session_message(msg, session_id=session_id)
-    summary = _store.session_close(session_id=session_id)
+    try:
+        if messages:
+            echo = _store.check_echo(messages[0], session_id=session_id)
+        for msg in messages:
+            _store.session_message(msg, session_id=session_id)
+        summary = _store.session_close(session_id=session_id)
+    except EmbeddingError as exc:
+        return _embedding_error_response(exc)
     response = {
         "session_id": session_id,
         "label": summary.get("label"),

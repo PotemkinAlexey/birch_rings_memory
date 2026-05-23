@@ -101,10 +101,17 @@ def _post(url: str, body: dict, timeout: float = 30.0) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
-    except urllib.error.HTTPError:
-        # Caller distinguishes HTTPError (e.g. 404 = legacy fallback) from
-        # the harder failures below — re-raise it untouched.
-        raise
+    except urllib.error.HTTPError as exc:
+        # Only let 404 escape untouched — that's the signal the caller
+        # uses to fall back to the legacy endpoint. Every other HTTP
+        # code (400 bad request, 500 model error, 503 etc.) is a real
+        # provider failure that should surface as a typed EmbeddingError
+        # at the MCP boundary, not as a raw stacktrace.
+        if exc.code == 404:
+            raise
+        raise EmbeddingError(
+            f"Ollama HTTP {exc.code} at {url}: {exc.reason}"
+        ) from exc
     except (urllib.error.URLError, socket.timeout, ConnectionError) as exc:
         raise EmbeddingError(
             f"cannot reach Ollama at {_BASE_URL}: {exc}. "
