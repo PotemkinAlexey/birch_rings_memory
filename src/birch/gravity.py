@@ -22,6 +22,7 @@ class GravityBody(Protocol):
     last_accessed: float
     created_at: float
     resonance_count: int
+    recent_utility: float
 
     @property
     def fact_id(self) -> str: ...
@@ -57,10 +58,14 @@ def pre_resonance_features(
     graph_degree: int = 0,
     max_degree: int = 1,
     now: float | None = None,
-) -> tuple[float, float, float]:
-    """Compute (freshness, access, graph) — the features whose weights are
-    learned. Resonance is excluded on purpose: it is the *target* of the
-    learning, not a predictor of it.
+) -> tuple[float, float, float, float]:
+    """Compute (freshness, access, graph, utility) — the features whose
+    weights are learned. Resonance is excluded on purpose: it is the
+    *target* of the learning, not a predictor of it.
+
+    ``utility`` is the fact's stored ``recent_utility`` EWMA — a slow-
+    moving prior on how useful this fact has been in recent sessions,
+    independent of how often it was touched.
     """
     now = now or time.time()
 
@@ -74,7 +79,9 @@ def pre_resonance_features(
 
     graph_score = min(1.0, graph_degree / max(1, max_degree))
 
-    return freshness, access_score, graph_score
+    utility = max(0.0, min(1.0, float(getattr(fact, "recent_utility", 0.5))))
+
+    return freshness, access_score, graph_score, utility
 
 
 def compute_gravity(
@@ -93,7 +100,7 @@ def compute_gravity(
     if weights is None:
         weights = AdaptiveWeights.from_prior()
 
-    freshness, access_score, graph_score = pre_resonance_features(
+    freshness, access_score, graph_score, utility = pre_resonance_features(
         fact, graph_degree, max_degree, now)
 
     if fact.resonance_count > 0:
@@ -104,8 +111,9 @@ def compute_gravity(
     gravity = (
         weights.w_freshness * freshness
         + weights.w_access * access_score
-        + _W_RESONANCE * resonance_score
         + weights.w_graph * graph_score
+        + weights.w_utility * utility
+        + _W_RESONANCE * resonance_score
     )
     return round(min(1.0, max(0.0, gravity)), 4)
 

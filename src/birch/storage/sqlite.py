@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS facts (
     access_count    INTEGER DEFAULT 0,
     last_accessed   REAL,
     resonance_sum   REAL DEFAULT 0.0,
-    resonance_count INTEGER DEFAULT 0
+    resonance_count INTEGER DEFAULT 0,
+    recent_utility  REAL DEFAULT 0.5
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -66,7 +67,8 @@ CREATE TABLE IF NOT EXISTS meta_facts (
     access_count    INTEGER DEFAULT 0,
     last_accessed   REAL,
     resonance_sum   REAL DEFAULT 0.0,
-    resonance_count INTEGER DEFAULT 0
+    resonance_count INTEGER DEFAULT 0,
+    recent_utility  REAL DEFAULT 0.5
 );
 
 CREATE TABLE IF NOT EXISTS adaptive_weights (
@@ -74,6 +76,7 @@ CREATE TABLE IF NOT EXISTS adaptive_weights (
     w_freshness     REAL NOT NULL,
     w_access        REAL NOT NULL,
     w_graph         REAL NOT NULL,
+    w_utility       REAL NOT NULL DEFAULT 0.10,
     train_count     INTEGER NOT NULL DEFAULT 0,
     updated_at      REAL
 );
@@ -101,6 +104,7 @@ class SQLiteBackend:
         self._txn_depth = 0
         self._conn.executescript(_SCHEMA)
         self._migrate_echo_sessions()
+        self._migrate_recent_utility()
         self._conn.commit()
 
     # ── Cross-process coordination ───────────────────────────────────────────
@@ -155,7 +159,41 @@ class SQLiteBackend:
         if "echo_penalty" not in cols:
             self._conn.execute("ALTER TABLE echo_sessions ADD COLUMN echo_penalty REAL DEFAULT 0")
 
+    def _migrate_recent_utility(self) -> None:
+        """Add recent_utility / w_utility columns to older DBs in place."""
+        fact_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(facts)")
+        }
+        if "recent_utility" not in fact_cols:
+            self._conn.execute(
+                "ALTER TABLE facts ADD COLUMN recent_utility REAL DEFAULT 0.5"
+            )
+        meta_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(meta_facts)")
+        }
+        if "recent_utility" not in meta_cols:
+            self._conn.execute(
+                "ALTER TABLE meta_facts ADD COLUMN recent_utility REAL DEFAULT 0.5"
+            )
+        weight_cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(adaptive_weights)")
+        }
+        if "w_utility" not in weight_cols:
+            self._conn.execute(
+                "ALTER TABLE adaptive_weights "
+                "ADD COLUMN w_utility REAL NOT NULL DEFAULT 0.10"
+            )
+
     # ── Facts ────────────────────────────────────────────────────────────────
+
+    _FACT_INSERT = (
+        "INSERT OR REPLACE INTO facts "
+        "(fact_id, subject, predicate, object, vector, gravity_score, layer, "
+        " created_at, ttl, source_session, deprecated_by, access_count, "
+        " last_accessed, resonance_sum, resonance_count, recent_utility) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
 
     @staticmethod
     def _fact_row(fact: FactPassport) -> tuple:
@@ -166,13 +204,11 @@ class SQLiteBackend:
             fact.source_session, fact.deprecated_by,
             fact.access_count, fact.last_accessed,
             fact.resonance_sum, fact.resonance_count,
+            fact.recent_utility,
         )
 
     def save_fact(self, fact: FactPassport) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            self._fact_row(fact),
-        )
+        self._conn.execute(self._FACT_INSERT, self._fact_row(fact))
         self._maybe_commit()
 
     def save_facts(self, facts: list[FactPassport]) -> None:
@@ -180,10 +216,7 @@ class SQLiteBackend:
         if not facts:
             return
         rows = [self._fact_row(f) for f in facts]
-        self._conn.executemany(
-            "INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            rows,
-        )
+        self._conn.executemany(self._FACT_INSERT, rows)
         self._maybe_commit()
 
     def delete_fact(self, fact_id: str) -> None:
@@ -202,6 +235,11 @@ class SQLiteBackend:
                 source_session=r["source_session"], deprecated_by=r["deprecated_by"],
                 access_count=r["access_count"], last_accessed=r["last_accessed"],
                 resonance_sum=r["resonance_sum"], resonance_count=r["resonance_count"],
+                recent_utility=(
+                    r["recent_utility"]
+                    if "recent_utility" in r.keys() and r["recent_utility"] is not None
+                    else 0.5
+                ),
             )
             for r in rows
         ]
@@ -328,8 +366,8 @@ class SQLiteBackend:
         "INSERT OR REPLACE INTO meta_facts "
         "(meta_id, vector, weight, source_texts, source_fact_ids, summary, "
         " gravity_score, created_at, layer, access_count, last_accessed, "
-        " resonance_sum, resonance_count) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " resonance_sum, resonance_count, recent_utility) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -341,6 +379,7 @@ class SQLiteBackend:
             d["gravity_score"], d["created_at"], d["layer"],
             d["access_count"], d["last_accessed"],
             d["resonance_sum"], d["resonance_count"],
+            d["recent_utility"],
         )
 
     def save_meta_fact(self, meta: MetaFact) -> None:
@@ -371,12 +410,14 @@ class SQLiteBackend:
 
         self._conn.execute(
             "INSERT OR REPLACE INTO adaptive_weights "
-            "(id, w_freshness, w_access, w_graph, train_count, updated_at) "
-            "VALUES (1, ?, ?, ?, ?, ?)",
+            "(id, w_freshness, w_access, w_graph, w_utility, "
+            " train_count, updated_at) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?)",
             (
                 weights.w_freshness,
                 weights.w_access,
                 weights.w_graph,
+                weights.w_utility,
                 weights.train_count,
                 _time.time(),
             ),
@@ -386,7 +427,7 @@ class SQLiteBackend:
     def load_adaptive_weights(self) -> AdaptiveWeights | None:
         """Return the persisted weights, or None if the store has none yet."""
         row = self._conn.execute(
-            "SELECT w_freshness, w_access, w_graph, train_count "
+            "SELECT w_freshness, w_access, w_graph, w_utility, train_count "
             "FROM adaptive_weights WHERE id = 1"
         ).fetchone()
         if row is None:
@@ -395,6 +436,9 @@ class SQLiteBackend:
             w_freshness=row["w_freshness"],
             w_access=row["w_access"],
             w_graph=row["w_graph"],
+            w_utility=(
+                row["w_utility"] if row["w_utility"] is not None else 0.10
+            ),
             train_count=int(row["train_count"]),
         )
 

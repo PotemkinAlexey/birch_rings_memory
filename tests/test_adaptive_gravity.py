@@ -8,7 +8,9 @@ from birch.storage.sqlite import SQLiteBackend
 
 def test_from_prior_matches_the_legacy_formula():
     w = AdaptiveWeights.from_prior()
-    assert (w.w_freshness, w.w_access, w.w_graph) == AdaptiveWeights.PRIOR
+    assert (
+        w.w_freshness, w.w_access, w.w_graph, w.w_utility
+    ) == AdaptiveWeights.PRIOR
     assert w.train_count == 0
 
 
@@ -17,7 +19,9 @@ def test_consistent_signal_nudges_the_relevant_weight_up():
     w = AdaptiveWeights.from_prior()
     start = w.w_freshness
     for _ in range(40):
-        w.update(freshness=1.0, access=0.0, graph=0.0, target=1.0)
+        w.update(
+            freshness=1.0, access=0.0, graph=0.0, utility=0.0, target=1.0,
+        )
     assert w.w_freshness > start
     assert w.train_count == 40
 
@@ -25,24 +29,41 @@ def test_consistent_signal_nudges_the_relevant_weight_up():
 def test_weights_stay_in_budget_and_non_negative():
     w = AdaptiveWeights.from_prior()
     for _ in range(200):
-        w.update(freshness=1.0, access=0.0, graph=0.0, target=1.0)
-    total = w.w_freshness + w.w_access + w.w_graph
+        w.update(
+            freshness=1.0, access=0.0, graph=0.0, utility=0.0, target=1.0,
+        )
+    total = w.w_freshness + w.w_access + w.w_graph + w.w_utility
     assert abs(total - AdaptiveWeights.BUDGET) < 1e-9
-    assert min(w.w_freshness, w.w_access, w.w_graph) >= 0.0
+    assert min(
+        w.w_freshness, w.w_access, w.w_graph, w.w_utility
+    ) >= 0.0
 
 
 def test_regularisation_pulls_back_toward_the_prior():
     """Stop signalling and reg, every step, drifts each weight toward the prior."""
     w = AdaptiveWeights.from_prior()
     for _ in range(80):
-        w.update(freshness=1.0, access=0.0, graph=0.0, target=1.0)
+        w.update(
+            freshness=1.0, access=0.0, graph=0.0, utility=0.0, target=1.0,
+        )
     pumped = w.w_freshness
     # Feed neutral signal (target equals the model's own prediction → err = 0)
     # so only the regularisation term acts.
     for _ in range(80):
-        pred = w.predict(0.5, 0.5, 0.5)
-        w.update(0.5, 0.5, 0.5, target=pred)
+        pred = w.predict(0.5, 0.5, 0.5, 0.5)
+        w.update(0.5, 0.5, 0.5, 0.5, target=pred)
     assert w.w_freshness < pumped
+
+
+def test_utility_weight_learns_when_utility_predicts_value():
+    """If recent_utility lines up with the target, w_utility climbs."""
+    w = AdaptiveWeights.from_prior()
+    start = w.w_utility
+    for _ in range(60):
+        w.update(
+            freshness=0.0, access=0.0, graph=0.0, utility=1.0, target=1.0,
+        )
+    assert w.w_utility > start
 
 
 def test_compute_gravity_with_prior_matches_the_default():
@@ -58,8 +79,10 @@ def test_compute_gravity_with_prior_matches_the_default():
 def test_sqlite_roundtrip_of_adaptive_weights(tmp_path):
     backend = SQLiteBackend(str(tmp_path / "m.db"))
     assert backend.load_adaptive_weights() is None
-    weights = AdaptiveWeights(w_freshness=0.40, w_access=0.15, w_graph=0.10,
-                              train_count=7)
+    weights = AdaptiveWeights(
+        w_freshness=0.40, w_access=0.15, w_graph=0.10, w_utility=0.05,
+        train_count=7,
+    )
     backend.save_adaptive_weights(weights)
     loaded = backend.load_adaptive_weights()
     backend.close()
@@ -67,6 +90,7 @@ def test_sqlite_roundtrip_of_adaptive_weights(tmp_path):
     assert abs(loaded.w_freshness - 0.40) < 1e-9
     assert abs(loaded.w_access - 0.15) < 1e-9
     assert abs(loaded.w_graph - 0.10) < 1e-9
+    assert abs(loaded.w_utility - 0.05) < 1e-9
     assert loaded.train_count == 7
 
 
@@ -87,7 +111,12 @@ def test_memory_store_learns_one_step_per_resonant_session(tmp_path):
     stats = mem.stats
     weights = stats["adaptive_weights"]
     assert weights["train_count"] >= 1
-    total = weights["w_freshness"] + weights["w_access"] + weights["w_graph"]
+    total = (
+        weights["w_freshness"]
+        + weights["w_access"]
+        + weights["w_graph"]
+        + weights["w_utility"]
+    )
     assert abs(total - AdaptiveWeights.BUDGET) < 1e-3
 
     # A fresh process must read the same learned weights from disk.

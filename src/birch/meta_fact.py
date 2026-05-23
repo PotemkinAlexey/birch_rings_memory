@@ -41,6 +41,7 @@ class MetaFact:
     last_accessed: float = field(default_factory=time.time)
     resonance_sum: float = 0.0
     resonance_count: int = 0
+    recent_utility: float = 0.5
 
     # ── Polymorphism shims for code that ducks on FactPassport ──────────────
     # FactPassport carries optional ttl/deprecated_by fields; MetaFacts cannot
@@ -111,6 +112,7 @@ class MetaFact:
             "last_accessed": self.last_accessed,
             "resonance_sum": self.resonance_sum,
             "resonance_count": self.resonance_count,
+            "recent_utility": self.recent_utility,
         }
 
     @classmethod
@@ -129,6 +131,7 @@ class MetaFact:
             last_accessed=float(row.get("last_accessed", time.time())),
             resonance_sum=float(row.get("resonance_sum", 0.0)),
             resonance_count=int(row.get("resonance_count", 0)),
+            recent_utility=float(row.get("recent_utility", 0.5)),
         )
 
 

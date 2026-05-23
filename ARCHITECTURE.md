@@ -69,13 +69,14 @@ startup and is updated on deprecation and on black-hole absorption.
 
 ## Gravity engine
 
-Gravity is recomputed every `tick()` from four components:
+Gravity is recomputed every `tick()` from five components:
 
 ```
-gravity = w_freshness × freshness   (learned; prior 0.35; ~2-week half-life)
-        + w_access    × access      (learned; prior 0.20; log-scaled, ~3-day decay)
-        + 0.35        × resonance   (fixed: observation, not prediction)
-        + w_graph     × graph       (learned; prior 0.10; degree / max-degree)
+gravity = w_freshness × freshness        (learned; prior 0.30; ~2-week half-life)
+        + w_access    × access           (learned; prior 0.15; log-scaled, ~3-day decay)
+        + w_graph     × graph            (learned; prior 0.10; degree / max-degree)
+        + w_utility   × recent_utility   (learned; prior 0.10; EWMA of closure-weighted R)
+        + 0.35        × resonance        (fixed: observation, not prediction)
 ```
 
 ### freshness
@@ -121,30 +122,73 @@ graph = degree(fact) / max_degree_in_graph
 Facts with more `link()` connections are harder to sink. Encodes the
 intuition that well-connected knowledge is more structural.
 
+### recent_utility
+
+```
+recent_utility[t] = (1 − α) · recent_utility[t−1]  +  α · target
+target            = clamp((R · attribution_weight + 1) / 2, 0, 1)
+α                 = 0.15      # ≈ 7 sessions to half-life
+default           = 0.5       # Bayesian neutral prior
+```
+
+Per-fact EWMA of closure-weighted resonance, updated at every
+`session_close` for every fact the session touched (with the cosine
+attribution weight as the multiplier). It captures **how recent sessions
+that used this fact tended to end**, independent of how often the fact
+was touched — `access` already covers that. A fact silently riding along
+positive sessions climbs above the 0.5 prior and gets a small boost;
+a fact that keeps appearing in toxic sessions sinks below 0.5 and gets
+pulled toward the black hole even if its raw access count is high.
+
+The 0.5 default is the soft floor: an untouched fact carries a neutral
+prior, so it contributes `w_utility · 0.5` to gravity from day one and
+does not need a session to "prove itself" before it stops looking like
+junk.
+
+### Positive context is emergent, not assigned
+
+We deliberately do not ask the user to label facts ("👍 / 👎", "scope =
+work", "polarity = positive"). The system reads it instead:
+
+- **Closure** is the user's natural endpoint — "thanks, exactly that"
+  vs. "опять не работает". It already arrives, free, at the end of
+  every session.
+- **Resonance** turns that closure into a per-session R ∈ [−1, +1] from
+  behavioural / semantic / repetition signals, with no LLM call.
+- **`recent_utility`** is the per-fact EWMA of that signal — the slow,
+  ambient memory of "has this fact tended to be in conversations that
+  ended well *for me*".
+
+The user never marks anything; the gravity formula learns the
+attribution. Magic numbers that needed personalisation become weights
+the system fits to the user, and the only "labels" are the ones the
+user produced organically by closing a session.
+
 ### Adaptive weights — the formula learns
 
-The three pre-resonance weights (freshness, access, graph) are not
-hand-set magic numbers any more. They live in ``AdaptiveWeights`` and
-are learned from the user's own resonance feedback:
+The four pre-resonance weights (freshness, access, graph, utility) are
+not hand-set magic numbers any more. They live in ``AdaptiveWeights``
+and are learned from the user's own resonance feedback:
 
-- Behaviour at zero data is identical to the prior `(0.35, 0.20, 0.10)`,
-  so flipping the switch is safe.
-- Each `session_close` snapshots `(freshness, access, graph)` for every
-  fact about to receive its *first* resonance, averages those, and takes
-  one regularised SGD step toward `(R + 1) / 2`. The non-circularity is
-  the point: the weights learn what predicts realised value *before* a
-  fact has been reacted to.
+- Behaviour at zero data is identical to the prior
+  `(0.30, 0.15, 0.10, 0.10)`, so flipping the switch is safe.
+- Each `session_close` snapshots
+  `(freshness, access, graph, recent_utility)` for every fact about to
+  receive its *first* resonance, averages those, and takes one
+  regularised SGD step toward `(R + 1) / 2`. The non-circularity is the
+  point: the weights learn what predicts realised value *before* a fact
+  has been reacted to this session.
 - A regularisation term pulls each weight back toward the prior every
-  step; a budget renormalisation keeps `w_freshness + w_access + w_graph
-  = 0.65` so the formula stays in `[0, 1]`.
+  step; a budget renormalisation keeps `w_freshness + w_access +
+  w_graph + w_utility = 0.65` so the formula stays in `[0, 1]`.
 - The resonance weight stays fixed at `0.35`: resonance is observation,
   not prediction.
 
 Weights persist in a singleton SQLite row and round-trip via the
 `StorageBackend` protocol's `save_adaptive_weights` / `load_adaptive_weights`.
-`memory_stats` returns them, so the user can read `freshness 0.41,
-access 0.17, graph 0.07 — trained on 47 sessions` and see exactly what
-the formula has learned. Magic numbers that needed personalisation are
+`memory_stats` returns them, so the user can read `freshness 0.36,
+access 0.14, graph 0.07, utility 0.08 — trained on 47 sessions` and
+see exactly what the formula has learned. Magic numbers that needed personalisation are
 fit to the user; the only remaining constants are the learner's `lr`
 and `reg` — standard, robust hyperparameters with safe defaults.
 

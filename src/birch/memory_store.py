@@ -683,7 +683,7 @@ class MemoryStore:
                 # weights learn what predicted realised value *before* it.
                 now_ts = time.time()
                 max_deg = max(self._engine._degrees.values(), default=1)
-                training_features: list[tuple[float, float, float]] = []
+                training_features: list[tuple[float, float, float, float]] = []
                 for fid in facts_snapshot:
                     f = self._facts.get(fid)
                     if f is not None and f.resonance_count == 0:
@@ -698,9 +698,24 @@ class MemoryStore:
                 # relevant each fact was to the session's queries.
                 self._engine.apply_session_resonance(facts_snapshot, result.r)
 
-                for fid in facts_snapshot:
-                    if fid in self._facts:
-                        self._facts[fid].touch()
+                # Update recent_utility EWMA per touched fact. Target is the
+                # per-fact realised value: (R · attribution_weight + 1) / 2,
+                # mapped from [-1, 1] into [0, 1] so the EWMA stays in [0, 1].
+                # α = 0.15 — roughly seven sessions to half-life. Slow enough
+                # that one outlier session doesn't swing the prior, fast
+                # enough that a meaningful streak shows up within a week.
+                _EWMA_ALPHA = 0.15
+                for fid, attr_weight in facts_snapshot.items():
+                    f = self._facts.get(fid)
+                    if f is None:
+                        continue
+                    f.touch()
+                    per_fact_r = result.r * float(attr_weight)
+                    target = max(0.0, min(1.0, (per_fact_r + 1.0) / 2.0))
+                    f.recent_utility = (
+                        (1.0 - _EWMA_ALPHA) * f.recent_utility
+                        + _EWMA_ALPHA * target
+                    )
 
                 self._echo.record(
                     sid,
@@ -744,8 +759,11 @@ class MemoryStore:
                     mean_f = sum(f[0] for f in training_features) / n
                     mean_a = sum(f[1] for f in training_features) / n
                     mean_g = sum(f[2] for f in training_features) / n
+                    mean_u = sum(f[3] for f in training_features) / n
                     target = max(0.0, min(1.0, (result.r + 1.0) / 2.0))
-                    self._engine.weights.update(mean_f, mean_a, mean_g, target=target)
+                    self._engine.weights.update(
+                        mean_f, mean_a, mean_g, mean_u, target=target,
+                    )
                     if self._storage and hasattr(self._storage, "save_adaptive_weights"):
                         self._storage.save_adaptive_weights(self._engine.weights)
 

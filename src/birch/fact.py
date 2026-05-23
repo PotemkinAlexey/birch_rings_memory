@@ -30,6 +30,10 @@ class FactPassport:
     resonance_sum: float = 0.0      # cumulative R from sessions that used this
     resonance_count: int = 0        # how many sessions contributed
 
+    # EWMA of recent contextual usefulness (closure-weighted resonance).
+    # Default 0.5 = Bayesian neutral prior; untouched facts get a soft floor.
+    recent_utility: float = 0.5
+
     @property
     def is_deprecated(self) -> bool:
         return self.deprecated_by is not None
