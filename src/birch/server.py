@@ -739,6 +739,13 @@ def session_open(
         except EmbeddingError as exc:
             response["echo_error"] = _embedding_error_response(exc)
             response["first_message_recorded"] = False
+            # Top-level failure markers so an agent that reads only the
+            # response envelope (not nested keys) cannot miss the
+            # partial-open state. session_id stays — the session IS
+            # opened on disk; the agent can either retry session_push
+            # or call session_close to drop the empty session.
+            response["ok"] = False
+            response["partial_open"] = True
             response["_hint"] = (
                 "session was opened but first_message was NOT recorded "
                 "due to embedding failure; retry session_push or call "

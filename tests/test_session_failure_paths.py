@@ -183,6 +183,10 @@ def test_session_open_first_message_recorded_flag_on_failure():
     except Exception:
         response["echo_error"] = {"ok": False, "error": "embed_failed"}
         response["first_message_recorded"] = False
+        # Top-level markers — an agent reading only the envelope
+        # cannot miss the partial-open state.
+        response["ok"] = False
+        response["partial_open"] = True
         response["_hint"] = (
             "session was opened but first_message was NOT recorded "
             "due to embedding failure; retry session_push or call "
@@ -192,6 +196,11 @@ def test_session_open_first_message_recorded_flag_on_failure():
     assert response["first_message_recorded"] is False
     assert "echo_error" in response
     assert "NOT recorded" in response["_hint"]
+    # Top-level discoverability: agent must not need to read nested
+    # echo_error to spot the failure.
+    assert response["ok"] is False
+    assert response["partial_open"] is True
+    assert "session_id" in response  # session IS opened on disk
 
 
 # --- README docstring drift catch ---------------------------------------
