@@ -128,6 +128,26 @@ def _post(url: str, body: dict, timeout: float = 30.0) -> dict:
     return data
 
 
+def _validate_vector(vec: object, where: str) -> list[float]:
+    """Embedding-shape contract for the boundary between the HTTP client
+    and the rest of birch.
+
+    Two failure modes downstream — wrong-shape vectors crash
+    ``np.asarray(dtype=float32)`` with a raw ``ValueError``, and
+    non-numeric items crash later in ``VectorIndex.add`` after the
+    record was already partially committed. Catching both here turns
+    them into a single typed ``EmbeddingError`` the MCP layer can wrap.
+    """
+    if not isinstance(vec, list) or not vec:
+        raise EmbeddingError(f"{where} is empty or wrong shape")
+    try:
+        return [float(x) for x in vec]
+    except (TypeError, ValueError) as exc:
+        raise EmbeddingError(
+            f"{where} contains non-numeric values"
+        ) from exc
+
+
 def _ollama_embed_batch(texts: list[str]) -> list[list[float]]:
     try:
         data = _post(_BATCH_ENDPOINT, {"model": _MODEL, "input": texts})
@@ -138,12 +158,10 @@ def _ollama_embed_batch(texts: list[str]) -> list[list[float]]:
                     f"Ollama batch returned {len(embeddings)} embeddings "
                     f"for {len(texts)} inputs"
                 )
-            for i, v in enumerate(embeddings):
-                if not isinstance(v, list) or not v:
-                    raise EmbeddingError(
-                        f"Ollama batch embedding #{i} is empty or wrong shape"
-                    )
-            return embeddings
+            return [
+                _validate_vector(v, f"Ollama batch embedding #{i}")
+                for i, v in enumerate(embeddings)
+            ]
     except urllib.error.HTTPError:
         # 404 from older Ollama builds — fall through to per-prompt legacy.
         pass
@@ -155,16 +173,20 @@ def _ollama_embed(text: str) -> list[float]:
         data = _post(_BATCH_ENDPOINT, {"model": _MODEL, "input": text})
         embeddings = data.get("embeddings")
         if isinstance(embeddings, list) and embeddings:
-            return embeddings[0]
+            return _validate_vector(
+                embeddings[0], f"Ollama embedding ({_BATCH_ENDPOINT})",
+            )
     except urllib.error.HTTPError:
         pass
     data = _post(_LEGACY_ENDPOINT, {"model": _MODEL, "prompt": text})
     embedding = data.get("embedding")
-    if not isinstance(embedding, list):
+    if embedding is None:
         raise EmbeddingError(
             f"missing 'embedding' field in response from {_LEGACY_ENDPOINT}"
         )
-    return embedding
+    return _validate_vector(
+        embedding, f"Ollama embedding ({_LEGACY_ENDPOINT})",
+    )
 
 
 # ── Public surface ──────────────────────────────────────────────────────────

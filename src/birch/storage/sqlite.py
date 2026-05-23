@@ -587,7 +587,20 @@ class SQLiteBackend:
                         break
                 if bad:
                     raise ValueError("corrupted JSON cell")
-                out.append(MetaFact.from_dict(dict(r)))
+                meta = MetaFact.from_dict(dict(r))
+                # Round-11: round-trip for legitimately empty MetaFacts
+                # is preserved (tests/migrations), but a persisted body
+                # with no lineage at all is operationally suspicious —
+                # nothing in the compactor path produces one. Log so an
+                # operator can spot manual-edit / migration drift, but
+                # don't drop (would break the round-trip contract).
+                if not meta.source_fact_ids and not meta.source_texts:
+                    _logger.warning(
+                        "SQLite load_meta_facts: meta_id=%r has empty "
+                        "lineage (no source_fact_ids, no source_texts)",
+                        meta.meta_id,
+                    )
+                out.append(meta)
             except Exception as exc:
                 meta_id = r["meta_id"] if "meta_id" in r.keys() else "?"
                 _logger.warning(

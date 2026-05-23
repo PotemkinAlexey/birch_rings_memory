@@ -1591,6 +1591,15 @@ class MemoryStore:
           - if a session is active, fact_id is attributed to it so the
             session's resonance later propagates back to its gravity.
         """
+        # top_k guard at the core boundary. The server layer rejects
+        # non-positive top_k with a structured response (round 10), but
+        # MemoryStore.query is a public core API used in tests and
+        # embedded mode too — a negative top_k would slice
+        # results[:top_k] from the right end (returning all-except-last),
+        # not return "nothing". That is a Python-list semantics trap;
+        # close it at the core. (Also skips a needless embed roundtrip.)
+        if top_k <= 0:
+            return []
         # Embed outside the lock.
         vec = embed(text)
         prefix = subject_prefix.lower() if subject_prefix else None

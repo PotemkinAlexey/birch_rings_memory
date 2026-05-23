@@ -10,6 +10,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from .memory_store import MemoryStore
+from .resonance.embeddings import EmbeddingError
 
 _DB_PATH = os.environ.get("BIRCH_DB", str(Path.home() / ".birch" / "memory.db"))
 Path(_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -17,6 +18,26 @@ Path(_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 _store = MemoryStore(db_path=_DB_PATH)
 
 mcp = FastMCP("BirchKM")
+
+
+def _embedding_error_response(exc: EmbeddingError) -> dict:
+    """Wrap an EmbeddingError as the structured failure shape MCP tools
+    return when the embedding provider is unreachable / misconfigured.
+
+    Symmetric with forecast_memory's DimensionMismatchError wrapper:
+    agent gets ``{"ok": False, "error": ..., "detail", "hint"}`` instead
+    of a raw stacktrace, and the hint points at the three knobs the
+    user actually controls.
+    """
+    return {
+        "ok": False,
+        "error": "embedding_provider_unavailable",
+        "detail": str(exc),
+        "hint": (
+            "Start Ollama, set BIRCH_EMBED_MODEL to a model the provider "
+            "knows, or set BIRCH_EMBED_PROVIDER=mock for offline use."
+        ),
+    }
 
 
 @mcp.tool()
@@ -56,6 +77,7 @@ def query_memory(
     if top_k <= 0:
         return {"results": [], "error": "invalid_top_k",
                 "_hint": "top_k must be positive"}
+    requested_top_k = top_k
     if top_k > 50:
         top_k = 50
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
@@ -77,16 +99,19 @@ def query_memory(
         allowed = {layer_map[name] for name in layers}
     else:
         allowed = None
-    results = _store.query(
-        text,
-        top_k=top_k,
-        hawking=True,
-        session_id=session_id,
-        min_similarity=min_similarity,
-        subject_prefix=subject_prefix,
-        min_gravity=min_gravity,
-        allowed_layers=allowed,
-    )
+    try:
+        results = _store.query(
+            text,
+            top_k=top_k,
+            hawking=True,
+            session_id=session_id,
+            min_similarity=min_similarity,
+            subject_prefix=subject_prefix,
+            min_gravity=min_gravity,
+            allowed_layers=allowed,
+        )
+    except EmbeddingError as exc:
+        return _embedding_error_response(exc)
     hits = [r.to_mcp_dict() for r in results]
 
     # conflict_hints: same (subject, predicate) with different objects.
@@ -129,7 +154,12 @@ def query_memory(
         )
     else:
         hint = "call session_close when the conversation ends to propagate resonance to gravity"
-    response: dict = {"results": hits, "_hint": hint}
+    response: dict = {"results": hits, "_hint": hint,
+                      "effective_top_k": top_k}
+    if requested_top_k != top_k:
+        response["_warning"] = (
+            f"top_k capped at {top_k} (requested {requested_top_k})"
+        )
     if conflicts:
         response["conflicts"] = conflicts
     return response
@@ -158,10 +188,13 @@ def record_fact(
     # Transaction-honest: add_fact returns created from inside its own
     # write txn, so there's no race window between a fact_exists probe and
     # the insert (same pattern set_fact uses since round 5).
-    fact, created = _store.add_fact(
-        subject, predicate, object,
-        session_id=session_id, return_status=True,
-    )
+    try:
+        fact, created = _store.add_fact(
+            subject, predicate, object,
+            session_id=session_id, return_status=True,
+        )
+    except EmbeddingError as exc:
+        return _embedding_error_response(exc)
     already_existed = not created
     similar: list[dict] = []
     if created and fact.vector:
@@ -218,6 +251,25 @@ def record_facts(
         missing = [k for k in required if k not in f or f[k] in (None, "")]
         if missing:
             invalid.append({"index": i, "missing": missing})
+            continue
+        # Type validation: round-9 caught missing/None/""; round 11
+        # catches the next layer — subject=123 / predicate=[] / object={}
+        # all pass the presence check but break embedding-text formatting
+        # and SPO normalisation downstream. Triples must be strings, and
+        # whitespace-only strings count as empty.
+        bad_type = [
+            k for k in required
+            if not isinstance(f[k], str) or not f[k].strip()
+        ]
+        if bad_type:
+            invalid.append({
+                "index": i,
+                "error": "invalid_field_type",
+                "bad_fields": bad_type,
+                "got_types": {
+                    k: type(f[k]).__name__ for k in bad_type
+                },
+            })
     if invalid:
         return {
             "ok": False,
@@ -234,12 +286,15 @@ def record_facts(
     # spelled out in the docstring. Items without their own session_id fall
     # back to the top-level argument.
     per_item_sids = [f.get("session_id") for f in facts]
-    statuses = _store.add_facts(
-        triples,
-        session_id=session_id,
-        session_ids=per_item_sids,
-        return_status=True,
-    )
+    try:
+        statuses = _store.add_facts(
+            triples,
+            session_id=session_id,
+            session_ids=per_item_sids,
+            return_status=True,
+        )
+    except EmbeddingError as exc:
+        return _embedding_error_response(exc)
     if not session_id:
         hint = (
             "open a session with session_open and pass session_id here "
@@ -443,6 +498,14 @@ def list_facts(
     if limit <= 0:
         return []
     if limit > 500:
+        # list_facts returns list[dict] of fact rows; injecting a warning
+        # dict at index 0 would break every consumer that iterates. Log
+        # the cap server-side instead — the agent can also detect the
+        # cap by len(result) == 500 against its requested limit.
+        import logging
+        logging.getLogger(__name__).warning(
+            "list_facts: limit capped at 500 (requested %d)", limit,
+        )
         limit = 500
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     # Validate enum: a typo used to silently produce target_layer=None,
@@ -510,23 +573,33 @@ def find_similar(
             "hits": [],
             "_warning": "top_k must be positive",
         }
+    requested_top_k = top_k
     if top_k > 50:
         top_k = 50
-    hits = _store.find_similar(
-        text=text,
-        top_k=top_k,
-        min_similarity=min_similarity,
-        subject_prefix=subject_prefix,
-    )
-    return {
+    try:
+        hits = _store.find_similar(
+            text=text,
+            top_k=top_k,
+            min_similarity=min_similarity,
+            subject_prefix=subject_prefix,
+        )
+    except EmbeddingError as exc:
+        return _embedding_error_response(exc)
+    response: dict = {
         "query": text,
         "min_similarity": min_similarity,
         "hits": hits,
+        "effective_top_k": top_k,
         "_hint": (
             "use set_fact for slot-replace, supersede_fact(old, new) when the "
             "new fact is already recorded, retire_fact when no replacement"
         ),
     }
+    if requested_top_k != top_k:
+        response["_warning"] = (
+            f"top_k capped at {top_k} (requested {requested_top_k})"
+        )
+    return response
 
 
 @mcp.tool()
