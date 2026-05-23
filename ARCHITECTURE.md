@@ -72,10 +72,10 @@ startup and is updated on deprecation and on black-hole absorption.
 Gravity is recomputed every `tick()` from four components:
 
 ```
-gravity = 0.35 × freshness   (decays from creation, ~2-week half-life)
-        + 0.20 × access      (log-scaled hits, decays from last touch)
-        + 0.35 × resonance   (avg session R, 0 until a session scores it)
-        + 0.10 × graph       (degree relative to the most-connected fact)
+gravity = w_freshness × freshness   (learned; prior 0.35; ~2-week half-life)
+        + w_access    × access      (learned; prior 0.20; log-scaled, ~3-day decay)
+        + 0.35        × resonance   (fixed: observation, not prediction)
+        + w_graph     × graph       (learned; prior 0.10; degree / max-degree)
 ```
 
 ### freshness
