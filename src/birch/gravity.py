@@ -23,6 +23,7 @@ class GravityBody(Protocol):
     created_at: float
     resonance_count: int
     recent_utility: float
+    forecast_stability: float
 
     @property
     def fact_id(self) -> str: ...
@@ -58,14 +59,19 @@ def pre_resonance_features(
     graph_degree: int = 0,
     max_degree: int = 1,
     now: float | None = None,
-) -> tuple[float, float, float, float]:
-    """Compute (freshness, access, graph, utility) — the features whose
-    weights are learned. Resonance is excluded on purpose: it is the
+) -> tuple[float, float, float, float, float]:
+    """Compute (freshness, access, graph, utility, stability) — the features
+    whose weights are learned. Resonance is excluded on purpose: it is the
     *target* of the learning, not a predictor of it.
 
     ``utility`` is the fact's stored ``recent_utility`` EWMA — a slow-
     moving prior on how useful this fact has been in recent sessions,
     independent of how often it was touched.
+
+    ``stability`` is the fact's stored ``forecast_stability`` — the
+    galaxy's prediction of how far this body will be from the horizon
+    after a short forward simulation. 1.0 = safely on surface, 0.0 =
+    predicted to fall, 0.5 = no forecast available (neutral prior).
     """
     now = now or time.time()
 
@@ -80,8 +86,10 @@ def pre_resonance_features(
     graph_score = min(1.0, graph_degree / max(1, max_degree))
 
     utility = max(0.0, min(1.0, float(getattr(fact, "recent_utility", 0.5))))
+    stability = max(0.0, min(1.0,
+                             float(getattr(fact, "forecast_stability", 0.5))))
 
-    return freshness, access_score, graph_score, utility
+    return freshness, access_score, graph_score, utility, stability
 
 
 def compute_gravity(
@@ -100,7 +108,8 @@ def compute_gravity(
     if weights is None:
         weights = AdaptiveWeights.from_prior()
 
-    freshness, access_score, graph_score, utility = pre_resonance_features(
+    (freshness, access_score, graph_score,
+     utility, stability) = pre_resonance_features(
         fact, graph_degree, max_degree, now)
 
     if fact.resonance_count > 0:
@@ -113,6 +122,7 @@ def compute_gravity(
         + weights.w_access * access_score
         + weights.w_graph * graph_score
         + weights.w_utility * utility
+        + weights.w_stability * stability
         + _W_RESONANCE * resonance_score
     )
     return round(min(1.0, max(0.0, gravity)), 4)

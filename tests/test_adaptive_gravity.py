@@ -9,7 +9,7 @@ from birch.storage.sqlite import SQLiteBackend
 def test_from_prior_matches_the_legacy_formula():
     w = AdaptiveWeights.from_prior()
     assert (
-        w.w_freshness, w.w_access, w.w_graph, w.w_utility
+        w.w_freshness, w.w_access, w.w_graph, w.w_utility, w.w_stability
     ) == AdaptiveWeights.PRIOR
     assert w.train_count == 0
 
@@ -20,7 +20,7 @@ def test_consistent_signal_nudges_the_relevant_weight_up():
     start = w.w_freshness
     for _ in range(40):
         w.update(
-            freshness=1.0, access=0.0, graph=0.0, utility=0.0, target=1.0,
+            freshness=1.0, access=0.0, graph=0.0, utility=0.0, stability=0.0, target=1.0,
         )
     assert w.w_freshness > start
     assert w.train_count == 40
@@ -30,12 +30,14 @@ def test_weights_stay_in_budget_and_non_negative():
     w = AdaptiveWeights.from_prior()
     for _ in range(200):
         w.update(
-            freshness=1.0, access=0.0, graph=0.0, utility=0.0, target=1.0,
+            freshness=1.0, access=0.0, graph=0.0, utility=0.0, stability=0.0, target=1.0,
         )
-    total = w.w_freshness + w.w_access + w.w_graph + w.w_utility
+    total = (
+        w.w_freshness + w.w_access + w.w_graph + w.w_utility + w.w_stability
+    )
     assert abs(total - AdaptiveWeights.BUDGET) < 1e-9
     assert min(
-        w.w_freshness, w.w_access, w.w_graph, w.w_utility
+        w.w_freshness, w.w_access, w.w_graph, w.w_utility, w.w_stability
     ) >= 0.0
 
 
@@ -44,14 +46,14 @@ def test_regularisation_pulls_back_toward_the_prior():
     w = AdaptiveWeights.from_prior()
     for _ in range(80):
         w.update(
-            freshness=1.0, access=0.0, graph=0.0, utility=0.0, target=1.0,
+            freshness=1.0, access=0.0, graph=0.0, utility=0.0, stability=0.0, target=1.0,
         )
     pumped = w.w_freshness
     # Feed neutral signal (target equals the model's own prediction → err = 0)
     # so only the regularisation term acts.
     for _ in range(80):
-        pred = w.predict(0.5, 0.5, 0.5, 0.5)
-        w.update(0.5, 0.5, 0.5, 0.5, target=pred)
+        pred = w.predict(0.5, 0.5, 0.5, 0.5, 0.5)
+        w.update(0.5, 0.5, 0.5, 0.5, 0.5, target=pred)
     assert w.w_freshness < pumped
 
 
@@ -61,9 +63,22 @@ def test_utility_weight_learns_when_utility_predicts_value():
     start = w.w_utility
     for _ in range(60):
         w.update(
-            freshness=0.0, access=0.0, graph=0.0, utility=1.0, target=1.0,
+            freshness=0.0, access=0.0, graph=0.0, utility=1.0,
+            stability=0.0, target=1.0,
         )
     assert w.w_utility > start
+
+
+def test_stability_weight_learns_when_stability_predicts_value():
+    """If forecast_stability lines up with the target, w_stability climbs."""
+    w = AdaptiveWeights.from_prior()
+    start = w.w_stability
+    for _ in range(60):
+        w.update(
+            freshness=0.0, access=0.0, graph=0.0, utility=0.0,
+            stability=1.0, target=1.0,
+        )
+    assert w.w_stability > start
 
 
 def test_compute_gravity_with_prior_matches_the_default():
@@ -81,6 +96,7 @@ def test_sqlite_roundtrip_of_adaptive_weights(tmp_path):
     assert backend.load_adaptive_weights() is None
     weights = AdaptiveWeights(
         w_freshness=0.40, w_access=0.15, w_graph=0.10, w_utility=0.05,
+        w_stability=0.03,
         train_count=7,
     )
     backend.save_adaptive_weights(weights)
@@ -91,6 +107,7 @@ def test_sqlite_roundtrip_of_adaptive_weights(tmp_path):
     assert abs(loaded.w_access - 0.15) < 1e-9
     assert abs(loaded.w_graph - 0.10) < 1e-9
     assert abs(loaded.w_utility - 0.05) < 1e-9
+    assert abs(loaded.w_stability - 0.03) < 1e-9
     assert loaded.train_count == 7
 
 
@@ -116,6 +133,7 @@ def test_memory_store_learns_one_step_per_resonant_session(tmp_path):
         + weights["w_access"]
         + weights["w_graph"]
         + weights["w_utility"]
+        + weights["w_stability"]
     )
     assert abs(total - AdaptiveWeights.BUDGET) < 1e-3
 

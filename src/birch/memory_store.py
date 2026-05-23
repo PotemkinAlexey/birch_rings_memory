@@ -747,7 +747,9 @@ class MemoryStore:
                 # weights learn what predicted realised value *before* it.
                 now_ts = time.time()
                 max_deg = max(self._engine._degrees.values(), default=1)
-                training_features: list[tuple[float, float, float, float]] = []
+                training_features: list[
+                    tuple[float, float, float, float, float]
+                ] = []
                 for fid in facts_snapshot:
                     f = self._facts.get(fid)
                     if f is not None and f.resonance_count == 0:
@@ -824,9 +826,10 @@ class MemoryStore:
                     mean_a = sum(f[1] for f in training_features) / n
                     mean_g = sum(f[2] for f in training_features) / n
                     mean_u = sum(f[3] for f in training_features) / n
+                    mean_s = sum(f[4] for f in training_features) / n
                     target = max(0.0, min(1.0, (result.r + 1.0) / 2.0))
                     self._engine.weights.update(
-                        mean_f, mean_a, mean_g, mean_u, target=target,
+                        mean_f, mean_a, mean_g, mean_u, mean_s, target=target,
                     )
                     if self._storage and hasattr(self._storage, "save_adaptive_weights"):
                         self._storage.save_adaptive_weights(self._engine.weights)
@@ -942,6 +945,69 @@ class MemoryStore:
         self._inflight_collapse = self._collapse_executor.submit(
             self.collapse_singularity,
         )
+
+    def run_forecast(self, horizon_ticks: int = 50) -> dict:
+        """Run a galaxy forecast and write ``forecast_stability`` back to facts.
+
+        The galaxy module models a fact as a body in orbit around a central
+        black hole; running it forward gives a per-fact prediction of how
+        close that body will be to the event horizon after ``horizon_ticks``
+        steps. Stability ∈ [0, 1]: 1.0 = predicted safely on surface,
+        0.0 = predicted to fall, 0.5 = neutral prior (default for facts the
+        galaxy could not place).
+
+        The value is stored on FactPassport.forecast_stability and consumed
+        by the adaptive gravity formula via ``w_stability`` — so this call
+        materially feeds back into how the formula scores facts on the next
+        tick. The galaxy build + simulation is O(n²) per step in fact count
+        and pure numpy, fine for the few hundred to few thousand facts a
+        personal store holds. Returns a small summary; full per-fact values
+        are persisted, not returned.
+        """
+        from .galaxy.forecast import forecast_stability
+
+        with self._lock:
+            with self._txn():
+                self._sync()
+                facts_snapshot = list(self._facts.values())
+
+        # The simulation itself is pure numpy and reads no shared state —
+        # run it OUTSIDE the lock so other agents can keep querying.
+        scores = forecast_stability(facts_snapshot, horizon_ticks=horizon_ticks)
+
+        with self._lock:
+            with self._txn():
+                self._sync()
+                updated = 0
+                for fid, score in scores.items():
+                    fact = self._facts.get(fid)
+                    if fact is None:
+                        continue
+                    fact.forecast_stability = float(score)
+                    updated += 1
+                if updated and self._storage:
+                    self._storage.save_facts(
+                        [f for f in self._facts.values()
+                         if f.fact_id in scores]
+                    )
+
+        # Quick distribution snapshot so the caller can see what landed.
+        ranges = {"safe": 0, "kinetic": 0, "near_horizon": 0, "predicted_fall": 0}
+        for score in scores.values():
+            if score >= 0.7:
+                ranges["safe"] += 1
+            elif score >= 0.3:
+                ranges["kinetic"] += 1
+            elif score > 0.0:
+                ranges["near_horizon"] += 1
+            else:
+                ranges["predicted_fall"] += 1
+        return {
+            "horizon_ticks": horizon_ticks,
+            "facts_forecasted": len(scores),
+            "facts_updated": updated,
+            "distribution": ranges,
+        }
 
     def close(self) -> None:
         """Release the background executor and close the storage layer.

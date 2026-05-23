@@ -34,6 +34,12 @@ class FactPassport:
     # Default 0.5 = Bayesian neutral prior; untouched facts get a soft floor.
     recent_utility: float = 0.5
 
+    # Galaxy-derived forecast: how far this fact will be from the horizon
+    # after a short forward simulation. 1.0 = predicted safely on surface,
+    # 0.0 = predicted to fall, 0.5 = unknown / no forecast run yet.
+    # Updated by MemoryStore.run_forecast(); not touched per session.
+    forecast_stability: float = 0.5
+
     @property
     def is_deprecated(self) -> bool:
         return self.deprecated_by is not None

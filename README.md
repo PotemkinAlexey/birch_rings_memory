@@ -66,11 +66,12 @@ into toxic territory, pulling down the gravity of facts it used.
 ### Gravity engine
 
 ```
-gravity = w_freshness × freshness        (learned; prior 0.30; ~2-week half-life)
-        + w_access    × access           (learned; prior 0.15; log-scaled, ~3-day decay)
-        + w_graph     × graph            (learned; prior 0.10; degree / max-degree)
-        + w_utility   × recent_utility   (learned; prior 0.10; EWMA of closure-weighted R)
-        + 0.35        × resonance        (fixed: observation, not prediction)
+gravity = w_freshness × freshness            (learned; prior 0.28; ~2-week half-life)
+        + w_access    × access               (learned; prior 0.14; log-scaled, ~3-day decay)
+        + w_graph     × graph                (learned; prior 0.09; degree / max-degree)
+        + w_utility   × recent_utility       (learned; prior 0.09; EWMA of closure-weighted R)
+        + w_stability × forecast_stability   (learned; prior 0.05; galaxy forward forecast)
+        + 0.35        × resonance            (fixed: observation, not prediction)
 ```
 
 The **freshness** term is a grace period — a new fact rides high and is not
@@ -90,17 +91,30 @@ gets a soft floor and does not need to "prove itself" to escape junk
 status. Positive context is emergent: the user never labels anything, the
 gravity formula learns the attribution.
 
-**The four pre-resonance weights are learned, not hand-set.** Freshness,
-access, graph and utility each carry a weight that starts at the values
-above (the prior) and adapts to the user's own resonance feedback — one
-regularised SGD step per closed session, fit against `(R+1)/2` as ground
-truth. The resonance weight stays fixed at 0.35: resonance is
-observation, not prediction. A budget renormalisation keeps the four
-learned weights summing to 0.65 so the formula stays in `[0, 1]`.
-`memory_stats` exposes the live weights and the training count so the
-formula stays legible — at zero data behaviour is identical to the
-hand-tuned prior, and as the store is used the weights drift toward
-what predicts value *for you*.
+**`forecast_stability`** is the galaxy's forecast — built by running the
+N-body model forward `horizon_ticks` steps and reading off how far each
+body finished from the event horizon. 1.0 = safely on the surface ring,
+0.0 = crossed the horizon during the simulation, 0.5 = no forecast yet
+(neutral prior). It is the only adaptive feature that reads from the
+*future*; the others are all derived from a fact's current local state.
+Triggered explicitly via the `forecast_memory` MCP tool, not on every
+session_close (the simulation is O(n²)). The galaxy was the telescope;
+this turns it into a producer of features the live formula consumes.
+
+**The five pre-resonance weights are learned, not hand-set.** Freshness,
+access, graph, utility and stability each carry a weight that starts at
+the values above (the prior) and adapts to the user's own resonance
+feedback — one regularised SGD step per closed session, fit against
+`(R+1)/2` as ground truth. The resonance weight stays fixed at 0.35:
+resonance is observation, not prediction. A budget renormalisation keeps
+the five learned weights summing to 0.65 so the formula stays in
+`[0, 1]`. `memory_stats` exposes the live weights and the training count
+so the formula stays legible — at zero data behaviour is identical to
+the hand-tuned prior, and as the store is used the weights drift toward
+what predicts value *for you*. A feature that turns out to have no
+predictive power simply has its weight stay near its prior; useful ones
+climb. The forecast feature is a clean example: `w_stability` only grows
+if galaxy predictions correlate with realised session outcomes.
 
 Layer migration happens on every `session_close()`. Each tick a fact steps
 one layer **toward the layer its gravity belongs in** — surface above 0.70,
@@ -194,7 +208,7 @@ so polymorphic `query()` does four scans without ID collisions.
 | `resonance/echo.py` | Cross-session echo detection + retroactive penalty + TTL sweep |
 | `resonance/cluster.py` | K-means++ bundle for session storage |
 | `resonance/embeddings.py` | Ollama batch embedding client |
-| `galaxy/` | N-body research model — facts as orbiting bodies (see below) |
+| `galaxy/` | N-body research model — facts as orbiting bodies (see below); now also a feature producer via `galaxy/forecast.py` |
 
 ---
 
@@ -346,7 +360,7 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Claude then has twelve tools:
+Claude then has thirteen tools:
 
 | Tool | What it does |
 |---|---|
@@ -361,6 +375,7 @@ Claude then has twelve tools:
 | `session_push` | Append a user message to an open session |
 | `session_close` | Close a session — score resonance, update gravity, detect echo |
 | `record_session` | Score a completed session in one call (open + push messages + close) |
+| `forecast_memory` | Run the galaxy forward and write a per-fact stability prediction back into the live store; feeds the adaptive gravity formula via `w_stability` |
 | `memory_stats` | Report layer distribution, black hole status, and live adaptive weights |
 
 `query_memory` returns polymorphic hits. Every item has `kind`, `body_id`, `similarity`,

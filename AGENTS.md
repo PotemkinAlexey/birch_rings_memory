@@ -241,6 +241,23 @@ Treat MetaFact hits as **aggregated leads, not citable statements**:
 
 ---
 
+## forecast_memory
+
+The galaxy isn't just a picture any more — `forecast_memory(horizon_ticks=50)`
+runs the N-body model forward and writes a per-fact stability prediction back
+into the live store. Stability ∈ [0, 1]: 1.0 = body finished safely on the
+surface ring after the simulation, 0.0 = it crossed the event horizon (predicted
+to fall), 0.5 = neutral prior (untouched facts).
+
+The adaptive gravity formula consumes this via `w_stability`, so calling
+`forecast_memory` materially affects what gravity ranks high on the next tick.
+
+Call it sparingly — once per day, or at the start of a new long-running
+agent session. The simulation is O(n²) per step and isn't meant for the
+per-write path.
+
+---
+
 ## memory_stats
 
 Call at session start if you suspect memory is growing stale or the user

@@ -5,16 +5,17 @@ The gravity formula has the shape
     gravity = w_freshness · freshness
             + w_access    · access
             + w_graph     · graph
-            + w_utility   · recent_utility    (EWMA of closure-weighted R)
-            + 0.35        · resonance         (fixed: resonance is observation)
+            + w_utility   · recent_utility       (EWMA of closure-weighted R)
+            + w_stability · forecast_stability   (galaxy forward forecast)
+            + 0.35        · resonance            (fixed: observation, not prediction)
 
-Four of those weights were hand-set magic numbers — the personalised
+Five of those weights were hand-set magic numbers — the personalised
 ones, "what predicts a fact's value *before* the user has reacted to
 it this session". This module makes them learned from the user's own
 resonance feedback: every closed session contributes one regularised
 SGD step toward predicting realised value from
-(freshness, access, graph, recent_utility) measured before that
-resonance landed.
+(freshness, access, graph, recent_utility, forecast_stability) measured
+before that resonance landed.
 
 The learner is deliberately simple — a regularised linear model,
 budgeted and clamped — so the weights stay legible (you can always
@@ -29,17 +30,20 @@ from typing import ClassVar
 
 @dataclass
 class AdaptiveWeights:
-    """The four pre-resonance weights — learned from resonance feedback."""
+    """The five pre-resonance weights — learned from resonance feedback."""
 
     w_freshness: float
     w_access: float
     w_graph: float
     w_utility: float
+    w_stability: float
     train_count: int = 0
 
-    # Hand-set prior — the weights at zero data.
-    PRIOR: ClassVar[tuple[float, float, float, float]] = (0.30, 0.15, 0.10, 0.10)
-    # Pre-resonance budget — the four weights sum to BUDGET. Resonance
+    # Hand-set prior — the weights at zero data. Sum equals BUDGET.
+    PRIOR: ClassVar[tuple[float, float, float, float, float]] = (
+        0.28, 0.14, 0.09, 0.09, 0.05,
+    )
+    # Pre-resonance budget — the five weights sum to BUDGET. Resonance
     # carries the remaining 0.35, fixed by design.
     BUDGET: ClassVar[float] = 0.65
     LR: ClassVar[float] = 0.05       # SGD step size
@@ -55,12 +59,14 @@ class AdaptiveWeights:
         access: float,
         graph: float,
         utility: float,
+        stability: float,
     ) -> float:
         return (
             self.w_freshness * freshness
             + self.w_access * access
             + self.w_graph * graph
             + self.w_utility * utility
+            + self.w_stability * stability
         )
 
     def update(
@@ -69,6 +75,7 @@ class AdaptiveWeights:
         access: float,
         graph: float,
         utility: float,
+        stability: float,
         target: float,
     ) -> None:
         """One regularised SGD step toward ``target`` ∈ [0, 1].
@@ -77,24 +84,28 @@ class AdaptiveWeights:
         the first-resonance training event, ``(R + 1) / 2`` of the
         session's R.
         """
-        err = target - self.predict(freshness, access, graph, utility)
+        err = target - self.predict(freshness, access, graph, utility, stability)
         self.w_freshness += self.LR * err * freshness
         self.w_access    += self.LR * err * access
         self.w_graph     += self.LR * err * graph
         self.w_utility   += self.LR * err * utility
+        self.w_stability += self.LR * err * stability
         # Pull each weight back toward its prior — regularisation.
         self.w_freshness += self.REG * (self.PRIOR[0] - self.w_freshness)
         self.w_access    += self.REG * (self.PRIOR[1] - self.w_access)
         self.w_graph     += self.REG * (self.PRIOR[2] - self.w_graph)
         self.w_utility   += self.REG * (self.PRIOR[3] - self.w_utility)
+        self.w_stability += self.REG * (self.PRIOR[4] - self.w_stability)
         # Clamp non-negative.
         self.w_freshness = max(0.0, self.w_freshness)
         self.w_access    = max(0.0, self.w_access)
         self.w_graph     = max(0.0, self.w_graph)
         self.w_utility   = max(0.0, self.w_utility)
+        self.w_stability = max(0.0, self.w_stability)
         # Renormalise to the budget so gravity stays in [0, 1].
         total = (
-            self.w_freshness + self.w_access + self.w_graph + self.w_utility
+            self.w_freshness + self.w_access + self.w_graph
+            + self.w_utility + self.w_stability
         )
         if total > 0.0:
             scale = self.BUDGET / total
@@ -102,9 +113,10 @@ class AdaptiveWeights:
             self.w_access *= scale
             self.w_graph *= scale
             self.w_utility *= scale
+            self.w_stability *= scale
         else:
-            (self.w_freshness, self.w_access,
-             self.w_graph, self.w_utility) = self.PRIOR
+            (self.w_freshness, self.w_access, self.w_graph,
+             self.w_utility, self.w_stability) = self.PRIOR
         self.train_count += 1
 
     def as_dict(self) -> dict[str, float | int]:
@@ -114,5 +126,6 @@ class AdaptiveWeights:
             "w_access": round(self.w_access, 4),
             "w_graph": round(self.w_graph, 4),
             "w_utility": round(self.w_utility, 4),
+            "w_stability": round(self.w_stability, 4),
             "train_count": self.train_count,
         }

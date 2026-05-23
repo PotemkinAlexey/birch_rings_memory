@@ -14,14 +14,16 @@ def test_default_is_neutral_prior():
     assert f.recent_utility == 0.5
 
 
-def test_pre_resonance_features_returns_four_values():
+def test_pre_resonance_features_returns_five_values():
     f = FactPassport("api", "runs on", "Go")
     feats = pre_resonance_features(f, graph_degree=0, max_degree=1)
-    assert len(feats) == 4
-    freshness, access, graph, utility = feats
+    assert len(feats) == 5
+    freshness, access, graph, utility, stability = feats
     assert 0.0 <= utility <= 1.0
-    # An untouched fact carries the 0.5 prior.
+    assert 0.0 <= stability <= 1.0
+    # An untouched fact carries the 0.5 prior on both EWMA / forecast.
     assert abs(utility - 0.5) < 1e-9
+    assert abs(stability - 0.5) < 1e-9
 
 
 def test_sqlite_roundtrips_recent_utility(tmp_path):

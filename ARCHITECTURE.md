@@ -69,14 +69,15 @@ startup and is updated on deprecation and on black-hole absorption.
 
 ## Gravity engine
 
-Gravity is recomputed every `tick()` from five components:
+Gravity is recomputed every `tick()` from six components:
 
 ```
-gravity = w_freshness × freshness        (learned; prior 0.30; ~2-week half-life)
-        + w_access    × access           (learned; prior 0.15; log-scaled, ~3-day decay)
-        + w_graph     × graph            (learned; prior 0.10; degree / max-degree)
-        + w_utility   × recent_utility   (learned; prior 0.10; EWMA of closure-weighted R)
-        + 0.35        × resonance        (fixed: observation, not prediction)
+gravity = w_freshness × freshness            (learned; prior 0.28; ~2-week half-life)
+        + w_access    × access               (learned; prior 0.14; log-scaled, ~3-day decay)
+        + w_graph     × graph                (learned; prior 0.09; degree / max-degree)
+        + w_utility   × recent_utility       (learned; prior 0.09; EWMA of closure-weighted R)
+        + w_stability × forecast_stability   (learned; prior 0.05; galaxy forward forecast)
+        + 0.35        × resonance            (fixed: observation, not prediction)
 ```
 
 ### freshness
@@ -145,6 +146,35 @@ prior, so it contributes `w_utility · 0.5` to gravity from day one and
 does not need a session to "prove itself" before it stops looking like
 junk.
 
+### forecast_stability
+
+```
+forecast_stability = clip((radius_after_N_ticks − horizon) / (r_surface − horizon), 0, 1)
+default            = 0.5      # no forecast run yet — neutral prior
+absorbed           = 0.0      # crossed the horizon during the forecast
+```
+
+The N-body galaxy is built from current facts via the shared loader,
+advanced `horizon_ticks` integrator steps (default 50), and the
+finishing radius of every body becomes its stability score. Bodies that
+crossed the event horizon during the run get 0.0; survivors get a
+linear interpolation between the horizon and the surface ring.
+
+It is the only adaptive feature that consults a fact's *future*: a
+fact whose current local features (freshness, access, graph) look fine
+but whose orbital trajectory will fall in 30 ticks gets a low stability
+and is pulled toward the black hole *before* the local features
+register the trouble. Conversely, a fact spiralling outward into a
+stable orbit because of resonance kicks gets a high stability even if
+it is still numerically near the core.
+
+Updated explicitly via `MemoryStore.run_forecast(horizon_ticks)`
+(exposed as the `forecast_memory` MCP tool), NOT on every
+`session_close` — the simulation is O(n²·steps) and is meant to be a
+periodic batch job, not a per-write hook. Each forecast pass writes
+back to every live FactPassport's `forecast_stability` and persists the
+update.
+
 ### Positive context is emergent, not assigned
 
 We deliberately do not ask the user to label facts ("👍 / 👎", "scope =
@@ -166,23 +196,28 @@ user produced organically by closing a session.
 
 ### Adaptive weights — the formula learns
 
-The four pre-resonance weights (freshness, access, graph, utility) are
-not hand-set magic numbers any more. They live in ``AdaptiveWeights``
-and are learned from the user's own resonance feedback:
+The five pre-resonance weights (freshness, access, graph, utility,
+stability) are not hand-set magic numbers any more. They live in
+``AdaptiveWeights`` and are learned from the user's own resonance
+feedback:
 
 - Behaviour at zero data is identical to the prior
-  `(0.30, 0.15, 0.10, 0.10)`, so flipping the switch is safe.
+  `(0.28, 0.14, 0.09, 0.09, 0.05)`, so flipping the switch is safe.
 - Each `session_close` snapshots
-  `(freshness, access, graph, recent_utility)` for every fact about to
-  receive its *first* resonance, averages those, and takes one
-  regularised SGD step toward `(R + 1) / 2`. The non-circularity is the
-  point: the weights learn what predicts realised value *before* a fact
-  has been reacted to this session.
+  `(freshness, access, graph, recent_utility, forecast_stability)` for
+  every fact about to receive its *first* resonance, averages those,
+  and takes one regularised SGD step toward `(R + 1) / 2`. The
+  non-circularity is the point: the weights learn what predicts
+  realised value *before* a fact has been reacted to this session.
 - A regularisation term pulls each weight back toward the prior every
-  step; a budget renormalisation keeps `w_freshness + w_access +
-  w_graph + w_utility = 0.65` so the formula stays in `[0, 1]`.
+  step; a budget renormalisation keeps the five learned weights summing
+  to `0.65` so the formula stays in `[0, 1]`.
 - The resonance weight stays fixed at `0.35`: resonance is observation,
   not prediction.
+- A feature that turns out not to predict realised value just has its
+  weight stay near the prior. `w_stability` only grows if galaxy
+  forecasts actually correlate with session outcomes for this user; a
+  useless feature gets weighted near zero, no manual tuning needed.
 
 Weights persist in a singleton SQLite row and round-trip via the
 `StorageBackend` protocol's `save_adaptive_weights` / `load_adaptive_weights`.
@@ -621,12 +656,14 @@ store hits as soon as a second client connects.
 
 ---
 
-## Galaxy — the N-body research model
+## Galaxy — the N-body research model (and a feature producer)
 
-`birch/galaxy/` is a research model that sits *beside* the live engine,
-not inside it — the MCP server still scores facts with `compute_gravity`.
-The galaxy makes the metaphor literal: instead of a scoring formula,
-facts are bodies in orbit and the physics is simulated directly.
+`birch/galaxy/` started as a research model that sits *beside* the live
+engine, not inside it — the MCP server still scores facts with
+`compute_gravity`. It still does that, but it now also produces a
+feature that the live formula consumes: `forecast_stability`. The
+galaxy makes the metaphor literal: instead of a scoring formula, facts
+are bodies in orbit and the physics is simulated directly.
 
 - **engine.py** — a 2D N-body integrator: a central black hole, leapfrog
   integration, softened gravity, dynamical friction. A body's orbital
@@ -646,6 +683,11 @@ facts are bodies in orbit and the physics is simulated directly.
   store: facts at forgetting-risk, emergent topic clusters, MetaFact
   candidates.
 - **render.py** — matplotlib stills and animated GIFs.
+- **forecast.py** — the producer arm. Builds the galaxy from current
+  facts, advances `horizon_ticks` steps, and reports per-fact stability
+  in `[0, 1]`. Wired into the live formula via the 5th adaptive feature
+  `forecast_stability`; triggered by `MemoryStore.run_forecast` (MCP
+  tool `forecast_memory`).
 
 Run `python -m birch.galaxy` to replay and diagnose the real store. One
 finding from the model: an off-centre attractor in a black-hole-dominated
@@ -687,6 +729,7 @@ src/birch/
     collapse.py             friends-of-friends + Jeans collapse into MetaFacts
     report.py               diagnose the settled galaxy
     render.py               matplotlib stills and animated GIFs
+    forecast.py             feature producer: per-fact stability for the adaptive formula
 ```
 
 ---

@@ -42,6 +42,7 @@ class MetaFact:
     resonance_sum: float = 0.0
     resonance_count: int = 0
     recent_utility: float = 0.5
+    forecast_stability: float = 0.5
 
     # ── Polymorphism shims for code that ducks on FactPassport ──────────────
     # FactPassport carries optional ttl/deprecated_by fields; MetaFacts cannot
@@ -113,6 +114,7 @@ class MetaFact:
             "resonance_sum": self.resonance_sum,
             "resonance_count": self.resonance_count,
             "recent_utility": self.recent_utility,
+            "forecast_stability": self.forecast_stability,
         }
 
     @classmethod
@@ -132,6 +134,7 @@ class MetaFact:
             resonance_sum=float(row.get("resonance_sum", 0.0)),
             resonance_count=int(row.get("resonance_count", 0)),
             recent_utility=float(row.get("recent_utility", 0.5)),
+            forecast_stability=float(row.get("forecast_stability", 0.5)),
         )
 
 

@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS facts (
     last_accessed   REAL,
     resonance_sum   REAL DEFAULT 0.0,
     resonance_count INTEGER DEFAULT 0,
-    recent_utility  REAL DEFAULT 0.5
+    recent_utility  REAL DEFAULT 0.5,
+    forecast_stability REAL DEFAULT 0.5
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -68,7 +69,8 @@ CREATE TABLE IF NOT EXISTS meta_facts (
     last_accessed   REAL,
     resonance_sum   REAL DEFAULT 0.0,
     resonance_count INTEGER DEFAULT 0,
-    recent_utility  REAL DEFAULT 0.5
+    recent_utility  REAL DEFAULT 0.5,
+    forecast_stability REAL DEFAULT 0.5
 );
 
 CREATE TABLE IF NOT EXISTS adaptive_weights (
@@ -77,6 +79,7 @@ CREATE TABLE IF NOT EXISTS adaptive_weights (
     w_access        REAL NOT NULL,
     w_graph         REAL NOT NULL,
     w_utility       REAL NOT NULL DEFAULT 0.10,
+    w_stability     REAL NOT NULL DEFAULT 0.05,
     train_count     INTEGER NOT NULL DEFAULT 0,
     updated_at      REAL
 );
@@ -105,6 +108,7 @@ class SQLiteBackend:
         self._conn.executescript(_SCHEMA)
         self._migrate_echo_sessions()
         self._migrate_recent_utility()
+        self._migrate_forecast_stability()
         self._conn.commit()
 
     # ── Cross-process coordination ───────────────────────────────────────────
@@ -185,14 +189,43 @@ class SQLiteBackend:
                 "ADD COLUMN w_utility REAL NOT NULL DEFAULT 0.10"
             )
 
+    def _migrate_forecast_stability(self) -> None:
+        """Add forecast_stability / w_stability columns to older DBs."""
+        fact_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(facts)")
+        }
+        if "forecast_stability" not in fact_cols:
+            self._conn.execute(
+                "ALTER TABLE facts "
+                "ADD COLUMN forecast_stability REAL DEFAULT 0.5"
+            )
+        meta_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(meta_facts)")
+        }
+        if "forecast_stability" not in meta_cols:
+            self._conn.execute(
+                "ALTER TABLE meta_facts "
+                "ADD COLUMN forecast_stability REAL DEFAULT 0.5"
+            )
+        weight_cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(adaptive_weights)")
+        }
+        if "w_stability" not in weight_cols:
+            self._conn.execute(
+                "ALTER TABLE adaptive_weights "
+                "ADD COLUMN w_stability REAL NOT NULL DEFAULT 0.05"
+            )
+
     # ── Facts ────────────────────────────────────────────────────────────────
 
     _FACT_INSERT = (
         "INSERT OR REPLACE INTO facts "
         "(fact_id, subject, predicate, object, vector, gravity_score, layer, "
         " created_at, ttl, source_session, deprecated_by, access_count, "
-        " last_accessed, resonance_sum, resonance_count, recent_utility) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " last_accessed, resonance_sum, resonance_count, recent_utility, "
+        " forecast_stability) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -205,6 +238,7 @@ class SQLiteBackend:
             fact.access_count, fact.last_accessed,
             fact.resonance_sum, fact.resonance_count,
             fact.recent_utility,
+            fact.forecast_stability,
         )
 
     def save_fact(self, fact: FactPassport) -> None:
@@ -238,6 +272,12 @@ class SQLiteBackend:
                 recent_utility=(
                     r["recent_utility"]
                     if "recent_utility" in r.keys() and r["recent_utility"] is not None
+                    else 0.5
+                ),
+                forecast_stability=(
+                    r["forecast_stability"]
+                    if "forecast_stability" in r.keys()
+                    and r["forecast_stability"] is not None
                     else 0.5
                 ),
             )
@@ -366,8 +406,9 @@ class SQLiteBackend:
         "INSERT OR REPLACE INTO meta_facts "
         "(meta_id, vector, weight, source_texts, source_fact_ids, summary, "
         " gravity_score, created_at, layer, access_count, last_accessed, "
-        " resonance_sum, resonance_count, recent_utility) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " resonance_sum, resonance_count, recent_utility, "
+        " forecast_stability) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -380,6 +421,7 @@ class SQLiteBackend:
             d["access_count"], d["last_accessed"],
             d["resonance_sum"], d["resonance_count"],
             d["recent_utility"],
+            d["forecast_stability"],
         )
 
     def save_meta_fact(self, meta: MetaFact) -> None:
@@ -410,14 +452,15 @@ class SQLiteBackend:
 
         self._conn.execute(
             "INSERT OR REPLACE INTO adaptive_weights "
-            "(id, w_freshness, w_access, w_graph, w_utility, "
+            "(id, w_freshness, w_access, w_graph, w_utility, w_stability, "
             " train_count, updated_at) "
-            "VALUES (1, ?, ?, ?, ?, ?, ?)",
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
             (
                 weights.w_freshness,
                 weights.w_access,
                 weights.w_graph,
                 weights.w_utility,
+                weights.w_stability,
                 weights.train_count,
                 _time.time(),
             ),
@@ -427,8 +470,8 @@ class SQLiteBackend:
     def load_adaptive_weights(self) -> AdaptiveWeights | None:
         """Return the persisted weights, or None if the store has none yet."""
         row = self._conn.execute(
-            "SELECT w_freshness, w_access, w_graph, w_utility, train_count "
-            "FROM adaptive_weights WHERE id = 1"
+            "SELECT w_freshness, w_access, w_graph, w_utility, w_stability, "
+            "train_count FROM adaptive_weights WHERE id = 1"
         ).fetchone()
         if row is None:
             return None
@@ -438,6 +481,9 @@ class SQLiteBackend:
             w_graph=row["w_graph"],
             w_utility=(
                 row["w_utility"] if row["w_utility"] is not None else 0.10
+            ),
+            w_stability=(
+                row["w_stability"] if row["w_stability"] is not None else 0.05
             ),
             train_count=int(row["train_count"]),
         )

@@ -207,6 +207,36 @@ def retire_fact(fact_id: str) -> dict:
 
 
 @mcp.tool()
+def forecast_memory(horizon_ticks: int = 50) -> dict:
+    """
+    Run the galaxy forward and write a per-fact stability prediction back.
+
+    For every live fact the galaxy simulates a body in orbit around the
+    central black hole. After ``horizon_ticks`` integrator steps each body
+    has either survived (its orbital radius gives a stability score in
+    [0, 1]) or crossed the event horizon (stability = 0). The score lands
+    on FactPassport.forecast_stability and is consumed by the adaptive
+    gravity formula via ``w_stability`` — facts the galaxy predicts to
+    fall earn a smaller gravity contribution from this feature, facts
+    predicted safe earn more.
+
+    The feature complements the local pre-resonance signals (freshness,
+    access, graph, recent_utility) with a forecast no local feature can
+    produce: it sees the body's *future*. Whether the forecast helps is
+    not assumed — ``w_stability`` is learned by the same SGD pass that
+    learns the other adaptive weights, so a useless forecast just sits
+    at its prior and contributes nothing.
+
+    Call at session start (or once per day) on a real store. Pure numpy,
+    O(n²) per step in fact count.
+
+    Returns a summary: how many facts were forecasted and updated, and a
+    coarse distribution across {safe / kinetic / near_horizon / predicted_fall}.
+    """
+    return _store.run_forecast(horizon_ticks=horizon_ticks)
+
+
+@mcp.tool()
 def delete_fact(fact_id: str) -> dict:
     """
     Hard-delete a fact — destructive primitive, the data is GONE.
