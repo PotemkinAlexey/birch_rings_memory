@@ -1,9 +1,10 @@
-"""ChatGPT round-10 punch-list regressions.
+"""DeepSeek round-1 punch-list regressions.
 
-Round 10 found multi-process AdaptiveWeights race, missing echo
-metrics, and the absence of a forecast_memory cache. The first is a
-real correctness bug (concurrent processes silently overwrite each
-other's SGD steps); the other two are operational hardening.
+First DeepSeek review (after 9 ChatGPT rounds + Codex + Cursor x2 +
+chemist/professor) found multi-process AdaptiveWeights race, missing
+echo metrics, and the absence of a forecast_memory cache. The first
+is a real correctness bug (concurrent processes silently overwrite
+each other's SGD steps); the other two are operational hardening.
 """
 from __future__ import annotations
 
