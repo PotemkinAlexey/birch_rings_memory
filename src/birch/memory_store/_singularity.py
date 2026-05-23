@@ -272,6 +272,37 @@ class SingularityMixin:
         with self._lock:
             with self._txn():
                 self._sync()
+                # Snapshot revalidation: the heavy N² simulation above
+                # ran OUTSIDE the lock so concurrent agents could keep
+                # querying. While we were away, another thread could
+                # have called set_fact / session_close / add_fact /
+                # delete_body and bumped _mutation_version. Writing
+                # stale scores into the surviving subset of bodies
+                # would silently feed the next tick's adaptive gravity
+                # with values computed from a phantom past. Recompute
+                # the same key under the lock and abort cleanly if
+                # the universe moved. Agent retries; the next call
+                # picks up the post-mutation state.
+                live_count = len(self._facts) + len(self._meta_facts)
+                writeback_key = (
+                    self._data_version_now(),
+                    self._mutation_version,
+                    live_count,
+                    horizon_ticks,
+                )
+                if writeback_key != cache_key:
+                    return {
+                        "ok": False,
+                        "error": "forecast_snapshot_stale",
+                        "horizon_ticks": horizon_ticks,
+                        "snapshot_body_count": len(bodies_snapshot),
+                        "writeback_body_count": live_count,
+                        "hint": (
+                            "Memory mutated between snapshot and "
+                            "writeback. Retry forecast_memory; the "
+                            "next call sees the post-mutation state."
+                        ),
+                    }
                 updated_facts: list = []
                 updated_metas: list = []
                 for bid, score in scores.items():

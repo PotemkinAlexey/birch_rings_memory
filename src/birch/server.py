@@ -713,6 +713,12 @@ def forecast_memory(horizon_ticks: int = 50) -> dict:
     swap without reindex) returns ``{"ok": false, "error":
     "mixed_embedding_dimensions", "hint": "...", "detail": "..."}`` instead
     of a raw exception so the agent gets actionable diagnostic.
+
+    On a concurrent-mutation race (another agent wrote to memory
+    while the heavy O(n²) simulation was running outside the lock)
+    returns ``{"ok": false, "error": "forecast_snapshot_stale", ...}``
+    instead of writing stale scores into the post-mutation bodies.
+    The agent retries; the next call sees the new universe.
     """
     from .vector_index import DimensionMismatchError
 
