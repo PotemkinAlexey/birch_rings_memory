@@ -37,8 +37,12 @@ if TYPE_CHECKING:
 # Default collapse threshold. 0.92 is tight enough to keep semantically
 # distinct facts apart and loose enough to actually compact — at 0.95
 # (the Hawking threshold) almost nothing groups, and below ~0.85 the
-# bundle starts gluing unrelated topics together.
-_DEFAULT_THRESHOLD = 0.92
+# bundle starts gluing unrelated topics together. Sourced from the
+# env-overridable Thresholds module (round 12) so an operator can pin
+# a different value for their embedding model's cosine distribution.
+from .thresholds import Thresholds  # noqa: E402
+
+_DEFAULT_THRESHOLD = Thresholds.COLLAPSE
 
 
 @dataclass

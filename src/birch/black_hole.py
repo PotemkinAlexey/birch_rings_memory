@@ -11,8 +11,13 @@ if TYPE_CHECKING:
     from .fact import FactPassport
     from .meta_fact import MetaFact
 
-# Similarity threshold for Hawking emission — only the strongest queries pull facts back
-_HAWKING_THRESHOLD = 0.95
+# Similarity threshold for Hawking emission — only the strongest queries
+# pull facts back. Sourced from the env-overridable Thresholds module
+# (round 12) so an operator with a different embedding model's cosine
+# distribution can tune it without forking.
+from .thresholds import Thresholds  # noqa: E402
+
+_HAWKING_THRESHOLD = Thresholds.HAWKING_FACT
 # Gravity assigned to emitted facts — they return weakened
 _HAWKING_GRAVITY = 0.30
 

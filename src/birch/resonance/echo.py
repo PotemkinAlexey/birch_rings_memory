@@ -35,8 +35,13 @@ class EchoResult:
         return list(self.fact_weights.keys())
 
 
-# Similarity threshold above which we consider it a return to the same problem
-_ECHO_THRESHOLD = 0.68
+# Similarity threshold above which we consider it a return to the same
+# problem. Sourced from the env-overridable Thresholds module — an
+# operator with a tighter-clustering embedding model can lower it, or
+# raise it on a sparser model where 0.68 happens too often.
+from ..thresholds import Thresholds  # noqa: E402
+
+_ECHO_THRESHOLD = Thresholds.ECHO
 
 # TTL defaults (in seconds). The store is unbounded by default; ``expire()``
 # is opportunistic — call it from session lifecycle or from a background

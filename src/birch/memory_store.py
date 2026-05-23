@@ -22,13 +22,15 @@ from .singularity_compactor import (
     collapse_singularity,
 )
 from .storage import SQLiteBackend, StorageBackend
+from .thresholds import Thresholds
 from .vector_index import VectorIndex
 
-# Gravity floor — bodies below this after tick fall into the black hole
-_ABSORPTION_THRESHOLD = 0.10
-# Hawking emission threshold for MetaFacts: a centroid lives between its
-# sources, so a strict 0.95 almost never fires. 0.85 is the working default.
-_META_HAWKING_THRESHOLD = 0.85
+# Module-level aliases kept for the existing call sites; the values
+# now come from the centralised env-overridable Thresholds module
+# (round 12 / Gemini round 1). Operators can pin every threshold via
+# BIRCH_* env vars to match their embedding model's cosine distribution.
+_ABSORPTION_THRESHOLD = Thresholds.ABSORPTION
+_META_HAWKING_THRESHOLD = Thresholds.HAWKING_META
 
 
 @dataclass
@@ -111,9 +113,10 @@ class MemoryStore:
      -1 — black hole (gravity < 0.10 after tick, absorbed)
     """
 
-    # Minimum cosine similarity for auto-linking two facts.
-    # High enough to avoid false edges; low enough to catch related triples.
-    AUTO_LINK_THRESHOLD: float = 0.80
+    # Minimum cosine similarity for auto-linking two facts. Sourced
+    # from the env-overridable Thresholds module (round 12) so an
+    # operator pinning a different embedding model can tune it.
+    AUTO_LINK_THRESHOLD: float = Thresholds.AUTO_LINK
     # Max neighbours considered per new fact to keep startup cost linear.
     AUTO_LINK_TOP_K: int = 5
 
@@ -128,10 +131,12 @@ class MemoryStore:
         db_path: Optional[str | Path] = None,
         storage: Optional[StorageBackend] = None,
         auto_link: bool = True,
-        collapse_threshold: float = 0.92,
+        collapse_threshold: Optional[float] = None,
         collapse_min_group_size: int = 2,
         collapse_async: bool = True,
     ) -> None:
+        if collapse_threshold is None:
+            collapse_threshold = Thresholds.COLLAPSE
         self._auto_link = auto_link
         # Collapse configuration — knobs the operator can tune per deployment.
         self._collapse_threshold = collapse_threshold
@@ -2094,4 +2099,8 @@ class MemoryStore:
                 "total_echoes_detected": self._echo.total_echoes_detected,
                 "total_echoes_applied": self._echo.total_echoes_applied,
                 "total_echoes_ignored": self._echo.total_echoes_ignored,
+                # Diagnostics: which thresholds the process actually
+                # picked up. Operator can confirm BIRCH_* env vars
+                # took effect without reading the process environment.
+                "thresholds": Thresholds.as_dict(),
             }

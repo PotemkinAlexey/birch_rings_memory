@@ -802,3 +802,50 @@ query(text, session_id)                                 │
     └── _attribute_to(ctx, body_id, similarity)
           ↳ touches FactPassport or MetaFact symmetrically
 ```
+
+
+## Operational notes from external review
+
+The system has been through 16 reviews across 5 reviewers (ChatGPT
+11 rounds, DeepSeek 1, Codex 1, Cursor 2, chemist-professor 1).
+A few recurring concerns were deferred as design choices or future
+work — documented here so the next reviewer (or contributor) doesn't
+re-raise them:
+
+### Vector index O(N·d) at scale
+`VectorIndex` is a numpy L2-normalised matrix; cosine search is one
+matmul per query. Fine for personal-store scale (few hundred to few
+thousand facts). At 100k+ facts the matmul becomes the bottleneck —
+future work is to swap in HNSW (FAISS / LanceDB). Not blocking
+because the personal-context-lakehouse use case rarely exceeds 10k.
+
+### SPO temporal collapse is by design
+``_spo_index`` keys on ``(subject, predicate, object)`` normalised
+case + whitespace. A second identical triple touches the existing
+fact instead of creating a new one. This **is** the contract:
+Birch holds atomic mutable triples, gravity-ranked. Temporal
+evolution lives in ``access_count``, ``created_at``,
+``recent_utility`` (EWMA), ``resonance_sum/count``. If you need a
+narrative log of "we used to think X, now Y, here's the why",
+that's the Vertical Brain layer (see AGENTS.md boundary table) —
+write a paragraph there, mutate the triple here.
+
+### Async collapse holds the lock for its duration
+``collapse_singularity`` acquires ``self._lock`` (RLock) and a
+write txn for its entire pass. No race conditions — every other
+``MemoryStore`` operation serialises behind it. The real concern is
+**latency**: a long collapse on a huge singularity blocks
+interactive queries. Mitigations already in place: per-dim
+partitioning (round 8), bounded ``min_group_size``, the matmul
+itself is fast for the few-thousand-body regime. If collapse
+latency ever becomes user-visible, the next step is snapshot-under-
+lock / compute-outside-lock / re-acquire-to-apply — over-engineered
+for now.
+
+### Hard-coded cosine thresholds (closed in round 12)
+``Thresholds`` (``birch/thresholds.py``) centralises every cosine
+and gravity threshold. Each is overridable via ``BIRCH_*`` env
+vars — pin them to your embedding model's cosine distribution.
+``memory_stats.thresholds`` echoes what the process actually
+picked up. No more "0.85 is statistically impossible on this model"
+landmines under provider swaps.
