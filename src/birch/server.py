@@ -724,16 +724,27 @@ def session_open(
         # An unreachable provider here would abort session_open after
         # the session was already started — wrap so the agent gets a
         # structured failure and can retry. The session is left open
-        # (session_start already ran); a follow-up close will be a
-        # no-op or get a recoverable empty session.
+        # so the caller can decide: retry session_push(first_message),
+        # close it, or abort. ``first_message_recorded`` tells the
+        # agent which state it's in so it can't assume the message
+        # already landed in the trajectory.
         try:
             response["echo"] = _store.check_echo(
                 first_message, session_id=sid,
             )
             if record_first_message:
                 _store.session_message(first_message, session_id=sid)
+                response["first_message_recorded"] = True
+            else:
+                response["first_message_recorded"] = False
         except EmbeddingError as exc:
             response["echo_error"] = _embedding_error_response(exc)
+            response["first_message_recorded"] = False
+            response["_hint"] = (
+                "session was opened but first_message was NOT recorded "
+                "due to embedding failure; retry session_push or call "
+                "session_close to drop the empty session"
+            )
     return response
 
 
@@ -855,6 +866,15 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
             _store.session_message(msg, session_id=session_id)
         summary = _store.session_close(session_id=session_id)
     except EmbeddingError as exc:
+        # The session was started before the failing embed. Without a
+        # cleanup, it would sit in _sessions until TTL eviction and
+        # leak into open_sessions on disk. abort_session drops it
+        # without computing resonance — best-effort, swallows any
+        # secondary error so the original embed failure surfaces.
+        try:
+            _store.abort_session(session_id)
+        except Exception:
+            pass
         return _embedding_error_response(exc)
     response = {
         "session_id": session_id,

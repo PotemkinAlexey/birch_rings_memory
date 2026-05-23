@@ -139,13 +139,15 @@ straight into the surface layer.
 ### Memory consolidation (gravitational collapse)
 
 The black hole would grow linearly with every session close. **Singularity
-Compactor** runs gravitational collapse over the singularity: a single
-numpy `matmul` computes pairwise cosine over all absorbed fact vectors,
-path-compressing Union-Find groups every transitive cluster above the
-collapse threshold (default `0.92`), and each group becomes one
-`MetaFact`. The originals are removed from both `_singularity` and the
-index; their texts and ids live on inside the MetaFact (`source_texts`,
-`source_fact_ids`) for lineage.
+Compactor** runs gravitational collapse over the singularity: bodies are
+partitioned by vector dimension (so a model swap leaves old-dim and
+new-dim bodies compacting independently rather than crashing on a
+ragged numpy array), each dim-group gets its own numpy `matmul` for
+pairwise cosine, path-compressing Union-Find groups every transitive
+cluster above the collapse threshold (default `0.92`), and each group
+becomes one `MetaFact`. The originals are removed from both
+`_singularity` and the index; their texts and ids live on inside the
+MetaFact (`source_texts`, `source_fact_ids`) for lineage.
 
 `MemoryStore` runs collapse opportunistically on `session_close` — when
 the singularity has both grown past `COLLAPSE_FACT_MASS_TRIGGER` (default

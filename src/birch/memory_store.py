@@ -1395,6 +1395,27 @@ class MemoryStore:
         if self._storage and hasattr(self._storage, "delete_open_session"):
             self._storage.delete_open_session(sid)
 
+    def abort_session(self, session_id: str) -> bool:
+        """Drop an open session without computing resonance or touching gravity.
+
+        For failure-path cleanup — when ``session_open(first_message=...)``
+        or ``record_session`` partially started a session and a downstream
+        embed failed, the caller can abort instead of leaking an orphan
+        open session that waits for TTL cleanup or blocks future opens
+        of the same id. Idempotent: aborting an unknown session returns
+        False without raising.
+
+        Distinct from ``session_close``: no R computed, no migrations,
+        no EWMA, no adaptive-weight training. Pure cleanup.
+        """
+        with self._lock:
+            with self._txn():
+                self._sync()
+                if session_id not in self._sessions:
+                    return False
+                self._pop_session_locked(session_id)
+                return True
+
     def _absorb_dead(self) -> list[str]:
         """Send facts and live MetaFacts below the threshold back into the hole.
 
