@@ -49,6 +49,15 @@ def query_memory(
       ``hawking``      — single fact recovered from the black hole
       ``hawking_meta`` — MetaFact bundle recovered from the black hole
     """
+    # Bounds: reject non-positive / oversized top_k with a structured
+    # response. _store.query handles top_k=0 internally now (round 9),
+    # but the MCP contract should be explicit: an agent that asks for
+    # zero hits gets told why, not silently empty results.
+    if top_k <= 0:
+        return {"results": [], "error": "invalid_top_k",
+                "_hint": "top_k must be positive"}
+    if top_k > 50:
+        top_k = 50
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     if layers:
         # Validate enum: a typo like "surfase" used to silently produce an
@@ -356,8 +365,12 @@ def forecast_memory(horizon_ticks: int = 50) -> dict:
     Call at session start (or once per day) on a real store. Pure numpy,
     O(n²) per step in body count.
 
-    Returns a summary: how many facts were forecasted and updated, and a
-    coarse distribution across {safe / kinetic / near_horizon / predicted_fall}.
+    Returns a summary: how many bodies were forecasted and updated, with
+    a per-type split (``facts_updated_count`` / ``metas_updated_count``)
+    and a coarse distribution across {safe / kinetic / near_horizon /
+    predicted_fall}. The ``facts_forecasted`` / ``facts_updated`` keys
+    are kept as legacy aliases for wire-format stability but actually
+    count BODIES (FactPassport + MetaFact). Prefer the ``bodies_*`` keys.
     On mixed embedding dimensions in the store (after a BIRCH_EMBED_MODEL
     swap without reindex) returns ``{"ok": false, "error":
     "mixed_embedding_dimensions", "hint": "...", "detail": "..."}`` instead
@@ -423,6 +436,14 @@ def list_facts(
     ``min_gravity`` (drop low-confidence facts), ``layer`` (one of
     ``surface``/``kinetic``/``core``).
     """
+    # Bounds: a zero/negative limit used to fall through to the
+    # "len(out) >= limit" check below AFTER the first append, so the
+    # caller still got one item back. Reject explicitly. Cap upper
+    # bound so an agent asking for 1M facts can't pin the server.
+    if limit <= 0:
+        return []
+    if limit > 500:
+        limit = 500
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     # Validate enum: a typo used to silently produce target_layer=None,
     # which then returned ALL layers — worse than empty because the
@@ -479,6 +500,18 @@ def find_similar(
     surfaces several stale HEAD entries; then ``set_fact(subject, "HEAD on
     master", new_value)`` collapses them in one call.
     """
+    # Bounds: explicit MCP contract. Round 9 added a top_k<=0 guard
+    # at VectorIndex.search; the server layer should surface that as
+    # a structured warning so the agent learns instead of silently
+    # getting nothing.
+    if top_k <= 0:
+        return {
+            "query": text,
+            "hits": [],
+            "_warning": "top_k must be positive",
+        }
+    if top_k > 50:
+        top_k = 50
     hits = _store.find_similar(
         text=text,
         top_k=top_k,

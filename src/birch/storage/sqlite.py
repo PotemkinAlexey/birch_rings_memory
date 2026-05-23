@@ -465,11 +465,27 @@ class SQLiteBackend:
         out: list[dict] = []
         for r in rows:
             try:
+                messages = _safe_loads(r["messages"], [])
+                vectors = _safe_loads(r["vectors"], [])
+                facts = _safe_loads(r["facts"], {})
+                # Shape validation. _safe_loads gives us "valid JSON",
+                # but the consumer (_load_from_storage) calls .items()
+                # on facts and indexes vectors element-wise — a row
+                # where facts came back as a list, or vectors as a
+                # dict, would crash the consumer instead of the loader.
+                # Drop the row at the loader so a malformed cell never
+                # reaches the consumer.
+                if not isinstance(messages, list):
+                    raise ValueError("messages must be a list")
+                if not isinstance(vectors, list):
+                    raise ValueError("vectors must be a list")
+                if not isinstance(facts, dict):
+                    raise ValueError("facts must be a dict")
                 out.append({
                     "session_id": r["session_id"],
-                    "messages": _safe_loads(r["messages"], []),
-                    "vectors": _safe_loads(r["vectors"], []),
-                    "facts": _safe_loads(r["facts"], {}),
+                    "messages": messages,
+                    "vectors": vectors,
+                    "facts": facts,
                     "started_at": r["started_at"],
                 })
             except Exception as exc:
@@ -542,16 +558,34 @@ class SQLiteBackend:
                 # forgiving (returns [] on bad JSON), but a row whose JSON
                 # cells are all garbage is corruption, not drift — drop it
                 # rather than silently load a near-empty MetaFact.
-                bad_json = False
+                # Two corruption modes drop the row:
+                #
+                #   1. Cell is invalid JSON entirely ("{garbage").
+                #   2. Cell is valid JSON but the wrong SHAPE (dict /
+                #      string / number) where a list is required —
+                #      MetaFact._load_list would silently coerce these
+                #      to [], producing a body with no lineage. The
+                #      original cell wasn't [], so this is corruption,
+                #      not "saved-as-empty".
+                #
+                # An originally-empty list ("[]") is preserved as-is:
+                # the round-trip contract (save X → load X) must hold
+                # for callers that legitimately save empty MetaFacts
+                # in tests / migrations.
+                bad = False
                 for cell in ("vector", "source_texts", "source_fact_ids"):
                     raw = r[cell] if cell in r.keys() else None
-                    if isinstance(raw, str) and raw:
-                        try:
-                            json.loads(raw)
-                        except (TypeError, ValueError):
-                            bad_json = True
-                            break
-                if bad_json:
+                    if not isinstance(raw, str) or not raw:
+                        continue
+                    try:
+                        parsed = json.loads(raw)
+                    except (TypeError, ValueError):
+                        bad = True
+                        break
+                    if not isinstance(parsed, list):
+                        bad = True
+                        break
+                if bad:
                     raise ValueError("corrupted JSON cell")
                 out.append(MetaFact.from_dict(dict(r)))
             except Exception as exc:

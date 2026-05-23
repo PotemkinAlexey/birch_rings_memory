@@ -27,7 +27,11 @@ def test_load_meta_facts_skips_corrupted_row(tmp_path):
     db = str(tmp_path / "m.db")
     mem = MemoryStore(db_path=db)
     # Plant one good MetaFact through the storage layer.
+    # Compactor-shaped MetaFact: both source_texts AND source_fact_ids
+    # populated. Round-10 semantic-shape validation drops persisted
+    # MetaFacts missing either lineage field.
     good = MetaFact(weight=2, source_texts=["good text"],
+                    source_fact_ids=["src-1"],
                     gravity_score=0.5, layer=1)
     good.vector = [0.1] * 64
     assert mem._storage is not None
