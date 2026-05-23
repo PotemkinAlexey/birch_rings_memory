@@ -912,21 +912,22 @@ class MemoryStore:
                 if self._storage:
                     self._storage.save_edge(from_id, to_id)
 
-    def deprecate(self, old_id: str, new_id: str) -> None:
+    def deprecate(self, old_id: str, new_id: str) -> dict:
         """Legacy alias for :meth:`supersede_fact`.
 
-        Older callers (tests, external integrations) used to set
-        ``deprecated_by`` directly without sending the body to the
-        singularity. That left the deprecated fact in the live store
-        until the next tick, where it could leak into ``query()`` as
-        if it were current. Now this just delegates to
+        Older callers used to set ``deprecated_by`` directly without
+        sending the body to the singularity, leaking deprecated facts
+        into live ``query()`` until next tick. Now delegates to
         ``supersede_fact``, which runs ``_absorb_dead`` synchronously
         and keeps the body in the singularity with lineage intact.
 
-        Prefer ``supersede_fact`` directly in new code — this shim
-        exists only to keep the older surface working.
+        Returns the same dict ``supersede_fact`` does — including
+        ``{"superseded": False, "reason": "old_id not found"}`` when
+        the id is unknown — so callers can tell whether anything
+        actually happened. Legacy callers that ignore the return
+        value remain compatible.
         """
-        self.supersede_fact(old_id, new_id)
+        return self.supersede_fact(old_id, new_id)
 
     def supersede_fact(self, old_id: str, new_id: str) -> dict:
         """Mark ``old_id`` as superseded by ``new_id`` and send it to the singularity.

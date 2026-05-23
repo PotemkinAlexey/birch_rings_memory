@@ -134,10 +134,16 @@ def record_fact(
     "consider supersede_fact or set_fact"; the dedup in this call only catches
     exact normalised SPO matches, not "X uses Postgres" vs "X is on Postgres".
     """
-    already_existed = _store.fact_exists(subject, predicate, object)
-    fact = _store.add_fact(subject, predicate, object, session_id=session_id)
+    # Transaction-honest: add_fact returns created from inside its own
+    # write txn, so there's no race window between a fact_exists probe and
+    # the insert (same pattern set_fact uses since round 5).
+    fact, created = _store.add_fact(
+        subject, predicate, object,
+        session_id=session_id, return_status=True,
+    )
+    already_existed = not created
     similar: list[dict] = []
-    if not already_existed and fact.vector:
+    if created and fact.vector:
         similar = _store._find_similar_by_vector(
             fact.vector,
             top_k=3,
@@ -206,6 +212,15 @@ def record_facts(
                 # the SPO — agents that send the same triple twice in one
                 # call now see it instead of getting two clean inserts.
                 "duplicate_in_batch": s["duplicate_in_batch"],
+                # Direct "this call created the row" signal: True iff the
+                # SPO was NOT in the store before this batch AND was NOT
+                # introduced by an earlier item in the batch. Cheaper for
+                # the agent than computing not already_existed and not
+                # duplicate_in_batch on its own.
+                "created": (
+                    not s["already_existed"]
+                    and not s["duplicate_in_batch"]
+                ),
                 "layer": s["fact"].layer,
                 "gravity_score": round(s["fact"].gravity_score, 3),
             }
@@ -283,15 +298,16 @@ def retire_fact(fact_id: str) -> dict:
 @mcp.tool()
 def forecast_memory(horizon_ticks: int = 50) -> dict:
     """
-    Run the galaxy forward and write a per-fact stability prediction back.
+    Run the galaxy forward and write a per-body stability prediction back.
 
-    For every live fact the galaxy simulates a body in orbit around the
-    central black hole. After ``horizon_ticks`` integrator steps each body
-    has either survived (its orbital radius gives a stability score in
-    [0, 1]) or crossed the event horizon (stability = 0). The score lands
-    on FactPassport.forecast_stability and is consumed by the adaptive
-    gravity formula via ``w_stability`` — facts the galaxy predicts to
-    fall earn a smaller gravity contribution from this feature, facts
+    For every live body (FactPassport AND MetaFact — both carry
+    ``forecast_stability``) the galaxy simulates an orbit around the
+    central black hole. After ``horizon_ticks`` integrator steps each
+    body has either survived (its orbital radius gives a stability
+    score in [0, 1]) or crossed the event horizon (stability = 0).
+    The score lands on body.forecast_stability and is consumed by the
+    adaptive gravity formula via ``w_stability`` — bodies the galaxy
+    predicts to fall earn a smaller gravity contribution, bodies
     predicted safe earn more.
 
     The feature complements the local pre-resonance signals (freshness,
@@ -302,7 +318,7 @@ def forecast_memory(horizon_ticks: int = 50) -> dict:
     at its prior and contributes nothing.
 
     Call at session start (or once per day) on a real store. Pure numpy,
-    O(n²) per step in fact count.
+    O(n²) per step in body count.
 
     Returns a summary: how many facts were forecasted and updated, and a
     coarse distribution across {safe / kinetic / near_horizon / predicted_fall}.
