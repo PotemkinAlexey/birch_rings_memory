@@ -1045,6 +1045,77 @@ class MemoryStore:
                 self._mutation_version += 1
                 return True
 
+    def delete_body(self, body_id: str) -> dict:
+        """
+        Polymorphic hard-delete across all four body locations.
+
+        Queries return polymorphic bodies (live FactPassport, live
+        MetaFact, singularity FactPassport, singularity MetaFact) under
+        a single ``body_id``. ``delete_fact`` only handles live
+        FactPassports — an agent that gets a MetaFact body_id from
+        ``query_memory`` and wants to delete it for GDPR / secrets
+        reasons used to silently fail. ``delete_body`` checks all four
+        locations and deletes wherever the id lives.
+
+        Returns ``{"deleted": True, "kind": "fact"|"meta"|"singularity_fact"|
+        "singularity_meta", "body_id": ...}`` on success, or
+        ``{"deleted": False, "body_id": ...}`` if the id is not found.
+
+        Same destructive contract as ``delete_fact``: the body is gone,
+        no singularity, no lineage, no Hawking emission. Reserved for
+        secrets / GDPR / accidental writes; prefer ``supersede_fact``
+        or ``retire_fact`` for stale data.
+        """
+        with self._lock:
+            with self._txn():
+                self._sync()
+                # 1. Live FactPassport.
+                if body_id in self._facts:
+                    fact = self._facts.pop(body_id)
+                    self._index.remove(body_id)
+                    self._drop_from_spo_index(fact)
+                    self._engine.unregister(body_id)
+                    if self._storage:
+                        self._storage.delete_fact(body_id)
+                        if hasattr(self._storage, "delete_edges_for_fact"):
+                            self._storage.delete_edges_for_fact(body_id)
+                    self._mutation_version += 1
+                    return {"deleted": True, "kind": "fact",
+                            "body_id": body_id}
+                # 2. Live MetaFact.
+                if body_id in self._meta_facts:
+                    self._meta_facts.pop(body_id)
+                    self._meta_index.remove(body_id)
+                    self._engine.unregister(body_id)
+                    if (self._storage
+                            and hasattr(self._storage, "delete_meta_fact")):
+                        self._storage.delete_meta_fact(body_id)
+                    self._mutation_version += 1
+                    return {"deleted": True, "kind": "meta",
+                            "body_id": body_id}
+                # 3. Singularity FactPassport.
+                if body_id in self._hole._singularity:
+                    self._hole._singularity.pop(body_id)
+                    self._hole._index.remove(body_id)
+                    if self._storage:
+                        self._storage.delete_fact(body_id)
+                    self._mutation_version += 1
+                    return {"deleted": True,
+                            "kind": "singularity_fact",
+                            "body_id": body_id}
+                # 4. Singularity MetaFact.
+                if body_id in self._hole._meta_singularity:
+                    self._hole._meta_singularity.pop(body_id)
+                    self._hole._meta_index.remove(body_id)
+                    if (self._storage
+                            and hasattr(self._storage, "delete_meta_fact")):
+                        self._storage.delete_meta_fact(body_id)
+                    self._mutation_version += 1
+                    return {"deleted": True,
+                            "kind": "singularity_meta",
+                            "body_id": body_id}
+                return {"deleted": False, "body_id": body_id}
+
     def list_facts(
         self,
         subject: Optional[str] = None,

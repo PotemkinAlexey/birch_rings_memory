@@ -20,6 +20,30 @@ _store = MemoryStore(db_path=_DB_PATH)
 mcp = FastMCP("BirchKM")
 
 
+def _validate_text(
+    value, field_name: str = "text",
+) -> Optional[dict]:
+    """Reject non-string or empty text inputs at the MCP boundary.
+
+    query_memory, find_similar, session_push, check_echo, session_open
+    (first_message) all accept a ``text``-like argument that goes
+    straight into the embedding path. None / list / dict / whitespace-
+    only would either crash deep in embed() or, worse, embed an
+    opaque value as if it were content. Caller gets a structured
+    response with the failed field name so the agent can fix one
+    argument instead of guessing.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return {
+            "ok": False,
+            "error": "invalid_text",
+            "field": field_name,
+            "got_type": type(value).__name__,
+            "hint": f"{field_name} must be a non-empty string",
+        }
+    return None
+
+
 def _validate_spo_strings(
     subject, predicate, obj,
 ) -> Optional[dict]:
@@ -103,6 +127,9 @@ def query_memory(
       ``hawking``      — single fact recovered from the black hole
       ``hawking_meta`` — MetaFact bundle recovered from the black hole
     """
+    err = _validate_text(text, "text")
+    if err is not None:
+        return err
     # Bounds: reject non-positive / oversized top_k with a structured
     # response. _store.query handles top_k=0 internally,
     # but the MCP contract should be explicit: an agent that asks for
@@ -271,6 +298,21 @@ def record_facts(
     Each item must have ``subject``, ``predicate``, ``object``; per-item
     ``session_id`` overrides the top-level one.
     """
+    # Top-level type check: if the caller passes a string (would iterate
+    # by character) or a dict (would iterate by key) instead of a list,
+    # the per-item loop below would generate one "item_not_an_object"
+    # error per character/key, which is technically structured but
+    # useless. Reject the payload up front with a single clear error.
+    if not isinstance(facts, list):
+        return {
+            "ok": False,
+            "error": "invalid_facts_payload",
+            "got_type": type(facts).__name__,
+            "hint": (
+                "facts must be a list of objects with subject, "
+                "predicate, object"
+            ),
+        }
     # Per-item validation: a malformed entry used to raise a raw KeyError
     # straight through MCP. Now we collect the issues and return a typed
     # response the agent can parse and fix in one round trip.
@@ -627,6 +669,9 @@ def find_similar(
     surfaces several stale HEAD entries; then ``set_fact(subject, "HEAD on
     master", new_value)`` collapses them in one call.
     """
+    err = _validate_text(text, "text")
+    if err is not None:
+        return err
     # Bounds: explicit MCP contract. VectorIndex.search guards top_k<=0
     # internally; the server layer should surface that as a structured
     # warning so the agent learns instead of silently getting nothing.
@@ -718,6 +763,19 @@ def session_open(
             "and session_push — then call session_close when done"
         ),
     }
+    if first_message is not None:
+        # Type/empty guard for first_message — same contract as
+        # session_push text. Invalid input rejected before the
+        # session does any embed work.
+        err = _validate_text(first_message, "first_message")
+        if err is not None:
+            # session is already opened on disk (session_start above);
+            # mark partial_open so the agent can choose to close or
+            # retry with a valid first_message.
+            response["ok"] = False
+            response["partial_open"] = True
+            response["first_message_error"] = err
+            return response
     if first_message:
         # Both check_echo and session_message embed the first message.
         # An unreachable provider here would abort session_open after
@@ -767,6 +825,9 @@ def check_echo(first_message: str, session_id: Optional[str] = None) -> dict:
     this tool is the explicit form when you want the check without opening a
     new session, or when you've already opened one and want a late check.
     """
+    err = _validate_text(first_message, "first_message")
+    if err is not None:
+        return err
     try:
         return _store.check_echo(first_message, session_id=session_id)
     except EmbeddingError as exc:
@@ -783,6 +844,9 @@ def session_push(text: str, session_id: str) -> dict:
     behavioural / semantic / repetition signals score user closure, not
     your replies.
     """
+    err = _validate_text(text, "text")
+    if err is not None:
+        return err
     try:
         _store.session_message(text, session_id=session_id)
     except EmbeddingError as exc:
@@ -862,6 +926,22 @@ def session_close(
             "allowed": [
                 "resonant", "positive", "neutral", "toxic", "negative",
             ],
+        }
+    # Core returns {} for an unknown session_id or a session that was
+    # never pushed to (no messages). Without this guard the response
+    # looked like a successful close with null label and r_score=0.0
+    # — indistinguishable from a real close that scored neutral. Be
+    # explicit so the agent can tell the close didn't actually happen.
+    if not summary:
+        return {
+            "ok": False,
+            "error": "unknown_or_empty_session",
+            "session_id": session_id,
+            "hint": (
+                "Call session_open and session_push before session_close, "
+                "or check the session_id hasn't already been closed."
+            ),
+            "stats": _store.stats,
         }
     return {
         "session_id": session_id,

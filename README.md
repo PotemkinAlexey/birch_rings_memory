@@ -362,7 +362,7 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Claude then has sixteen tools:
+Claude then has seventeen tools:
 
 | Tool | What it does |
 |---|---|
@@ -373,15 +373,16 @@ Claude then has sixteen tools:
 | `find_similar` | Read-only paraphrase search — surface candidates before writing or for planning `set_fact` / `supersede_fact` cleanup |
 | `supersede_fact` | Mark `old_id` superseded by `new_id` — old body goes to the singularity with `deprecated_by` set; lineage preserved, MetaFact / Hawking still possible |
 | `retire_fact` | Send a no-longer-relevant fact to the singularity (no replacement) — `ttl=now`, same singularity benefits as supersede |
-| `delete_fact` | Hard-delete — data is GONE, no singularity, no lineage. Use only for secrets / accidental writes; prefer supersede or retire for stale data |
+| `delete_fact` | Hard-delete a live FactPassport — data is GONE, no singularity, no lineage. Use only for secrets / accidental writes; prefer supersede or retire for stale data |
 | `list_facts` | List live facts with filters (`subject_prefix`, `min_gravity`, `layer`, `exclude_deprecated`); sorted by gravity — audit without a query |
 | `explain_fact` | Decompose a fact's gravity into per-feature contributions — debug "why is this gravity so low" |
 | `session_open` | Open a named session so reads and writes can be attributed to it |
 | `session_push` | Append a user message to an open session |
-| `session_close` | Close a session — score resonance, update gravity, detect echo |
+| `session_close` | Close a session — score resonance, update gravity, detect echo. Optional `sentiment` / `r_override` to declare R when the heuristic would misclassify (e.g. declarative technical summaries) |
+| `check_echo` | Explicit cross-session topic match against past K-means session bundles; on a hit, retroactive penalty propagates to past session's R and to gravity of every fact that session touched. Usually called automatically via `session_open(first_message=...)` |
 | `record_session` | Score a completed session in one call (open + push messages + close) |
-| `forecast_memory` | Run the galaxy forward and write a per-fact stability prediction back into the live store; feeds the adaptive gravity formula via `w_stability` |
-| `memory_stats` | Report layer distribution, black hole status, and live adaptive weights |
+| `forecast_memory` | Run the galaxy forward and write a per-body stability prediction back into the live store (covers FactPassports + MetaFacts); feeds the adaptive gravity formula via `w_stability` |
+| `memory_stats` | Report layer distribution, black hole status, live adaptive weights, echo counters, thresholds |
 
 `query_memory` returns polymorphic hits. Every item has `kind`, `body_id`, `similarity`,
 `source`, `layer`, `gravity_score`. Fact hits (`kind: "fact"`) include `subject`,

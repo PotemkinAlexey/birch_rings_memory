@@ -34,12 +34,16 @@ its `gravity_score`. Low gravity means the system itself doubts it.
 **Storing** — use triples that capture a relationship, not prose. One fact per
 `record_fact` call.
 
-**Changing** — if a fact is superseded, `record_fact` the new version, then
-call `supersede_fact(old_id, new_id)`. The old body goes to the singularity
-with its `deprecated_by` pointer intact, so lineage is preserved and the
-body can still feed MetaFact compression or be Hawking-emitted. If a fact's
-topic is just over with no replacement, call `retire_fact(fact_id)` —
-same singularity benefits, no successor required.
+**Changing** — for a single-valued slot (HEAD, version, current count),
+call `set_fact(subject, predicate, new_value)` — it writes the new fact
+AND auto-supersedes every live fact sharing `(subject, predicate)` in one
+atomic call. For cross-slot cleanup where the replacement already exists
+(different SPO, you just want to point the old one at it), use
+`supersede_fact(old_id, new_id)`. Both paths send the old body to the
+singularity with `deprecated_by` intact — lineage preserved, MetaFact
+compression and Hawking emission still possible. If a fact's topic is
+just over with no replacement, call `retire_fact(fact_id)` — same
+singularity benefits, no successor required.
 
 **Deleting** — only on explicit user order, and only with `delete_fact`,
 which is the destructive primitive (no singularity, no lineage). Reserve
