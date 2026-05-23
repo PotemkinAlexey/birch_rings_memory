@@ -66,6 +66,7 @@ class FactsMixin:
     if TYPE_CHECKING:
         _sync: Callable[[], None]
         _txn: Callable[[], Any]
+        _reload: Callable[[], None]
         _resolve_sid: Callable[[Optional[str]], Optional[str]]
         _attribute_to: Callable[["SessionContext", str, float], None]
         _persist_session_locked: Callable[["Optional[SessionContext]"], None]
@@ -333,81 +334,142 @@ class FactsMixin:
         touched_ctxs: set[str] = set()
 
         with self._lock:
-            with self._txn():
-                # Reload under the write lock — the authoritative view.
-                self._sync()
-                # Track per-key first-occurrence within this batch so a
-                # duplicate SPO inside the same input list is marked.
-                seen_in_batch: dict[tuple[str, str, str], int] = {}
-
-                for idx, (triple, vec) in enumerate(zip(triples, vectors)):
-                    s, p, o = triple
-                    # Per-item session_id overrides the top-level default.
-                    raw_sid = (session_ids[idx] if session_ids is not None
-                               else None)
-                    sid = self._resolve_sid(raw_sid or session_id)
-                    ctx = self._sessions.get(sid) if sid else None
-                    key = self._normalize_spo(s, p, o)
-
-                    # 1) Pre-existing in the store (before this batch ran).
-                    existing_id = self._spo_index.get(key)
-                    if (existing_id and existing_id in self._facts
-                            and key not in seen_in_batch):
-                        already_existed[idx] = True
-
-                    # 2) Already appeared in this batch above.
-                    if key in seen_in_batch:
-                        duplicate_in_batch[idx] = True
-
-                    if existing_id and existing_id in self._facts:
-                        fact = self._facts[existing_id]
-                        fact.touch()
-                        if ctx is not None:
-                            self._attribute_to(ctx, existing_id, 1.0)
-                            touched_ctxs.add(ctx.session_id)
-                        results[idx] = fact
-                        seen_in_batch.setdefault(key, idx)
-                        continue
-
-                    # Preflight dimension to keep mutations atomic per
-                    # item — same pattern as add_fact above.
-                    if (vec and self._index._dim is not None
-                            and len(vec) != self._index._dim):
-                        raise DimensionMismatchError(
-                            f"Embedding dimension mismatch in batch: "
-                            f"index has dim={self._index._dim}, "
-                            f"incoming vector has dim={len(vec)} for "
-                            f"({s!r}, {p!r}, {o!r}). The embedding "
-                            f"model probably changed under the store."
+            # The apply loop below mutates self._facts / self._engine /
+            # self._index / self._spo_index per item, and touches the
+            # access_count / last_accessed on existing facts. If anything
+            # raises mid-batch (mismatched embedding dim sneaking past
+            # preflight, storage I/O failure, etc.) SQLite rolls back
+            # but the in-memory dicts and the existing-fact touch
+            # mutations stay dirty. Wrap in try/except and _reload() on
+            # any failure to re-anchor every cache to disk truth — same
+            # pattern as collapse_singularity uses for its rollback.
+            try:
+                with self._txn():
+                    # Reload under the write lock — the authoritative view.
+                    self._sync()
+                    # ── Preflight pass: classify every item, validate
+                    # every dim, build a plan list. NO mutation of
+                    # self._facts / _index / _spo_index / fact.touch()
+                    # happens in this pass — every raise here aborts the
+                    # batch before any state changes.
+                    seen_in_batch: dict[tuple[str, str, str], int] = {}
+                    # Each plan entry: ("touch", idx, existing_id, sid)
+                    # or ("new", idx, fact, key, vec, sid)
+                    # or ("dup_in_batch", idx, first_idx, sid).
+                    plans: list[tuple] = []
+                    for idx, (triple, vec) in enumerate(
+                        zip(triples, vectors)
+                    ):
+                        s, p, o = triple
+                        raw_sid = (
+                            session_ids[idx] if session_ids is not None
+                            else None
                         )
-                    fact = FactPassport(
-                        subject=s,
-                        predicate=p,
-                        object=o,
-                        layer=layer,
-                        source_session=sid,
-                    )
-                    fact.vector = vec
-                    self._facts[fact.fact_id] = fact
-                    self._engine.register(fact)
-                    self._index.add(fact.fact_id, vec)
-                    self._spo_index[key] = fact.fact_id
-                    self._auto_link_fact(fact.fact_id, vec)
-                    if ctx is not None:
-                        self._attribute_to(ctx, fact.fact_id, 1.0)
-                        touched_ctxs.add(ctx.session_id)
-                    results[idx] = fact
-                    seen_in_batch.setdefault(key, idx)
+                        sid = self._resolve_sid(raw_sid or session_id)
+                        key = self._normalize_spo(s, p, o)
 
-                # Persist new facts and touched duplicates in one shot.
-                if self._storage:
-                    self._storage.save_facts(
-                        [r for r in results if r is not None]
-                    )
-                # Persist every open session whose attribution changed.
-                for sid in touched_ctxs:
-                    self._persist_session_locked(self._sessions.get(sid))
-                self._bump_mutation_locked()
+                        # In-batch duplicate (resolves to the first
+                        # occurrence after apply pass).
+                        if key in seen_in_batch:
+                            duplicate_in_batch[idx] = True
+                            plans.append((
+                                "dup_in_batch", idx,
+                                seen_in_batch[key], sid,
+                            ))
+                            continue
+
+                        # Pre-existing in the store BEFORE this batch.
+                        existing_id = self._spo_index.get(key)
+                        if existing_id and existing_id in self._facts:
+                            already_existed[idx] = True
+                            plans.append((
+                                "touch", idx, existing_id, sid,
+                            ))
+                            seen_in_batch[key] = idx
+                            continue
+
+                        # New fact — preflight dimension BEFORE we
+                        # construct it so a later item's bad dim aborts
+                        # the batch cleanly with zero state change.
+                        if (vec and self._index._dim is not None
+                                and len(vec) != self._index._dim):
+                            raise DimensionMismatchError(
+                                f"Embedding dimension mismatch in batch: "
+                                f"index has dim={self._index._dim}, "
+                                f"incoming vector has dim={len(vec)} for "
+                                f"({s!r}, {p!r}, {o!r}). The embedding "
+                                f"model probably changed under the store."
+                            )
+                        fact = FactPassport(
+                            subject=s,
+                            predicate=p,
+                            object=o,
+                            layer=layer,
+                            source_session=sid,
+                        )
+                        fact.vector = vec
+                        plans.append(("new", idx, fact, key, vec, sid))
+                        seen_in_batch[key] = idx
+
+                    # ── Apply pass: every item passed preflight, now
+                    # mutate state. The only things that can raise from
+                    # here on are storage I/O failures (caught by the
+                    # outer try/except → _reload).
+                    for plan in plans:
+                        kind = plan[0]
+                        if kind == "dup_in_batch":
+                            _, idx, first_idx, sid = plan
+                            # Result resolves to the same fact the first
+                            # occurrence created/touched. Touch + attrib
+                            # already happened on first_idx; a second
+                            # touch here would over-count access on a
+                            # single batch's duplicate, so we skip it.
+                            results[idx] = results[first_idx]
+                        elif kind == "touch":
+                            _, idx, existing_id, sid = plan
+                            fact = self._facts[existing_id]
+                            fact.touch()
+                            ctx = (
+                                self._sessions.get(sid) if sid else None
+                            )
+                            if ctx is not None:
+                                self._attribute_to(ctx, existing_id, 1.0)
+                                touched_ctxs.add(ctx.session_id)
+                            results[idx] = fact
+                        else:  # "new"
+                            _, idx, fact, key, vec, sid = plan
+                            self._facts[fact.fact_id] = fact
+                            self._engine.register(fact)
+                            self._index.add(fact.fact_id, vec)
+                            self._spo_index[key] = fact.fact_id
+                            self._auto_link_fact(fact.fact_id, vec)
+                            ctx = (
+                                self._sessions.get(sid) if sid else None
+                            )
+                            if ctx is not None:
+                                self._attribute_to(ctx, fact.fact_id, 1.0)
+                                touched_ctxs.add(ctx.session_id)
+                            results[idx] = fact
+
+                    # Persist new facts and touched duplicates in one shot.
+                    if self._storage:
+                        self._storage.save_facts(
+                            [r for r in results if r is not None]
+                        )
+                    # Persist every open session whose attribution changed.
+                    for sid in touched_ctxs:
+                        self._persist_session_locked(
+                            self._sessions.get(sid)
+                        )
+                    self._bump_mutation_locked()
+            except Exception:
+                # SQLite rolled back; in-memory _facts / _index /
+                # _spo_index / fact.access_count / ctx.facts may be
+                # partially mutated. Re-anchor every cache to disk truth
+                # before propagating so callers don't see a phantom
+                # mid-batch state.
+                self._reload()
+                raise
 
         if return_status:
             return [
@@ -430,10 +492,28 @@ class FactsMixin:
         recent_utility is dragging it down, or the forecast says it's about
         to fall, or whatever.
         """
-        from ..gravity import pre_resonance_features
+        from ..gravity import _W_RESONANCE, pre_resonance_features
         with self._lock:
             self._sync()
-            fact = self._facts.get(fact_id)
+            # Polymorphic body lookup — same four locations as
+            # delete_body / query_memory so the agent can pipe a
+            # query hit's body_id straight in regardless of whether
+            # it points at a FactPassport, MetaFact, or singularity
+            # body. Returning {"found": False} for a valid query
+            # result was misleading.
+            fact: Any = self._facts.get(fact_id)
+            kind = "fact"
+            if fact is None:
+                meta = self._meta_facts.get(fact_id)
+                if meta is not None:
+                    fact = meta
+                    kind = "meta"
+            if fact is None and fact_id in self._hole._singularity:
+                fact = self._hole._singularity[fact_id].fact
+                kind = "singularity_fact"
+            if fact is None and fact_id in self._hole._meta_singularity:
+                fact = self._hole._meta_singularity[fact_id].meta
+                kind = "singularity_meta"
             if fact is None:
                 return {"found": False, "fact_id": fact_id}
             max_deg = max(self._engine._degrees.values(), default=1)
@@ -447,7 +527,6 @@ class FactsMixin:
                 resonance_score = (fact.avg_resonance + 1.0) / 2.0
             else:
                 resonance_score = 0.0
-            from ..gravity import _W_RESONANCE
             contributions = {
                 "freshness":  round(weights.w_freshness * freshness, 4),
                 "access":     round(weights.w_access * access, 4),
@@ -457,13 +536,10 @@ class FactsMixin:
                 "resonance":  round(_W_RESONANCE * resonance_score, 4),
             }
             live_gravity = sum(contributions.values())
-            return {
+            response: dict = {
                 "found": True,
                 "fact_id": fact_id,
-                "subject": fact.subject,
-                "predicate": fact.predicate,
-                "object": fact.object,
-                "layer": fact.layer,
+                "kind": kind,
                 "stored_gravity_score": round(fact.gravity_score, 4),
                 "live_gravity_score": round(min(1.0, max(0.0, live_gravity)), 4),
                 "features": {
@@ -476,14 +552,31 @@ class FactsMixin:
                 },
                 "weights": weights.as_dict(),
                 "contributions": contributions,
-                "is_deprecated": fact.is_deprecated,
-                "is_expired": fact.is_expired,
-                "deprecated_by": fact.deprecated_by,
                 "resonance_count": fact.resonance_count,
                 "access_count": fact.access_count,
                 "last_accessed": fact.last_accessed,
                 "created_at": fact.created_at,
             }
+            if kind in ("fact", "singularity_fact"):
+                # SPO triple + lifecycle flags only meaningful for
+                # FactPassports — MetaFacts aren't bound to a single
+                # SPO slot.
+                response["subject"] = fact.subject
+                response["predicate"] = fact.predicate
+                response["object"] = fact.object
+                response["layer"] = fact.layer
+                response["is_deprecated"] = fact.is_deprecated
+                response["is_expired"] = fact.is_expired
+                response["deprecated_by"] = fact.deprecated_by
+            else:
+                # MetaFact-shaped fields. weight = number of source
+                # facts absorbed; source_fact_ids + source_texts are
+                # the lineage so the agent can explain "this bundle
+                # represents these N facts".
+                response["weight"] = fact.weight
+                response["source_fact_ids"] = list(fact.source_fact_ids)
+                response["source_texts"] = list(fact.source_texts)
+            return response
 
     def delete_fact(self, fact_id: str) -> bool:
         """

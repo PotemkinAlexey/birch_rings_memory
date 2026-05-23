@@ -452,7 +452,12 @@ def test_server_source_pins_every_error_envelope():
     root = pathlib.Path(__file__).resolve().parents[1]
     src = (root / "src" / "birch" / "server.py").read_text()
     for token in [
-        '"invalid_top_k"',
+        # Numeric input validation collapsed under the symmetric
+        # invalid_int / invalid_float family — previously a per-tool
+        # ad-hoc invalid_top_k literal lived here.
+        '"invalid_int"',
+        '"invalid_float"',
+        '"invalid_layers"',
         '"unknown_layer"',
         '"invalid_fact_fields"',
         '"invalid_fact_item"',

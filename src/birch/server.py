@@ -66,6 +66,23 @@ def _validate_id(value, field_name: str = "fact_id") -> Optional[dict]:
     return None
 
 
+def _env_int(
+    name: str, default: int, *, lo: int = 1, hi: int = 1_000_000,
+) -> int:
+    """Tolerant int env var. Garbage values (``BIRCH_*=abc``) MUST NOT
+    crash module import — the server has to come up so it can return
+    a structured error from a tool call. Bad input falls back to the
+    default; out-of-range input clamps."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
+
+
 # Cap on the per-call ``record_facts`` batch. Each item carries a string
 # embedding round-trip and a SQLite write — a 50k-item payload is one
 # accidental copy-paste away from a many-minute embed call + a huge
@@ -73,9 +90,75 @@ def _validate_id(value, field_name: str = "fact_id") -> Optional[dict]:
 # endpoints (well under Ollama's default) and well above any agent's
 # legitimate single-call write. Override via env if you really need
 # bigger batches and have audited the cost.
-_RECORD_FACTS_BATCH_CAP = max(
-    1, int(os.environ.get("BIRCH_RECORD_FACTS_BATCH_CAP", "500"))
+_RECORD_FACTS_BATCH_CAP = _env_int(
+    "BIRCH_RECORD_FACTS_BATCH_CAP", 500, lo=1, hi=10_000,
 )
+
+
+def _validate_int(
+    value, field_name: str, *, lo: int = 1, hi: int = 500,
+) -> tuple[Optional[int], Optional[dict]]:
+    """Type+range validator for integer MCP inputs (top_k, limit,
+    horizon_ticks). Returns ``(clamped_int, None)`` on success or
+    ``(None, error_dict)``. Whitespace-only / non-numeric / None all
+    return structured ``invalid_int`` so tools never raise raw
+    TypeError on a string-typed JSON arg from a poorly-typed client."""
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        return None, {
+            "ok": False,
+            "error": "invalid_int",
+            "field": field_name,
+            "got_type": type(value).__name__,
+            "hint": f"{field_name} must be an integer",
+        }
+    if ivalue < lo:
+        return None, {
+            "ok": False,
+            "error": "invalid_int",
+            "field": field_name,
+            "min": lo,
+            "got": ivalue,
+        }
+    return min(ivalue, hi), None
+
+
+def _validate_float(
+    value, field_name: str, *, lo: float = 0.0, hi: float = 1.0,
+) -> tuple[Optional[float], Optional[dict]]:
+    """Type+range+finite validator for float MCP inputs (min_similarity,
+    min_gravity). NaN/Infinity are rejected the same way as in
+    session_close r_override — undefined cosine comparisons are worse
+    than a clear error."""
+    import math
+    try:
+        fvalue = float(value)
+    except (TypeError, ValueError):
+        return None, {
+            "ok": False,
+            "error": "invalid_float",
+            "field": field_name,
+            "got_type": type(value).__name__,
+            "hint": f"{field_name} must be a finite float",
+        }
+    if not math.isfinite(fvalue):
+        return None, {
+            "ok": False,
+            "error": "invalid_float",
+            "field": field_name,
+            "detail": "NaN or Infinity",
+        }
+    if not lo <= fvalue <= hi:
+        return None, {
+            "ok": False,
+            "error": "invalid_float",
+            "field": field_name,
+            "min": lo,
+            "max": hi,
+            "got": fvalue,
+        }
+    return fvalue, None
 
 
 def _validate_spo_strings(
@@ -164,17 +247,50 @@ def query_memory(
     err = _validate_text(text, "text")
     if err is not None:
         return err
-    # Bounds: reject non-positive / oversized top_k with a structured
-    # response. _store.query handles top_k=0 internally,
-    # but the MCP contract should be explicit: an agent that asks for
-    # zero hits gets told why, not silently empty results.
-    if top_k <= 0:
-        return {"results": [], "error": "invalid_top_k",
-                "_hint": "top_k must be positive"}
+    # Numeric type validation: a poorly-typed JSON client passing
+    # top_k="5" used to raise raw TypeError in the `<=` comparison
+    # below. _validate_int turns that into a structured response and
+    # also caps at 50 (the existing upper bound), preserving the
+    # "requested vs capped" disclosure path.
     requested_top_k = top_k
-    if top_k > 50:
-        top_k = 50
+    top_k_validated, err = _validate_int(top_k, "top_k", lo=1, hi=50)
+    if err is not None:
+        return {"results": [], **err}
+    top_k = top_k_validated  # type: ignore[assignment]
+    min_sim_validated, err = _validate_float(
+        min_similarity, "min_similarity", lo=0.0, hi=1.0,
+    )
+    if err is not None:
+        return {"results": [], **err}
+    min_similarity = min_sim_validated  # type: ignore[assignment]
+    min_grav_validated, err = _validate_float(
+        min_gravity, "min_gravity", lo=0.0, hi=1.0,
+    )
+    if err is not None:
+        return {"results": [], **err}
+    min_gravity = min_grav_validated  # type: ignore[assignment]
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
+    if layers is not None:
+        # Shape check: layers="surface" (string instead of list) used
+        # to iterate by character and report unknown_layers=["s","u",
+        # "r","f","a","c","e"] — technically structured but
+        # misleading. Tell the caller the actual shape problem.
+        if isinstance(layers, str) or not isinstance(layers, list):
+            return {
+                "results": [],
+                "error": "invalid_layers",
+                "got_type": type(layers).__name__,
+                "hint": (
+                    "layers must be a list of strings; valid values "
+                    "are surface, kinetic, core"
+                ),
+            }
+        if any(not isinstance(x, str) for x in layers):
+            return {
+                "results": [],
+                "error": "invalid_layers",
+                "hint": "every item in layers must be a string",
+            }
     if layers:
         # Validate enum: a typo like "surfase" used to silently produce an
         # empty allowed set, returning zero results with no explanation.
@@ -600,6 +716,15 @@ def forecast_memory(horizon_ticks: int = 50) -> dict:
     """
     from .vector_index import DimensionMismatchError
 
+    # Numeric validation symmetric with the other tools. horizon=0/neg
+    # was already handled by the catch-all ValueError below, but a
+    # structured invalid_int gives the agent a cleaner contract.
+    horizon_validated, err = _validate_int(
+        horizon_ticks, "horizon_ticks", lo=1, hi=10_000,
+    )
+    if err is not None:
+        return err
+    horizon_ticks = horizon_validated  # type: ignore[assignment]
     try:
         return _store.run_forecast(horizon_ticks=horizon_ticks)
     except DimensionMismatchError as exc:
@@ -711,22 +836,31 @@ def list_facts(
     ``min_gravity`` (drop low-confidence facts), ``layer`` (one of
     ``surface``/``kinetic``/``core``).
     """
-    # Bounds: a zero/negative limit used to fall through to the
-    # "len(out) >= limit" check below AFTER the first append, so the
-    # caller still got one item back. Reject explicitly. Cap upper
-    # bound so an agent asking for 1M facts can't pin the server.
-    if limit <= 0:
-        return []
-    if limit > 500:
-        # list_facts returns list[dict] of fact rows; injecting a warning
-        # dict at index 0 would break every consumer that iterates. Log
-        # the cap server-side instead — the agent can also detect the
-        # cap by len(result) == 500 against its requested limit.
+    # Numeric validation: string limit / min_gravity from a poorly
+    # typed JSON client would raise raw TypeError below. _validate_*
+    # turn that into a structured response. list_facts returns list[dict];
+    # the convention here is to inject the error at index 0 (existing
+    # unknown_layer path does the same).
+    limit_validated, err = _validate_int(limit, "limit", lo=1, hi=500)
+    if err is not None:
+        return [err]
+    requested_limit = limit
+    limit = limit_validated  # type: ignore[assignment]
+    if requested_limit != limit:
+        # Cap disclosure (was previously a server-side log; keeping
+        # behaviour for now). Agent can detect the cap by
+        # len(result) == 500 against its requested limit.
         import logging
         logging.getLogger(__name__).warning(
-            "list_facts: limit capped at 500 (requested %d)", limit,
+            "list_facts: limit capped at 500 (requested %s)",
+            requested_limit,
         )
-        limit = 500
+    min_grav_validated, err = _validate_float(
+        min_gravity, "min_gravity", lo=0.0, hi=1.0,
+    )
+    if err is not None:
+        return [err]
+    min_gravity = min_grav_validated  # type: ignore[assignment]
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     # Validate enum: a typo used to silently produce target_layer=None,
     # which then returned ALL layers — worse than empty because the
@@ -786,18 +920,19 @@ def find_similar(
     err = _validate_text(text, "text")
     if err is not None:
         return err
-    # Bounds: explicit MCP contract. VectorIndex.search guards top_k<=0
-    # internally; the server layer should surface that as a structured
-    # warning so the agent learns instead of silently getting nothing.
-    if top_k <= 0:
-        return {
-            "query": text,
-            "hits": [],
-            "_warning": "top_k must be positive",
-        }
+    # Numeric validation: structured response on bad type / out-of-range
+    # before _store.find_similar receives the input.
     requested_top_k = top_k
-    if top_k > 50:
-        top_k = 50
+    top_k_validated, err = _validate_int(top_k, "top_k", lo=1, hi=50)
+    if err is not None:
+        return {"query": text, "hits": [], **err}
+    top_k = top_k_validated  # type: ignore[assignment]
+    min_sim_validated, err = _validate_float(
+        min_similarity, "min_similarity", lo=0.0, hi=1.0,
+    )
+    if err is not None:
+        return {"query": text, "hits": [], **err}
+    min_similarity = min_sim_validated  # type: ignore[assignment]
     try:
         hits = _store.find_similar(
             text=text,
@@ -872,9 +1007,16 @@ def session_open(
     unique one is generated.
     """
     sid = session_id or f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
-    _store.session_start(sid)
+    # session_start now returns whether a brand-new SessionContext was
+    # created (True) or an existing in-flight one was promoted (False).
+    # Retry-aware agents need to distinguish "fresh open" from
+    # "recovered after a flaky open" so they don't accidentally double-
+    # push the same first_message into the trajectory.
+    created = _store.session_start(sid)
     response: dict = {
         "session_id": sid,
+        "created": created,
+        "already_open": not created,
         "_hint": (
             "pass this session_id to record_fact, record_facts, query_memory, "
             "and session_push — then call session_close when done"

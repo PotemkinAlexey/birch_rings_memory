@@ -151,7 +151,7 @@ class SessionsMixin:
 
     # ── Session lifecycle ────────────────────────────────────────────────────
 
-    def session_start(self, session_id: str) -> None:
+    def session_start(self, session_id: str) -> bool:
         """Open a session context. Safe to call concurrently.
 
         Idempotent: if the session already exists, the existing
@@ -163,6 +163,11 @@ class SessionsMixin:
         a second session_start silently overwrote the context with
         an empty one, which lost the conversation's resonance
         attribution before close.
+
+        Returns ``True`` if a new SessionContext was created, ``False``
+        if an existing one was promoted (idempotent reopen). The MCP
+        wrapper surfaces this as ``already_open`` so retry-aware agents
+        can distinguish a fresh open from a recovered in-flight one.
         """
         with self._lock:
             with self._txn():
@@ -179,7 +184,7 @@ class SessionsMixin:
                         "in-flight context (idempotent open)",
                         session_id,
                     )
-                    return
+                    return False
                 ctx = SessionContext(session_id=session_id)
                 self._sessions[session_id] = ctx
                 self._current_session_id = session_id
@@ -187,6 +192,7 @@ class SessionsMixin:
                     self._storage.save_open_session(
                         session_id, ctx.messages, ctx.vectors, ctx.facts, time.time()
                     )
+                return True
 
     def session_message(self, text: str, session_id: Optional[str] = None) -> None:
         """Record a user message in the named session (or the current one)."""

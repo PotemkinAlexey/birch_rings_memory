@@ -199,7 +199,7 @@ so polymorphic `query()` does four scans without ID collisions.
 | `black_hole.py` | `BlackHole` — irreversible sink + Hawking emission (facts + metas) |
 | `singularity_compactor.py` | `collapse_singularity()` — Union-Find collapse + center of mass |
 | `vector_index.py` | `VectorIndex` — numpy-backed cosine search |
-| `memory_store.py` | `MemoryStore` — unified API, per-session contexts, RLock, collapse orchestration |
+| `memory_store/` | `MemoryStore` package — split for navigability after it crossed 2500 LOC. Composition root `_base.py` plus five mixin files (`_sessions.py`, `_facts.py`, `_query.py`, `_singularity.py`, `_stats.py`) + `_models.py` (`QueryResult`, `SessionContext`) + `_embed_proxy.py` (late-binding embed lookup). Public import `from birch.memory_store import MemoryStore` unchanged |
 | `storage/base.py` | `StorageBackend` — Protocol for pluggable persistence |
 | `storage/sqlite.py` | `SQLiteBackend` — default write-through implementation, batched commits |
 | `server.py` | MCP server — exposes memory as tools for Claude agents |
