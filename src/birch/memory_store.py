@@ -11,7 +11,7 @@ from typing import Iterator, Optional
 
 from .black_hole import BlackHole
 from .fact import FactPassport
-from .gravity import GravityEngine
+from .gravity import GravityEngine, pre_resonance_features
 from .meta_fact import MetaFact
 from .resonance.cluster import ClusterBundle
 from .resonance.detector import compute_resonance
@@ -335,6 +335,11 @@ class MemoryStore:
     def _load_from_storage(self) -> None:
         # Only ever called when storage is configured (from __init__ / _reload).
         assert self._storage is not None
+        # Learned pre-resonance weights, if the user's history has trained any.
+        if hasattr(self._storage, "load_adaptive_weights"):
+            persisted = self._storage.load_adaptive_weights()
+            if persisted is not None:
+                self._engine.weights = persisted
         for fact in self._storage.load_facts():
             self._facts[fact.fact_id] = fact
             self._engine.register(fact)
@@ -672,6 +677,23 @@ class MemoryStore:
                 # every fact, so it must run on the authoritative state.
                 self._sync()
 
+                # Snapshot pre-resonance features for facts about to receive
+                # their first ever resonance — these are the training events
+                # for the adaptive weights. Resonance is the teacher; the
+                # weights learn what predicted realised value *before* it.
+                now_ts = time.time()
+                max_deg = max(self._engine._degrees.values(), default=1)
+                training_features: list[tuple[float, float, float]] = []
+                for fid in facts_snapshot:
+                    f = self._facts.get(fid)
+                    if f is not None and f.resonance_count == 0:
+                        training_features.append(pre_resonance_features(
+                            f,
+                            graph_degree=self._engine._degrees.get(fid, 0),
+                            max_degree=max_deg,
+                            now=now_ts,
+                        ))
+
                 # Propagate R to facts used in this session, weighted by how
                 # relevant each fact was to the session's queries.
                 self._engine.apply_session_resonance(facts_snapshot, result.r)
@@ -712,6 +734,20 @@ class MemoryStore:
                     self._storage.save_facts(list(self._facts.values()))
                     if self._meta_facts and hasattr(self._storage, "save_meta_facts"):
                         self._storage.save_meta_facts(list(self._meta_facts.values()))
+
+                # Train the adaptive weights: one regularised SGD step per
+                # session toward (R + 1) / 2, using the mean of first-resonance
+                # features as the predictor. One signal in, one step out — the
+                # weights drift slowly toward what predicts value FOR YOU.
+                if training_features:
+                    n = len(training_features)
+                    mean_f = sum(f[0] for f in training_features) / n
+                    mean_a = sum(f[1] for f in training_features) / n
+                    mean_g = sum(f[2] for f in training_features) / n
+                    target = max(0.0, min(1.0, (result.r + 1.0) / 2.0))
+                    self._engine.weights.update(mean_f, mean_a, mean_g, target=target)
+                    if self._storage and hasattr(self._storage, "save_adaptive_weights"):
+                        self._storage.save_adaptive_weights(self._engine.weights)
 
                 # Counter-triggered collapse. Held inside the lock so the
                 # collapse counter and the trigger decision are consistent.
@@ -1058,4 +1094,5 @@ class MemoryStore:
                 "collapse_counter": self._collapse_counter,
                 "total_collapses": self._total_collapses,
                 "last_collapse_at": self._last_collapse_at,
+                "adaptive_weights": self._engine.weights.as_dict(),
             }

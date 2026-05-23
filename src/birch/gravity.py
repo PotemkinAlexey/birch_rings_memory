@@ -5,6 +5,8 @@ import math
 import time
 from typing import Protocol
 
+from .adaptive_gravity import AdaptiveWeights
+
 
 class GravityBody(Protocol):
     """The gravity-relevant surface shared by FactPassport and MetaFact.
@@ -32,19 +34,17 @@ class GravityBody(Protocol):
     def apply_resonance(self, r: float) -> None: ...
 
 
-# Layer thresholds — facts migrate when gravity crosses these boundaries
-_LAYER_UP = 0.70    # gravity > 0.70 → promote to faster layer
-_LAYER_DOWN = 0.30  # gravity < 0.30 → demote to slower layer
+# Layer thresholds — facts migrate when gravity crosses these boundaries.
+_LAYER_UP = 0.70    # gravity > 0.70 → promote
+_LAYER_DOWN = 0.30  # gravity < 0.30 → demote
 
-# Component weights — sum to 1.0
-_W_FRESHNESS = 0.35   # how recently the fact was created
-_W_ACCESS = 0.20      # recency-weighted access frequency
-_W_RESONANCE = 0.35   # avg resonance of sessions that used it
-_W_GRAPH = 0.10       # connectivity in the knowledge graph
+# Resonance weight is fixed: resonance is observed value, not predicted.
+# The three pre-resonance weights live in AdaptiveWeights and are learned
+# from the user's actual session feedback.
+_W_RESONANCE = 0.35
 
-# Freshness half-life — a new fact is presumed relevant and rides high,
-# then sinks as it ages untouched. This is the grace period: a fresh fact
-# is not archived before it has had a chance to prove itself.
+# Freshness half-life — a new fact rides high and sinks as it ages
+# untouched. This is the grace period.
 _FRESHNESS_HALFLIFE_HOURS = 336.0   # ~2 weeks
 # Access half-life — how fast an un-revisited fact loses its access boost.
 _ACCESS_HALFLIFE_HOURS = 72.0       # ~3 days
@@ -52,55 +52,60 @@ _ACCESS_HALFLIFE_HOURS = 72.0       # ~3 days
 _LN2 = math.log(2)
 
 
-def compute_gravity(
+def pre_resonance_features(
     fact: GravityBody,
     graph_degree: int = 0,
     max_degree: int = 1,
     now: float | None = None,
-) -> float:
-    """
-    Compute gravity_score for a memory body. Returns a float in [0.0, 1.0].
-
-    Four components:
-      freshness  — decays from 1.0 by age since creation. A new fact starts
-                   buoyant; this is the grace period that keeps a just-created
-                   fact out of the cold core before it can prove itself.
-      access     — log-scaled access count, decayed by time since last touch.
-      resonance  — avg R of sessions that used it; 0 until a session scores it,
-                   so an un-resonated fact is not propped up by a neutral 0.5.
-      graph      — connectivity relative to the most-connected fact.
-
-    A fact rides high while fresh, climbs to the surface when used and
-    resonant, and sinks through the core toward the black hole as it ages
-    untouched.
+) -> tuple[float, float, float]:
+    """Compute (freshness, access, graph) — the features whose weights are
+    learned. Resonance is excluded on purpose: it is the *target* of the
+    learning, not a predictor of it.
     """
     now = now or time.time()
 
-    # Freshness: exponential decay from creation time.
     age_hours = max(0.0, (now - fact.created_at) / 3600)
     freshness = math.exp(-age_hours * _LN2 / _FRESHNESS_HALFLIFE_HOURS)
 
-    # Access: log-scaled count, decayed by time since last access.
     idle_hours = max(0.0, (now - fact.last_accessed) / 3600)
-    access_raw = math.log1p(fact.access_count) / math.log1p(100)  # saturates at 100
+    access_raw = math.log1p(fact.access_count) / math.log1p(100)
     access_decay = math.exp(-idle_hours * _LN2 / _ACCESS_HALFLIFE_HOURS)
     access_score = min(1.0, access_raw * access_decay)
 
-    # Resonance: avg_resonance lives in [-1, +1] → [0, 1]. Only counts once a
-    # session has actually scored the fact.
+    graph_score = min(1.0, graph_degree / max(1, max_degree))
+
+    return freshness, access_score, graph_score
+
+
+def compute_gravity(
+    fact: GravityBody,
+    weights: AdaptiveWeights | None = None,
+    graph_degree: int = 0,
+    max_degree: int = 1,
+    now: float | None = None,
+) -> float:
+    """Compute gravity_score for a memory body in [0.0, 1.0].
+
+    The three pre-resonance weights are read from ``weights`` (learned),
+    the resonance weight stays fixed. When ``weights`` is None we fall back
+    to the hand-tuned prior — identical to the previous static formula.
+    """
+    if weights is None:
+        weights = AdaptiveWeights.from_prior()
+
+    freshness, access_score, graph_score = pre_resonance_features(
+        fact, graph_degree, max_degree, now)
+
     if fact.resonance_count > 0:
         resonance_score = (fact.avg_resonance + 1.0) / 2.0
     else:
         resonance_score = 0.0
 
-    # Graph: degree relative to the most-connected fact in the store.
-    graph_score = min(1.0, graph_degree / max(1, max_degree))
-
     gravity = (
-        _W_FRESHNESS * freshness
-        + _W_ACCESS * access_score
+        weights.w_freshness * freshness
+        + weights.w_access * access_score
         + _W_RESONANCE * resonance_score
-        + _W_GRAPH * graph_score
+        + weights.w_graph * graph_score
     )
     return round(min(1.0, max(0.0, gravity)), 4)
 
@@ -116,26 +121,25 @@ def _target_layer(gravity: float) -> int:
 
 def update_gravity(
     fact: GravityBody,
+    weights: AdaptiveWeights | None = None,
     graph_degree: int = 0,
     max_degree: int = 1,
     now: float | None = None,
 ) -> int | None:
-    """
-    Recompute gravity_score in place. Returns the new layer if it migrated.
+    """Recompute gravity_score in place. Returns the new layer if it migrated.
 
-    Migration steps one layer per tick *toward* the layer the gravity score
-    belongs in — so a fact climbs out of the core once its gravity recovers
-    into the kinetic band, and a cooled surface fact settles back to kinetic.
-    The single-step cap keeps movement gradual and avoids teleporting on a
-    noisy reading.
+    Migration steps one layer per tick toward the layer the gravity score
+    belongs in — so a fact climbs out of core once its gravity recovers into
+    the kinetic band, and a cooled surface fact settles back to kinetic.
     """
-    fact.gravity_score = compute_gravity(fact, graph_degree, max_degree, now)
+    fact.gravity_score = compute_gravity(
+        fact, weights, graph_degree, max_degree, now)
 
     target = _target_layer(fact.gravity_score)
     if target < fact.layer:
-        new_layer = fact.layer - 1   # one step toward the surface
+        new_layer = fact.layer - 1
     elif target > fact.layer:
-        new_layer = fact.layer + 1   # one step toward the core
+        new_layer = fact.layer + 1
     else:
         new_layer = fact.layer
 
@@ -146,9 +150,14 @@ def update_gravity(
 
 
 class GravityEngine:
-    """Manages gravity computation across a collection of facts."""
+    """Manages gravity computation across a collection of facts.
 
-    def __init__(self) -> None:
+    Holds the live ``AdaptiveWeights`` so a tick uses the learned weights;
+    callers that don't care get the hand-tuned prior automatically.
+    """
+
+    def __init__(self, weights: AdaptiveWeights | None = None) -> None:
+        self.weights = weights if weights is not None else AdaptiveWeights.from_prior()
         self._facts: dict[str, GravityBody] = {}
         self._degrees: dict[str, int] = {}     # fact_id → graph degree
 
@@ -171,11 +180,6 @@ class GravityEngine:
         ``facts`` may be either:
           - a list[str] of fact_ids (legacy, uniform weight 1.0)
           - a dict[str, float] of fact_id → relevance weight ∈ [0, 1]
-
-        Per-fact weighting is the right primitive: an irrelevant
-        low-similarity fact that happened to be returned by query
-        gets a tiny resonance bump, while a high-similarity fact
-        the agent actually leaned on gets the full session R.
         """
         if isinstance(facts, dict):
             for fid, weight in facts.items():
@@ -187,9 +191,9 @@ class GravityEngine:
                     self._facts[fid].apply_resonance(r)
 
     def tick(self, now: float | None = None) -> list[tuple[str, int]]:
-        """
-        Recompute gravity for all facts. Returns list of (fact_id, new_layer)
-        for facts that migrated.
+        """Recompute gravity for all facts using the engine's adaptive weights.
+
+        Returns the list of (fact_id, new_layer) for facts that migrated.
         """
         max_deg = max(self._degrees.values(), default=1)
         migrations = []
@@ -198,6 +202,7 @@ class GravityEngine:
                 continue
             new_layer = update_gravity(
                 fact,
+                self.weights,
                 graph_degree=self._degrees.get(fid, 0),
                 max_degree=max_deg,
                 now=now,

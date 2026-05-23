@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Iterator, Protocol, runtime_checkable
 
+from ..adaptive_gravity import AdaptiveWeights
 from ..fact import FactPassport
 from ..meta_fact import MetaFact
 
@@ -96,5 +97,15 @@ class StorageBackend(Protocol):
     def transaction(self) -> Iterator[None]:
         """Reentrant exclusive transaction; nested writes share one commit."""
         yield
+
+    # ── Adaptive gravity weights (optional) ─────────────────────────────────
+
+    def save_adaptive_weights(self, weights: AdaptiveWeights) -> None:
+        """Persist the learned pre-resonance gravity weights."""
+        ...
+
+    def load_adaptive_weights(self) -> AdaptiveWeights | None:
+        """Return persisted weights, or None when nothing has been learned."""
+        ...
 
     def close(self) -> None: ...

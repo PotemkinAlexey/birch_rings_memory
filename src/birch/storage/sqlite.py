@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from ..adaptive_gravity import AdaptiveWeights
 from ..fact import FactPassport
 from ..meta_fact import MetaFact
 
@@ -66,6 +67,15 @@ CREATE TABLE IF NOT EXISTS meta_facts (
     last_accessed   REAL,
     resonance_sum   REAL DEFAULT 0.0,
     resonance_count INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS adaptive_weights (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    w_freshness     REAL NOT NULL,
+    w_access        REAL NOT NULL,
+    w_graph         REAL NOT NULL,
+    train_count     INTEGER NOT NULL DEFAULT 0,
+    updated_at      REAL
 );
 """
 
@@ -352,6 +362,41 @@ class SQLiteBackend:
         rows = self._conn.execute("SELECT * FROM meta_facts").fetchall()
         # MetaFact.from_dict is tolerant of the JSON-string column shape.
         return [MetaFact.from_dict(dict(r)) for r in rows]
+
+    # ── Adaptive gravity weights ─────────────────────────────────────────────
+
+    def save_adaptive_weights(self, weights: AdaptiveWeights) -> None:
+        """Persist the learned pre-resonance gravity weights (singleton row)."""
+        import time as _time
+
+        self._conn.execute(
+            "INSERT OR REPLACE INTO adaptive_weights "
+            "(id, w_freshness, w_access, w_graph, train_count, updated_at) "
+            "VALUES (1, ?, ?, ?, ?, ?)",
+            (
+                weights.w_freshness,
+                weights.w_access,
+                weights.w_graph,
+                weights.train_count,
+                _time.time(),
+            ),
+        )
+        self._maybe_commit()
+
+    def load_adaptive_weights(self) -> AdaptiveWeights | None:
+        """Return the persisted weights, or None if the store has none yet."""
+        row = self._conn.execute(
+            "SELECT w_freshness, w_access, w_graph, train_count "
+            "FROM adaptive_weights WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return AdaptiveWeights(
+            w_freshness=row["w_freshness"],
+            w_access=row["w_access"],
+            w_graph=row["w_graph"],
+            train_count=int(row["train_count"]),
+        )
 
     def close(self) -> None:
         self._conn.close()
