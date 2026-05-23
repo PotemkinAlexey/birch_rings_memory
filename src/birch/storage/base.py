@@ -38,6 +38,15 @@ class StorageBackend(Protocol):
 
     def load_edges(self) -> list[tuple[str, str]]: ...
 
+    def delete_edges_for_fact(self, fact_id: str) -> None:
+        """Drop every edge incident to ``fact_id`` (default: no-op).
+
+        Backends that persist the edge graph should override; the default
+        keeps minimal backends working unchanged. See ``MemoryStore.delete_fact``
+        which calls this so orphan edges do not accumulate.
+        """
+        return None
+
     def save_echo_session(
         self,
         session_id: str,

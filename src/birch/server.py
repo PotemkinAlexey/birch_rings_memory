@@ -179,16 +179,15 @@ def record_facts(
         (f["subject"], f["predicate"], f["object"])
         for f in facts
     ]
-    # Check existence before batch insert (no per-item round-trip needed).
-    existed = [_store.fact_exists(s, p, o) for s, p, o in triples]
     # Per-item session_id overrides the top-level one — honour the contract
     # spelled out in the docstring. Items without their own session_id fall
     # back to the top-level argument.
     per_item_sids = [f.get("session_id") for f in facts]
-    results_facts = _store.add_facts(
+    statuses = _store.add_facts(
         triples,
         session_id=session_id,
         session_ids=per_item_sids,
+        return_status=True,
     )
     if not session_id:
         hint = (
@@ -200,12 +199,17 @@ def record_facts(
     return {
         "facts": [
             {
-                "fact_id": fp.fact_id,
-                "already_existed": existed[i],
-                "layer": fp.layer,
-                "gravity_score": round(fp.gravity_score, 3),
+                "fact_id": s["fact"].fact_id,
+                # True if the SPO was already in the store BEFORE this batch.
+                "already_existed": s["already_existed"],
+                # True if an earlier item in this same batch already created
+                # the SPO — agents that send the same triple twice in one
+                # call now see it instead of getting two clean inserts.
+                "duplicate_in_batch": s["duplicate_in_batch"],
+                "layer": s["fact"].layer,
+                "gravity_score": round(s["fact"].gravity_score, 3),
             }
-            for i, fp in enumerate(results_facts)
+            for s in statuses
         ],
         "_hint": hint,
     }
@@ -344,8 +348,8 @@ def list_facts(
     (those live in the singularity).
 
     Filters: ``subject`` / ``predicate`` (case-insensitive substring),
-    ``subject_prefix`` (case-insensitive substring on subject — narrower
-    than ``subject`` when you want "starts with project name"),
+    ``subject_prefix`` (case-insensitive ``startswith`` on subject — use
+    when you want all facts under "my-project"),
     ``min_gravity`` (drop low-confidence facts), ``layer`` (one of
     ``surface``/``kinetic``/``core``).
     """
@@ -389,7 +393,7 @@ def find_similar(
 
     Returns live (non-deprecated, non-expired) facts whose embedding cosine
     to ``text`` is at or above ``min_similarity``. Higher threshold = stricter.
-    ``subject_prefix`` scopes by a case-insensitive substring on subject.
+    ``subject_prefix`` scopes by a case-insensitive ``startswith`` on subject.
 
     Typical flow: ``find_similar("HEAD on master", subject_prefix="my-project")``
     surfaces several stale HEAD entries; then ``set_fact(subject, "HEAD on
@@ -431,6 +435,7 @@ def session_open(
     session_id: Optional[str] = None,
     agent_id: str = "default",
     first_message: Optional[str] = None,
+    record_first_message: bool = True,
 ) -> dict:
     """USE WHEN: starting a conversation that will read or write memory and
     you want gravity feedback to land on the right facts. Always open a
@@ -442,6 +447,12 @@ def session_open(
     problem at cosine ≥ 0.68, the past session's R is pulled into toxic
     territory and the penalty propagates to the facts that misled it. The
     echo result is returned in the response under ``echo``.
+
+    ``record_first_message`` (default True) also pushes the first message
+    into the session's trajectory so the resonance engine sees it on close
+    — same as if you had called ``session_push(first_message)`` immediately
+    after. Set to False if you only want the echo check and plan to push
+    the opening message separately.
 
     Returns ``session_id`` — pass it to every subsequent ``record_fact``,
     ``record_facts``, ``set_fact``, ``query_memory``, ``session_push``. Close
@@ -460,6 +471,12 @@ def session_open(
     }
     if first_message:
         response["echo"] = _store.check_echo(first_message, session_id=sid)
+        if record_first_message:
+            # Push the opening message into the trajectory so the resonance
+            # engine sees it on close. Without this, an agent that uses
+            # session_open(first_message=...) loses the opening turn from
+            # the semantic-shift and repetition signals.
+            _store.session_message(first_message, session_id=sid)
     return response
 
 
@@ -536,10 +553,18 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
     """
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)
+    # Symmetric with session_open(first_message=...) — if there's an
+    # opening message, run echo detection now so the retroactive penalty
+    # path can fire for this convenience entrypoint too. Without this,
+    # an agent that records a whole session in one call never benefits
+    # from echo, which is the main retroactive correction feature.
+    echo = None
+    if messages:
+        echo = _store.check_echo(messages[0], session_id=session_id)
     for msg in messages:
         _store.session_message(msg, session_id=session_id)
     summary = _store.session_close(session_id=session_id)
-    return {
+    response = {
         "session_id": session_id,
         "label": summary.get("label"),
         "r_score": round(summary.get("r", 0.0), 3),
@@ -547,6 +572,9 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
         "absorbed": len(summary.get("absorbed", [])),
         "stats": _store.stats,
     }
+    if echo is not None:
+        response["echo"] = echo
+    return response
 
 
 @mcp.tool()

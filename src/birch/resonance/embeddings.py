@@ -131,8 +131,19 @@ def _post(url: str, body: dict, timeout: float = 30.0) -> dict:
 def _ollama_embed_batch(texts: list[str]) -> list[list[float]]:
     try:
         data = _post(_BATCH_ENDPOINT, {"model": _MODEL, "input": texts})
-        if "embeddings" in data and isinstance(data["embeddings"], list):
-            return data["embeddings"]
+        embeddings = data.get("embeddings")
+        if isinstance(embeddings, list):
+            if len(embeddings) != len(texts):
+                raise EmbeddingError(
+                    f"Ollama batch returned {len(embeddings)} embeddings "
+                    f"for {len(texts)} inputs"
+                )
+            for i, v in enumerate(embeddings):
+                if not isinstance(v, list) or not v:
+                    raise EmbeddingError(
+                        f"Ollama batch embedding #{i} is empty or wrong shape"
+                    )
+            return embeddings
     except urllib.error.HTTPError:
         # 404 from older Ollama builds — fall through to per-prompt legacy.
         pass

@@ -300,6 +300,23 @@ class MemoryStore:
             return
         self._attribute_to(ctx, fact_id, weight)
 
+    def _persist_session_locked(self, ctx: Optional[SessionContext]) -> None:
+        """Caller must hold self._lock AND be inside a write transaction.
+
+        After mutating ``ctx.facts`` (attribution from a write or read), flush
+        the open-session row so the per-fact relevance map survives a crash
+        before ``session_close``. Without this, an agent that records facts
+        and dies mid-session loses the attribution mapping and the eventual
+        resonance signal will not reach those bodies.
+        """
+        if ctx is None or self._storage is None:
+            return
+        if not hasattr(self._storage, "save_open_session"):
+            return
+        self._storage.save_open_session(
+            ctx.session_id, ctx.messages, ctx.vectors, ctx.facts, time.time(),
+        )
+
     @staticmethod
     def _normalize_spo(subject: str, predicate: str, obj: str) -> tuple[str, str, str]:
         return (
@@ -363,8 +380,28 @@ class MemoryStore:
                     self._meta_facts[meta.meta_id] = meta
                     self._meta_index.add(meta.meta_id, meta.vector)
                     self._engine.register(meta)
+        # Edges between live facts only — orphan endpoints (referenced fact
+        # was deleted) used to inflate _degrees and skew max_deg, which
+        # depressed graph_score for healthy facts. Drop them here AND in
+        # storage so the corruption does not grow.
+        live_fact_ids = set(self._facts.keys())
+        stale_edges: list[tuple[str, str]] = []
         for from_id, to_id in self._storage.load_edges():
-            self._engine.link(from_id, to_id)
+            if from_id in live_fact_ids and to_id in live_fact_ids:
+                self._engine.link(from_id, to_id)
+            else:
+                stale_edges.append((from_id, to_id))
+        if (stale_edges and self._storage
+                and hasattr(self._storage, "delete_edges_for_fact")):
+            # Cheaper to delete by endpoint than to add a per-edge delete;
+            # the orphan list shares many endpoints in practice.
+            seen: set[str] = set()
+            for from_id, to_id in stale_edges:
+                for endpoint in (from_id, to_id):
+                    if (endpoint not in live_fact_ids
+                            and endpoint not in seen):
+                        self._storage.delete_edges_for_fact(endpoint)
+                        seen.add(endpoint)
         for row in self._storage.load_echo_sessions():
             centroids = row["centroids"]
             cb = ClusterBundle(centroids=centroids, k=len(centroids), inertia=0.0)
@@ -462,6 +499,7 @@ class MemoryStore:
                     ctx = self._sessions.get(sid)
                     if ctx is not None:
                         self._attribute_to(ctx, fact.fact_id, 1.0)
+                        self._persist_session_locked(ctx)
                 return fact
 
     def _touch_existing(
@@ -479,6 +517,7 @@ class MemoryStore:
             ctx = self._sessions.get(sid)
             if ctx is not None:
                 self._attribute_to(ctx, existing_id, 1.0)
+                self._persist_session_locked(ctx)
         return existing
 
     def add_facts(
@@ -487,7 +526,8 @@ class MemoryStore:
         layer: int = 1,
         session_id: Optional[str] = None,
         session_ids: Optional[list[Optional[str]]] = None,
-    ) -> list[FactPassport]:
+        return_status: bool = False,
+    ) -> list:
         """
         Batch-insert a list of (subject, predicate, object) triples.
 
@@ -500,7 +540,15 @@ class MemoryStore:
         ``session_id`` when the per-item entry is None. This is what makes
         the MCP ``record_facts`` per-item ``session_id`` contract real.
 
-        Returns one FactPassport per input triple, in the same order.
+        ``return_status=True`` returns a list of dicts with
+        ``{fact, already_existed, duplicate_in_batch}`` instead of bare
+        ``FactPassport`` objects. ``already_existed=True`` means the SPO
+        triple was in the store BEFORE this batch ran; ``duplicate_in_batch=True``
+        means an earlier item in the same batch already created it. Both
+        flags can be true (existing fact also duplicated in the batch).
+
+        Returns one ``FactPassport`` per input triple, in the same order
+        (or one status dict per input triple if ``return_status=True``).
         """
         if not triples:
             return []
@@ -511,18 +559,33 @@ class MemoryStore:
             )
 
         results: list[Optional[FactPassport]] = [None] * len(triples)
+        already_existed: list[bool] = [False] * len(triples)
+        duplicate_in_batch: list[bool] = [False] * len(triples)
 
         # Embed every triple outside the lock — one batch round-trip.
-        # Duplicates are embedded too: embed_batch is a single call either
-        # way, and covering all triples removes the phase-skew race where a
-        # triple judged a duplicate before embedding turns out to be new.
+        # embed_batch validates length, so a partial response from the
+        # provider becomes a typed EmbeddingError instead of a silent
+        # alignment drift through zip().
         texts = [f"{s} {p} {o}" for (s, p, o) in triples]
         vectors = embed_batch(texts)
+        if len(vectors) != len(triples):
+            from .resonance.embeddings import EmbeddingError
+            raise EmbeddingError(
+                f"embedding provider returned {len(vectors)} vectors for "
+                f"{len(triples)} inputs — refusing to write a partial batch"
+            )
+
+        # Touched sessions, persisted ONCE at the end inside the same txn.
+        touched_ctxs: set[str] = set()
 
         with self._lock:
             with self._txn():
                 # Reload under the write lock — the authoritative view.
                 self._sync()
+                # Track per-key first-occurrence within this batch so a
+                # duplicate SPO inside the same input list is marked.
+                seen_in_batch: dict[tuple[str, str, str], int] = {}
+
                 for idx, (triple, vec) in enumerate(zip(triples, vectors)):
                     s, p, o = triple
                     # Per-item session_id overrides the top-level default.
@@ -531,13 +594,25 @@ class MemoryStore:
                     sid = self._resolve_sid(raw_sid or session_id)
                     ctx = self._sessions.get(sid) if sid else None
                     key = self._normalize_spo(s, p, o)
+
+                    # 1) Pre-existing in the store (before this batch ran).
                     existing_id = self._spo_index.get(key)
+                    if (existing_id and existing_id in self._facts
+                            and key not in seen_in_batch):
+                        already_existed[idx] = True
+
+                    # 2) Already appeared in this batch above.
+                    if key in seen_in_batch:
+                        duplicate_in_batch[idx] = True
+
                     if existing_id and existing_id in self._facts:
                         fact = self._facts[existing_id]
                         fact.touch()
                         if ctx is not None:
                             self._attribute_to(ctx, existing_id, 1.0)
+                            touched_ctxs.add(ctx.session_id)
                         results[idx] = fact
+                        seen_in_batch.setdefault(key, idx)
                         continue
 
                     fact = FactPassport(
@@ -555,14 +630,28 @@ class MemoryStore:
                     self._auto_link_fact(fact.fact_id, vec)
                     if ctx is not None:
                         self._attribute_to(ctx, fact.fact_id, 1.0)
+                        touched_ctxs.add(ctx.session_id)
                     results[idx] = fact
+                    seen_in_batch.setdefault(key, idx)
 
                 # Persist new facts and touched duplicates in one shot.
                 if self._storage:
                     self._storage.save_facts(
                         [r for r in results if r is not None]
                     )
+                # Persist every open session whose attribution changed.
+                for sid in touched_ctxs:
+                    self._persist_session_locked(self._sessions.get(sid))
 
+        if return_status:
+            return [
+                {
+                    "fact": results[i],
+                    "already_existed": already_existed[i],
+                    "duplicate_in_batch": duplicate_in_batch[i],
+                }
+                for i in range(len(triples))
+            ]
         return results  # type: ignore[return-value]
 
     def find_similar(
@@ -581,7 +670,7 @@ class MemoryStore:
         ``supersede_fact`` / ``set_fact`` — write-time hygiene without
         committing to a mutation here.
 
-        ``subject_prefix`` is a case-insensitive substring filter on the
+        ``subject_prefix`` is a case-insensitive ``startswith`` filter on the
         fact's subject; useful for scoping a search to one project.
         ``exclude_ids`` skips known facts (e.g., the one you just wrote).
         """
@@ -719,6 +808,11 @@ class MemoryStore:
                 self._engine.unregister(fact_id)
                 if self._storage:
                     self._storage.delete_fact(fact_id)
+                    # Drop every edge incident to this fact — otherwise on
+                    # next load the orphan endpoints inflate _degrees and
+                    # depress graph_score for healthy facts.
+                    if hasattr(self._storage, "delete_edges_for_fact"):
+                        self._storage.delete_edges_for_fact(fact_id)
                 return True
 
     def list_facts(
@@ -977,10 +1071,14 @@ class MemoryStore:
                     tuple[float, float, float, float, float]
                 ] = []
                 for fid in facts_snapshot:
-                    f = self._facts.get(fid)
-                    if f is not None and f.resonance_count == 0:
+                    # Body may be a live FactPassport or a live MetaFact
+                    # (Hawking-emitted); both share the same gravity surface
+                    # and must train the formula symmetrically.
+                    body = (self._facts.get(fid)
+                            or self._meta_facts.get(fid))
+                    if body is not None and body.resonance_count == 0:
                         training_features.append(pre_resonance_features(
-                            f,
+                            body,
                             graph_degree=self._engine._degrees.get(fid, 0),
                             max_degree=max_deg,
                             now=now_ts,
@@ -998,14 +1096,19 @@ class MemoryStore:
                 # enough that a meaningful streak shows up within a week.
                 _EWMA_ALPHA = 0.15
                 for fid, attr_weight in facts_snapshot.items():
-                    f = self._facts.get(fid)
-                    if f is None:
+                    # Symmetric for FactPassport and MetaFact — both
+                    # implement touch() and carry recent_utility, so the
+                    # EWMA update must apply to whichever body the agent
+                    # actually consulted in this session.
+                    body = (self._facts.get(fid)
+                            or self._meta_facts.get(fid))
+                    if body is None:
                         continue
-                    f.touch()
+                    body.touch()
                     per_fact_r = result.r * float(attr_weight)
                     target = max(0.0, min(1.0, (per_fact_r + 1.0) / 2.0))
-                    f.recent_utility = (
-                        (1.0 - _EWMA_ALPHA) * f.recent_utility
+                    body.recent_utility = (
+                        (1.0 - _EWMA_ALPHA) * body.recent_utility
                         + _EWMA_ALPHA * target
                     )
 
@@ -1369,6 +1472,15 @@ class MemoryStore:
             # resurrect bodies outside the requested scope as a side effect.
             if hawking:
                 def _fact_predicate(f) -> bool:
+                    # Lifecycle: a fact that was superseded by set_fact /
+                    # supersede_fact, or expired via retire_fact, must NOT
+                    # come back through Hawking emission as if it were
+                    # current. The agent thinks it's reading live truth;
+                    # the body knows it has been retired. Default query
+                    # never returns these. (Explicit historical access
+                    # belongs to a different tool, not query_memory.)
+                    if f.is_deprecated or f.is_expired:
+                        return False
                     if f.gravity_score < min_gravity:
                         return False
                     if prefix and not f.subject.lower().startswith(prefix):
@@ -1376,11 +1488,18 @@ class MemoryStore:
                     return True
 
                 def _meta_predicate(m) -> bool:
+                    # MetaFacts cannot be deprecated/expired in the current
+                    # surface, but keep the same shape for symmetry and
+                    # forward compatibility.
+                    if getattr(m, "is_deprecated", False):
+                        return False
+                    if getattr(m, "is_expired", False):
+                        return False
                     if m.gravity_score < min_gravity:
                         return False
                     if prefix:
                         # No single subject on a meta — only emit if any
-                        # source_text actually contains the prefix.
+                        # source_text actually starts with the prefix.
                         if not any((st or "").lower().startswith(prefix)
                                    for st in m.source_texts):
                             return False
@@ -1456,24 +1575,45 @@ class MemoryStore:
             # access_count / last_accessed / ctx.facts survive a crash
             # between session_message calls. Without this the gravity
             # formula's `access` term loses every read between closes.
-            if self._storage:
-                if touched_facts:
-                    with self._txn():
-                        self._storage.save_facts(touched_facts)
-                if (touched_metas
-                        and hasattr(self._storage, "save_meta_facts")):
-                    with self._txn():
-                        self._storage.save_meta_facts(touched_metas)
-            if (ctx is not None and self._storage
-                    and hasattr(self._storage, "save_open_session")):
+            # IMPORTANT: re-sync under the write lock and re-resolve every
+            # body from the authoritative dicts (rather than reusing the
+            # snapshot taken before the lock) so a write from another
+            # process between top selection and persist cannot get
+            # overwritten by stale snapshots.
+            need_persist = (
+                self._storage is not None
+                and (touched_facts or touched_metas or ctx is not None)
+            )
+            if need_persist:
+                touched_fact_ids = [f.fact_id for f in touched_facts]
+                touched_meta_ids = [m.meta_id for m in touched_metas]
                 with self._txn():
-                    self._storage.save_open_session(
-                        ctx.session_id,
-                        ctx.messages,
-                        ctx.vectors,
-                        ctx.facts,
-                        time.time(),
-                    )
+                    self._sync()
+                    fresh_facts = [
+                        self._facts[fid] for fid in touched_fact_ids
+                        if fid in self._facts
+                    ]
+                    fresh_metas = [
+                        self._meta_facts[mid] for mid in touched_meta_ids
+                        if mid in self._meta_facts
+                    ]
+                    if fresh_facts and self._storage:
+                        self._storage.save_facts(fresh_facts)
+                    if (fresh_metas and self._storage
+                            and hasattr(self._storage, "save_meta_facts")):
+                        self._storage.save_meta_facts(fresh_metas)
+                    # Re-resolve the open session under the write lock too.
+                    fresh_ctx = (self._sessions.get(ctx.session_id)
+                                 if ctx is not None else None)
+                    if (fresh_ctx is not None and self._storage
+                            and hasattr(self._storage, "save_open_session")):
+                        self._storage.save_open_session(
+                            fresh_ctx.session_id,
+                            fresh_ctx.messages,
+                            fresh_ctx.vectors,
+                            fresh_ctx.facts,
+                            time.time(),
+                        )
 
         return top
 

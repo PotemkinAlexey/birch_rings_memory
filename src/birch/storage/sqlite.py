@@ -297,6 +297,14 @@ class SQLiteBackend:
         rows = self._conn.execute("SELECT from_id, to_id FROM edges").fetchall()
         return [(r["from_id"], r["to_id"]) for r in rows]
 
+    def delete_edges_for_fact(self, fact_id: str) -> None:
+        """Drop every edge whose endpoint is ``fact_id``."""
+        self._conn.execute(
+            "DELETE FROM edges WHERE from_id = ? OR to_id = ?",
+            (fact_id, fact_id),
+        )
+        self._maybe_commit()
+
     # ── Echo sessions ─────────────────────────────────────────────────────────
 
     def save_echo_session(
