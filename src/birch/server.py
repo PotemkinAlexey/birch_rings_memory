@@ -26,27 +26,28 @@ def query_memory(
     session_id: Optional[str] = None,
     min_similarity: float = 0.0,
     layers: Optional[list[str]] = None,
+    subject_prefix: Optional[str] = None,
+    min_gravity: float = 0.0,
 ) -> dict:
-    """
-    Search memory for facts relevant to the given text.
+    """USE WHEN: looking up facts relevant to a user's first message or to a
+    sub-question mid-session. Pass ``session_id`` so retrieved facts are
+    attributed to the open session (their gravity rises if the session
+    resonates, falls if it goes toxic).
 
-    Returns up to top_k hits ranked by semantic similarity. Every item includes
-    kind, body_id, similarity, source, layer, gravity_score.
+    Returns ranked hits plus ``conflicts`` — any (subject, predicate) that
+    has more than one live candidate among the hits, with a ``recommended_id``
+    by gravity. Use that to spot "two competing HEAD values" cases.
 
-    kind == "fact" — also subject, predicate, object, fact_id (same as body_id).
-    kind == "meta" — also meta_id, weight, source_texts, source_fact_ids, summary.
-
-    Pass session_id to attribute retrieved bodies to an open session so their
-    gravity is updated when the session closes. Omit for read-only lookups.
-
-    min_similarity: drop results below this cosine threshold (0.0 = return all).
-    layers: restrict to specific layers, e.g. ["surface", "kinetic"].
-            Omit to search all layers. Valid values: "surface", "kinetic", "core".
+    Filters: ``subject_prefix`` (case-insensitive substring on subject),
+    ``min_gravity`` (drop low-confidence facts), ``layers`` (any of
+    ``surface``/``kinetic``/``core``), ``min_similarity`` (cosine floor).
+    Deprecated / expired facts are never returned (they live in the
+    singularity, not the live layers).
 
     source values:
-      "surface" / "kinetic" / "core" — live FactPassport layers
-      "hawking"      — single fact recovered from the black hole
-      "hawking_meta" — MetaFact bundle recovered from the black hole
+      ``surface`` / ``kinetic`` / ``core`` — live FactPassport layers
+      ``hawking``      — single fact recovered from the black hole
+      ``hawking_meta`` — MetaFact bundle recovered from the black hole
     """
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     if layers:
@@ -65,6 +66,47 @@ def query_memory(
         max_layer=max_layer,
     )
     hits = [r.to_mcp_dict() for r in results]
+    prefix = subject_prefix.lower() if subject_prefix else None
+    if prefix or min_gravity > 0.0:
+        hits = [
+            h for h in hits
+            if h.get("gravity_score", 0.0) >= min_gravity
+            and (not prefix or prefix in (h.get("subject") or "").lower())
+        ]
+
+    # conflict_hints: same (subject, predicate) with different objects.
+    conflicts: list[dict] = []
+    by_slot: dict[tuple[str, str], list[dict]] = {}
+    for h in hits:
+        if h.get("kind") != "fact":
+            continue
+        s = (h.get("subject") or "").strip().lower()
+        p = (h.get("predicate") or "").strip().lower()
+        by_slot.setdefault((s, p), []).append(h)
+    for (_, _), group in by_slot.items():
+        if len(group) <= 1:
+            continue
+        sorted_group = sorted(
+            group,
+            key=lambda x: x.get("gravity_score", 0.0),
+            reverse=True,
+        )
+        conflicts.append({
+            "subject": sorted_group[0].get("subject"),
+            "predicate": sorted_group[0].get("predicate"),
+            "candidates": [
+                {
+                    "fact_id": x.get("fact_id"),
+                    "object": x.get("object"),
+                    "gravity_score": x.get("gravity_score"),
+                    "similarity": x.get("similarity"),
+                }
+                for x in sorted_group
+            ],
+            "recommended_id": sorted_group[0].get("fact_id"),
+            "_hint": "consider set_fact(...) or supersede_fact(loser_id, recommended_id)",
+        })
+
     if not session_id:
         hint = (
             "pass session_id to attribute these reads to a session "
@@ -72,7 +114,10 @@ def query_memory(
         )
     else:
         hint = "call session_close when the conversation ends to propagate resonance to gravity"
-    return {"results": hits, "_hint": hint}
+    response: dict = {"results": hits, "_hint": hint}
+    if conflicts:
+        response["conflicts"] = conflicts
+    return response
 
 
 @mcp.tool()
@@ -82,23 +127,29 @@ def record_fact(
     object: str,
     session_id: Optional[str] = None,
 ) -> dict:
-    """
-    Store a new fact in memory as a subject-predicate-object triple.
+    """USE WHEN: storing a new atomic SPO triple where the (subject, predicate)
+    can legitimately carry several objects (e.g. "api uses Postgres" AND
+    "api uses Redis"). For one-canonical-value slots — HEADs, versions,
+    counts — use ``set_fact`` instead so old values auto-supersede.
 
-    Good triples:
-      subject="mailer service", predicate="runs on",      object="Go"
-      subject="user",           predicate="prefers",      object="dark mode"
-      subject="deploy pipeline",predicate="fails when",   object="migrations run first"
+    Identical triples (case-insensitive, whitespace-normalised) are deduplicated:
+    the existing fact is touched and returned with ``already_existed=true``.
 
-    Identical triples (case-insensitive, whitespace-normalised) are deduplicated —
-    the existing fact is touched and returned. Check already_existed in the response
-    to know if you created a new fact or confirmed an existing one.
-
-    Pass session_id to attribute this fact to an open session so its gravity
-    is updated when the session closes.
+    The response includes ``similar_existing`` — paraphrase candidates already
+    in the store at cosine ≥ 0.85 (excluding this fact). Treat them as
+    "consider supersede_fact or set_fact"; the dedup in this call only catches
+    exact normalised SPO matches, not "X uses Postgres" vs "X is on Postgres".
     """
     already_existed = _store.fact_exists(subject, predicate, object)
     fact = _store.add_fact(subject, predicate, object, session_id=session_id)
+    similar: list[dict] = []
+    if not already_existed and fact.vector:
+        similar = _store._find_similar_by_vector(
+            fact.vector,
+            top_k=3,
+            min_similarity=0.85,
+            exclude_ids={fact.fact_id},
+        )
     if not session_id:
         hint = (
             "open a session with session_open and pass session_id here "
@@ -111,6 +162,7 @@ def record_fact(
         "already_existed": already_existed,
         "layer": fact.layer,
         "gravity_score": round(fact.gravity_score, 3),
+        "similar_existing": similar,
         "_hint": hint,
     }
 
@@ -120,20 +172,14 @@ def record_facts(
     facts: list[dict],
     session_id: Optional[str] = None,
 ) -> dict:
-    """
-    Store multiple facts in one batch — one Ollama round-trip, one SQLite transaction.
+    """USE WHEN: storing several SPO triples at once — one Ollama round-trip
+    and one SQLite transaction beats N ``record_fact`` calls. Same semantics
+    per item as ``record_fact``; exact-SPO duplicates are touched and
+    returned with ``already_existed=true``. For mutable-scalar slots use
+    ``set_fact`` per item instead.
 
-    Each item in facts must have "subject", "predicate", "object".
-    Optional per-item "session_id" overrides the top-level session_id.
-
-    Example:
-      facts=[
-        {"subject": "API", "predicate": "written in", "object": "Go"},
-        {"subject": "API", "predicate": "deployed on", "object": "Kubernetes"},
-      ]
-
-    Returns one result per input fact, in the same order.
-    Duplicates are touched and returned with already_existed=true.
+    Each item must have ``subject``, ``predicate``, ``object``; per-item
+    ``session_id`` overrides the top-level one.
     """
     triples = [
         (f["subject"], f["predicate"], f["object"])
@@ -163,6 +209,30 @@ def record_facts(
         ],
         "_hint": hint,
     }
+
+
+@mcp.tool()
+def set_fact(
+    subject: str,
+    predicate: str,
+    object: str,
+    session_id: Optional[str] = None,
+) -> dict:
+    """USE WHEN: a (subject, predicate) slot has one canonical value that
+    *replaces* whatever was there before — HEADs, version strings, current
+    counts, single-valued settings. Atomic upsert with auto-supersede.
+
+    Records the new fact and supersedes every live fact that shares the same
+    ``(subject, predicate)`` — old bodies land in the singularity with
+    ``deprecated_by`` pointing at the new one (lineage preserved, MetaFact +
+    Hawking still possible). This is the canonical write for mutable scalars;
+    use ``record_fact`` instead when several ``object``s can legitimately
+    coexist on the same (subject, predicate) — for example a service that
+    "uses" both Postgres and Redis.
+
+    Returns ``{"set": true, "fact_id", "already_existed", "superseded": [...]}``.
+    """
+    return _store.set_fact(subject, predicate, object, session_id=session_id)
 
 
 @mcp.tool()
@@ -263,17 +333,37 @@ def list_facts(
     subject: Optional[str] = None,
     predicate: Optional[str] = None,
     limit: int = 50,
+    subject_prefix: Optional[str] = None,
+    min_gravity: float = 0.0,
+    layer: Optional[str] = None,
+    exclude_deprecated: bool = True,
 ) -> list[dict]:
-    """
-    List live facts, optionally filtered by subject and/or predicate substring.
+    """USE WHEN: auditing what the store actually holds about a topic, no
+    semantic query needed. Sorted by gravity descending; ``exclude_deprecated``
+    defaults true so superseded / retired bodies don't pollute the list
+    (those live in the singularity).
 
-    Matching is case-insensitive. Results are sorted by gravity_score descending.
-    Use this to audit memory without a semantic query — e.g. list_facts(subject="birch")
-    returns everything stored about birch, regardless of how you'd phrase the question.
+    Filters: ``subject`` / ``predicate`` (case-insensitive substring),
+    ``subject_prefix`` (case-insensitive substring on subject — narrower
+    than ``subject`` when you want "starts with project name"),
+    ``min_gravity`` (drop low-confidence facts), ``layer`` (one of
+    ``surface``/``kinetic``/``core``).
     """
-    facts = _store.list_facts(subject=subject, predicate=predicate, limit=limit)
-    return [
-        {
+    facts = _store.list_facts(subject=subject, predicate=predicate, limit=10_000)
+    layer_map = {"surface": 0, "kinetic": 1, "core": 2}
+    target_layer = layer_map.get(layer) if layer else None
+    prefix = subject_prefix.lower() if subject_prefix else None
+    out: list[dict] = []
+    for f in facts:
+        if exclude_deprecated and (f.is_deprecated or f.is_expired):
+            continue
+        if target_layer is not None and f.layer != target_layer:
+            continue
+        if f.gravity_score < min_gravity:
+            continue
+        if prefix and prefix not in f.subject.lower():
+            continue
+        out.append({
             "fact_id": f.fact_id,
             "subject": f.subject,
             "predicate": f.predicate,
@@ -281,20 +371,73 @@ def list_facts(
             "layer": f.layer,
             "gravity_score": round(f.gravity_score, 3),
             "source": {0: "surface", 1: "kinetic", 2: "core"}.get(f.layer, "kinetic"),
-        }
-        for f in facts
-    ]
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+@mcp.tool()
+def find_similar(
+    text: str,
+    top_k: int = 5,
+    min_similarity: float = 0.85,
+    subject_prefix: Optional[str] = None,
+) -> dict:
+    """USE WHEN: hunting for paraphrase candidates before writing or to plan a
+    ``set_fact`` / ``supersede_fact`` cleanup. Read-only; never mutates.
+
+    Returns live (non-deprecated, non-expired) facts whose embedding cosine
+    to ``text`` is at or above ``min_similarity``. Higher threshold = stricter.
+    ``subject_prefix`` scopes by a case-insensitive substring on subject.
+
+    Typical flow: ``find_similar("HEAD on master", subject_prefix="my-project")``
+    surfaces several stale HEAD entries; then ``set_fact(subject, "HEAD on
+    master", new_value)`` collapses them in one call.
+    """
+    hits = _store.find_similar(
+        text=text,
+        top_k=top_k,
+        min_similarity=min_similarity,
+        subject_prefix=subject_prefix,
+    )
+    return {
+        "query": text,
+        "min_similarity": min_similarity,
+        "hits": hits,
+        "_hint": (
+            "use set_fact for slot-replace, supersede_fact(old, new) when the "
+            "new fact is already recorded, retire_fact when no replacement"
+        ),
+    }
+
+
+@mcp.tool()
+def explain_fact(fact_id: str) -> dict:
+    """USE WHEN: a fact's gravity surprises you and you need to know why.
+
+    Decomposes the gravity score into per-feature contributions
+    (``freshness``, ``access``, ``graph``, ``recent_utility``,
+    ``forecast_stability``, ``resonance``) using the current adaptive
+    weights. Also reports ``is_deprecated`` / ``is_expired`` /
+    ``deprecated_by`` so you can tell whether the fact is even live.
+    Read-only debug; never mutates.
+    """
+    return _store.explain_fact(fact_id)
 
 
 @mcp.tool()
 def session_open(session_id: Optional[str] = None, agent_id: str = "default") -> dict:
-    """
-    Open a named memory session for tracking facts and messages over time.
+    """USE WHEN: starting a conversation that will read or write memory and
+    you want gravity feedback to land on the right facts. Always open a
+    session before the first ``query_memory`` so retrieved facts get
+    attributed to this session's outcome.
 
-    Returns the session_id to pass to subsequent session_push / session_close
-    calls and to record_fact / query_memory so gravity updates are attributed.
-
-    If session_id is omitted, a unique one is generated.
+    Returns ``session_id`` — pass it to every subsequent ``record_fact``,
+    ``record_facts``, ``set_fact``, ``query_memory``, ``session_push``. Close
+    with ``session_close`` when the conversation ends; that's when the
+    resonance signal propagates to gravity. If ``session_id`` is omitted a
+    unique one is generated.
     """
     sid = session_id or f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(sid)
@@ -309,12 +452,13 @@ def session_open(session_id: Optional[str] = None, agent_id: str = "default") ->
 
 @mcp.tool()
 def session_push(text: str, session_id: str) -> dict:
-    """
-    Append a user message to an open session.
+    """USE WHEN: a user message arrives during an open session. Push every
+    user message so the resonance engine can score the conversation
+    trajectory on close.
 
-    Call this for each user message during the session. The text is embedded
-    and stored so the resonance engine can score the session trajectory on close.
-    Do NOT push your own (assistant) responses — only user-side text.
+    Pass user-side text only. Do NOT push your own assistant responses —
+    behavioural / semantic / repetition signals score user closure, not
+    your replies.
     """
     _store.session_message(text, session_id=session_id)
     return {
@@ -329,17 +473,15 @@ def session_push(text: str, session_id: str) -> dict:
 
 @mcp.tool()
 def session_close(session_id: str) -> dict:
-    """
-    Close a session: score resonance, update fact gravity, detect echo.
+    """USE WHEN: a conversation that wrote or read facts ends. Closes the
+    session, scores R from the message trajectory, propagates R to every
+    touched fact's gravity, runs `_absorb_dead`, may trigger background
+    singularity collapse. Call exactly once per opened session — repeated
+    closes corrupt the resonance signal.
 
-    Call once when the conversation ends. BirchKM will:
-      - Score R in [-1, +1] from the session messages
-      - Propagate R to all facts touched during the session
-      - Detect echo (return to unresolved problem) and apply retroactive penalty
-      - Absorb dead facts into the black hole
-      - Trigger gravitational collapse if thresholds are met
-
-    Returns: label, r_score, migrations, absorbed count, current stats.
+    Returns: ``label`` (resonant / neutral / toxic), ``r_score``,
+    ``migrations`` (count of facts that moved layer), ``absorbed`` (count of
+    facts that fell into the singularity), and a fresh ``stats`` snapshot.
     """
     summary = _store.session_close(session_id=session_id)
     return {
@@ -354,20 +496,14 @@ def session_close(session_id: str) -> dict:
 
 @mcp.tool()
 def record_session(messages: list[str], agent_id: str = "default") -> dict:
-    """
-    Score a completed session and update memory gravity.
+    """USE WHEN: scoring a finished conversation in one call (without having
+    used ``session_open`` / ``session_push`` / ``session_close``). Pass every
+    user message in order; do not include assistant replies.
 
-    Pass all user messages from the session in order. Do not include
-    your own responses — the resonance engine scores user-side signals only.
-
-    BirchKM will:
-      - Score the session R in [-1, +1] (resonant / neutral / toxic)
-      - Propagate R to all facts touched during the session
-      - Detect echo if the user returned to an unresolved problem
-      - Absorb dead facts into the black hole
-
-    Returns: label, r_score, migrations, absorbed count, current stats.
-    Call once per session, at the end.
+    Prefer the open / push / close trio when you can — it lets ``query_memory``
+    and ``record_fact`` attribute reads and writes incrementally to the
+    session. ``record_session`` is the fallback for "I forgot to open a
+    session and now I want the resonance signal anyway".
     """
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)
@@ -386,13 +522,15 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
 
 @mcp.tool()
 def memory_stats() -> dict:
-    """
-    Return current memory state — layer distribution and black hole status.
+    """USE WHEN: checking the memory's health — at session start if you
+    suspect drift, or on a periodic audit. Cheap, read-only.
 
-    Interpret:
-      black_hole_mass rising  — facts are failing; review what is being stored
-      surface count dropping  — active knowledge declining; system needs fresh input
-      hawking_emissions > 0   — dead facts resurface; store may have stale info
+    Reports layer distribution (surface / kinetic / core), black hole mass,
+    Hawking emission count, and the live ``adaptive_weights`` (so you can
+    see what the formula has actually learned). Interpret:
+      ``black_hole_mass`` rising — facts are failing; review what is being stored.
+      ``surface`` dropping — active knowledge declining; needs fresh input.
+      ``hawking_emissions > 0`` — dead facts resurface; store may have stale info.
     """
     return _store.stats
 

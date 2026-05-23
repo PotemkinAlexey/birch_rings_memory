@@ -540,6 +540,140 @@ class MemoryStore:
 
         return results  # type: ignore[return-value]
 
+    def find_similar(
+        self,
+        text: str,
+        top_k: int = 5,
+        min_similarity: float = 0.85,
+        subject_prefix: Optional[str] = None,
+        exclude_ids: Optional[set[str]] = None,
+    ) -> list[dict]:
+        """Read-only semantic search — surface paraphrase candidates.
+
+        Returns live (non-deprecated, non-expired) facts whose embedding
+        cosine to ``text`` is at or above ``min_similarity``. Use this to
+        discover candidates that should be folded together with
+        ``supersede_fact`` / ``set_fact`` — write-time hygiene without
+        committing to a mutation here.
+
+        ``subject_prefix`` is a case-insensitive substring filter on the
+        fact's subject; useful for scoping a search to one project.
+        ``exclude_ids`` skips known facts (e.g., the one you just wrote).
+        """
+        if not text.strip():
+            return []
+        vec = embed(text)
+        return self._find_similar_by_vector(
+            vec,
+            top_k=top_k,
+            min_similarity=min_similarity,
+            subject_prefix=subject_prefix,
+            exclude_ids=exclude_ids,
+        )
+
+    def _find_similar_by_vector(
+        self,
+        vec: list[float],
+        top_k: int = 5,
+        min_similarity: float = 0.85,
+        subject_prefix: Optional[str] = None,
+        exclude_ids: Optional[set[str]] = None,
+    ) -> list[dict]:
+        """Caller-provided embedding variant — used by record_fact's
+        similar_existing hint to avoid embedding the same text twice.
+        """
+        prefix = subject_prefix.lower() if subject_prefix else None
+        skip = exclude_ids or set()
+        with self._lock:
+            self._sync()
+            sims = self._index.all_similarities(vec)
+        hits: list[dict] = []
+        for fid, sim in sims.items():
+            if fid in skip:
+                continue
+            if sim < min_similarity:
+                continue
+            fact = self._facts.get(fid)
+            if fact is None or fact.is_deprecated or fact.is_expired:
+                continue
+            if prefix and prefix not in fact.subject.lower():
+                continue
+            hits.append({
+                "fact_id": fid,
+                "subject": fact.subject,
+                "predicate": fact.predicate,
+                "object": fact.object,
+                "similarity": round(float(sim), 4),
+                "gravity_score": round(fact.gravity_score, 3),
+                "layer": fact.layer,
+            })
+        hits.sort(key=lambda h: h["similarity"], reverse=True)
+        return hits[:top_k]
+
+    def explain_fact(self, fact_id: str) -> dict:
+        """Decompose a fact's gravity into per-component contributions.
+
+        Returns the live values of every adaptive feature, the weight each
+        carries right now, and the actual contribution each makes to the
+        current gravity score. Use this when a fact's gravity surprises you
+        — you'll see immediately whether the freshness term is high but
+        recent_utility is dragging it down, or the forecast says it's about
+        to fall, or whatever.
+        """
+        with self._lock:
+            self._sync()
+            fact = self._facts.get(fact_id)
+            if fact is None:
+                return {"found": False, "fact_id": fact_id}
+            max_deg = max(self._engine._degrees.values(), default=1)
+            degree = self._engine._degrees.get(fact_id, 0)
+            features = pre_resonance_features(
+                fact, graph_degree=degree, max_degree=max_deg,
+            )
+            weights = self._engine.weights
+            freshness, access, graph, utility, stability = features
+            if fact.resonance_count > 0:
+                resonance_score = (fact.avg_resonance + 1.0) / 2.0
+            else:
+                resonance_score = 0.0
+            from .gravity import _W_RESONANCE
+            contributions = {
+                "freshness":  round(weights.w_freshness * freshness, 4),
+                "access":     round(weights.w_access * access, 4),
+                "graph":      round(weights.w_graph * graph, 4),
+                "recent_utility":     round(weights.w_utility * utility, 4),
+                "forecast_stability": round(weights.w_stability * stability, 4),
+                "resonance":  round(_W_RESONANCE * resonance_score, 4),
+            }
+            live_gravity = sum(contributions.values())
+            return {
+                "found": True,
+                "fact_id": fact_id,
+                "subject": fact.subject,
+                "predicate": fact.predicate,
+                "object": fact.object,
+                "layer": fact.layer,
+                "stored_gravity_score": round(fact.gravity_score, 4),
+                "live_gravity_score": round(min(1.0, max(0.0, live_gravity)), 4),
+                "features": {
+                    "freshness": round(freshness, 4),
+                    "access": round(access, 4),
+                    "graph": round(graph, 4),
+                    "recent_utility": round(utility, 4),
+                    "forecast_stability": round(stability, 4),
+                    "resonance_score": round(resonance_score, 4),
+                },
+                "weights": weights.as_dict(),
+                "contributions": contributions,
+                "is_deprecated": fact.is_deprecated,
+                "is_expired": fact.is_expired,
+                "deprecated_by": fact.deprecated_by,
+                "resonance_count": fact.resonance_count,
+                "access_count": fact.access_count,
+                "last_accessed": fact.last_accessed,
+                "created_at": fact.created_at,
+            }
+
     def delete_fact(self, fact_id: str) -> bool:
         """
         Permanently remove a fact from the live store.
@@ -641,6 +775,73 @@ class MemoryStore:
             "old_id": old_id,
             "new_id": new_id,
             "absorbed": absorbed,
+        }
+
+    def _live_slot_occupants(self, subject: str, predicate: str) -> list[str]:
+        """Caller must hold self._lock. Live fact_ids with this (s, p) slot.
+
+        A "slot" is the (case-insensitive, whitespace-normalised) subject and
+        predicate pair — the unit ``set_fact`` enforces uniqueness on. Only
+        non-deprecated, non-expired facts count as occupants.
+        """
+        s_norm = " ".join(subject.lower().split())
+        p_norm = " ".join(predicate.lower().split())
+        out: list[str] = []
+        for f in self._facts.values():
+            if f.is_deprecated or f.is_expired:
+                continue
+            if (" ".join(f.subject.lower().split()) == s_norm
+                    and " ".join(f.predicate.lower().split()) == p_norm):
+                out.append(f.fact_id)
+        return out
+
+    def set_fact(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        session_id: Optional[str] = None,
+    ) -> dict:
+        """Slot-based upsert: ``(subject, predicate)`` becomes a unique slot.
+
+        Whatever live facts already exist with the same ``(subject, predicate)``
+        — regardless of their ``object`` — get superseded by the new one. The
+        new fact takes the SPO slot; the old bodies land in the singularity
+        with ``deprecated_by`` pointing at the new fact, exactly like
+        ``supersede_fact`` does.
+
+        This is the right tool for "mutable scalar" knowledge — version
+        strings, HEADs, current counts, settings — where one canonical value
+        replaces the previous one. ``record_fact`` stays the append-only
+        primitive for atomic relations where multiple objects can coexist
+        ("api uses Postgres" + "api uses Redis"). Pick by intent.
+        """
+        slot_before = set()
+        with self._lock:
+            self._sync()
+            slot_before = set(self._live_slot_occupants(subject, predicate))
+
+        # add_fact handles its own embedding, lock and SPO dedup. If the
+        # full triple already exists it returns the existing fact unchanged.
+        new_fact = self.add_fact(subject, predicate, obj, session_id=session_id)
+
+        # Any slot occupant that is NOT the new fact gets superseded.
+        superseded: list[str] = []
+        for old_id in slot_before:
+            if old_id == new_fact.fact_id:
+                continue
+            result = self.supersede_fact(old_id, new_fact.fact_id)
+            if result.get("superseded"):
+                superseded.append(old_id)
+
+        return {
+            "set": True,
+            "fact_id": new_fact.fact_id,
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj,
+            "already_existed": new_fact.fact_id in slot_before,
+            "superseded": superseded,
         }
 
     def retire_fact(self, fact_id: str) -> dict:

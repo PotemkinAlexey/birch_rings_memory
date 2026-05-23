@@ -360,17 +360,20 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Claude then has thirteen tools:
+Claude then has sixteen tools:
 
 | Tool | What it does |
 |---|---|
-| `query_memory` | Semantic search — returns facts and MetaFacts ranked by similarity |
-| `record_fact` | Store one subject-predicate-object triple |
+| `query_memory` | Semantic search — returns facts and MetaFacts ranked by similarity, plus `conflicts` for any (subject, predicate) with multiple competing values |
+| `record_fact` | Store one SPO triple; response includes `similar_existing` paraphrase hints. Use when several `object`s can coexist on the same (subject, predicate) |
 | `record_facts` | Store many triples in one batch (one Ollama round-trip) |
-| `supersede_fact` | Replace an old fact with a newer one — old body goes to the singularity with `deprecated_by` set; lineage preserved, MetaFact / Hawking still possible |
+| `set_fact` | Slot-replace upsert: writes the new fact AND auto-supersedes any live fact sharing `(subject, predicate)`. Use for HEAD / version / single-valued scalars |
+| `find_similar` | Read-only paraphrase search — surface candidates before writing or for planning `set_fact` / `supersede_fact` cleanup |
+| `supersede_fact` | Mark `old_id` superseded by `new_id` — old body goes to the singularity with `deprecated_by` set; lineage preserved, MetaFact / Hawking still possible |
 | `retire_fact` | Send a no-longer-relevant fact to the singularity (no replacement) — `ttl=now`, same singularity benefits as supersede |
 | `delete_fact` | Hard-delete — data is GONE, no singularity, no lineage. Use only for secrets / accidental writes; prefer supersede or retire for stale data |
-| `list_facts` | List live facts by subject/predicate, sorted by gravity — audit without a query |
+| `list_facts` | List live facts with filters (`subject_prefix`, `min_gravity`, `layer`, `exclude_deprecated`); sorted by gravity — audit without a query |
+| `explain_fact` | Decompose a fact's gravity into per-feature contributions — debug "why is this gravity so low" |
 | `session_open` | Open a named session so reads and writes can be attributed to it |
 | `session_push` | Append a user message to an open session |
 | `session_close` | Close a session — score resonance, update gravity, detect echo |

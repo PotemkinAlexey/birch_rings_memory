@@ -1,5 +1,28 @@
 # BirchKM — Agent Contract
 
+## What lives here vs in vertical-brain
+
+Two memory systems run in parallel on purpose; they answer different
+questions, and writing the same thing into both creates churn rather
+than redundancy.
+
+| BirchKM is for | Vertical Brain is for |
+|---|---|
+| Atomic, relational SPO triples — "X uses Y", "HEAD is Z", "version is N" | Long-form architectural narrative, design decisions, session reasoning |
+| Mutable scalar slots (HEAD, version, test count) via `set_fact` | Stable Silver / Gold summaries per namespace |
+| Cheap reads with gravity ranking (`query_memory`, `list_facts`) | Locked context capsules per project |
+| Resonance-driven gravity, decay, singularity — facts compete | Quality layers (Bronze / Silver / Gold) — facts curate up |
+| Sub-second writes; no LLM, no curation | Manual / model-curated upgrades; LLM-friendly chunks |
+
+Rule of thumb: if it fits in one sentence and you might want to
+**replace** it next month, write to Birch with `set_fact`. If it is a
+paragraph that explains **why** or describes the **shape** of something,
+write to Vertical Brain. When a Birch fact and a Vertical Brain chunk
+describe the same project, link by convention (use the namespace path
+or a Vertical Brain `chunk_id` as the `object` in a Birch fact).
+
+---
+
 ## Principles
 
 **Not permitted** — do not store PII, credentials, secrets, or anything the user
@@ -125,16 +148,24 @@ fact's current value; `access_count` will have incremented by one. That is a
 safety net, not a license — still search before writing, since paraphrases
 (`"runs on" Go` vs `"is written in" Go`) will not be de-duped automatically.
 
-### Retiring a fact — pick the right path
+### Writing / replacing / retiring — pick by intent
 
-Three operations exist for "this fact should leave the live layers". They
-are NOT interchangeable; pick by intent.
+Five operations exist around writing and removing facts. They are NOT
+interchangeable; pick by intent.
 
 | Situation | Tool | What happens |
 |---|---|---|
-| There is a newer fact that *replaces* this one | `supersede_fact(old_id, new_id)` | Old fact's `deprecated_by` is set, body goes to the singularity. Lineage preserved; can feed MetaFact compression and Hawking emission. |
+| New atomic fact where many objects can coexist on (subject, predicate) | `record_fact(s, p, o)` | New SPO triple; dedup on exact normalised triple; response includes `similar_existing` paraphrase hints |
+| The (subject, predicate) is a single-valued slot — replace whatever was there | `set_fact(s, p, o)` | New SPO triple AND auto-supersede every live fact sharing (subject, predicate); old bodies land in the singularity with `deprecated_by` |
+| There is a newer fact that *replaces* this one (different SPO) | `supersede_fact(old_id, new_id)` | Old fact's `deprecated_by` is set, body goes to the singularity. Lineage preserved; can feed MetaFact compression and Hawking emission. |
 | The topic is over, no replacement | `retire_fact(fact_id)` | `ttl` set to now, body goes to the singularity. Same singularity benefits as supersede. |
 | Hard removal (secrets / accidental write) | `delete_fact(fact_id)` | Row deleted from storage. **No lineage, no singularity, no Hawking rescue.** Use sparingly. |
+
+The two new write tools — `set_fact` for "this is the new HEAD" and
+`record_fact` for "another thing X uses" — between them cover almost
+every legitimate write. Reach for `supersede_fact` only when the new
+fact is *already in the store* and you need to point an unrelated old
+fact at it (cross-namespace cleanup).
 
 The default for "we now know better" is **`supersede_fact`**, not
 `delete_fact`. Hard delete loses the "we used to think X" record and
