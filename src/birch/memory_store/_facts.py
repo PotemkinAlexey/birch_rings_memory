@@ -606,6 +606,19 @@ class FactsMixin:
                 self._bump_mutation_locked()
                 return True
 
+    def explain_body(self, body_id: str) -> dict:
+        """Polymorphic alias for ``explain_fact``.
+
+        Naming symmetry with ``delete_body`` and ``query_memory`` (both
+        of which return polymorphic body_ids spanning FactPassports
+        and MetaFacts in live/singularity locations). ``explain_fact``
+        was originally FactPassport-only and grew to handle all four
+        body kinds — keeping the old name is fine for backward compat,
+        but agents that get a ``body_id`` from ``query_memory`` and
+        want to explain it should reach for the body-named method.
+        """
+        return self.explain_fact(body_id)
+
     def delete_body(self, body_id: str) -> dict:
         """
         Polymorphic hard-delete across all four body locations.

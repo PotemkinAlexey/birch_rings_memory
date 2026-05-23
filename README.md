@@ -362,7 +362,7 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Claude then has eighteen tools:
+Claude then has nineteen tools:
 
 | Tool | What it does |
 |---|---|
@@ -376,7 +376,8 @@ Claude then has eighteen tools:
 | `delete_fact` | Legacy hard-delete — handles ONLY live FactPassports. Kept for backward compat; prefer `delete_body` for polymorphic ids from `query_memory` |
 | `delete_body` | Polymorphic hard-delete — handles live FactPassports, live MetaFacts, singularity FactPassports, and singularity MetaFacts under a single `body_id` (the kind `query_memory` returns). Same destructive contract as `delete_fact` |
 | `list_facts` | List live facts with filters (`subject_prefix`, `min_gravity`, `layer`, `exclude_deprecated`); sorted by gravity — audit without a query |
-| `explain_fact` | Decompose a fact's gravity into per-feature contributions — debug "why is this gravity so low" |
+| `explain_fact` | Decompose a body's gravity into per-feature contributions — debug "why is this gravity so low". Polymorphic: handles live FactPassports, live MetaFacts, and both singularity kinds (the four locations `query_memory` can return) |
+| `explain_body` | Polymorphic alias for `explain_fact` with the body-named contract — use when you got a `body_id` from `query_memory` |
 | `session_open` | Open a named session so reads and writes can be attributed to it |
 | `session_push` | Append a user message to an open session |
 | `session_close` | Close a session — score resonance, update gravity, detect echo. Optional `sentiment` / `r_override` to declare R when the heuristic would misclassify (e.g. declarative technical summaries) |

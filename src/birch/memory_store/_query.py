@@ -72,6 +72,14 @@ class QueryMixin:
         fact's subject; useful for scoping a search to one project.
         ``exclude_ids`` skips known facts (e.g., the one you just wrote).
         """
+        # Library-API hardening: MCP validates this at the boundary,
+        # but find_similar is also a public Python entry point. A
+        # bare text.strip() on None / int / list raised AttributeError
+        # at runtime — make the type contract explicit.
+        if not isinstance(text, str):
+            raise TypeError(
+                f"text must be str, got {type(text).__name__}"
+            )
         if not text.strip():
             return []
         vec = embed(text)
@@ -167,6 +175,14 @@ class QueryMixin:
         # close it at the core. (Also skips a needless embed roundtrip.)
         if top_k <= 0:
             return []
+        # Library-API hardening: MCP validates this at the boundary,
+        # but query is also a public Python entry point. Same
+        # contract as find_similar — explicit TypeError beats a
+        # raw AttributeError deep inside embed().
+        if not isinstance(text, str):
+            raise TypeError(
+                f"text must be str, got {type(text).__name__}"
+            )
         # Embed outside the lock.
         vec = embed(text)
         prefix = subject_prefix.lower() if subject_prefix else None

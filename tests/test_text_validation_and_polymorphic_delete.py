@@ -187,7 +187,7 @@ def test_readme_lists_check_echo_with_correct_tool_count():
 
     root = pathlib.Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text()
-    assert "eighteen tools" in readme
+    assert "nineteen tools" in readme
     assert "`check_echo`" in readme
     # forecast wording updated to per-body.
     assert "per-body stability" in readme

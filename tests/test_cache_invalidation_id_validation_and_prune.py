@@ -191,14 +191,15 @@ def test_validate_id_inline_contract():
 def test_readme_says_eighteen_tools_and_lists_delete_body():
     root = pathlib.Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text()
-    assert "eighteen tools" in readme, (
-        "README should advertise eighteen tools "
+    assert "nineteen tools" in readme, (
+        "README should advertise nineteen tools "
         "(was seventeen; delete_body is now exposed)"
     )
     # Tool table row exists.
     assert "`delete_body`" in readme
-    # Old "seventeen tools" line must be gone.
+    # Old tool-count lines must be gone.
     assert "seventeen tools" not in readme
+    assert "eighteen tools" not in readme
 
 
 # --- I6: prune_orphan_edges utility -----------------------------------

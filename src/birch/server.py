@@ -975,11 +975,37 @@ def explain_fact(fact_id: str) -> dict:
     weights. Also reports ``is_deprecated`` / ``is_expired`` /
     ``deprecated_by`` so you can tell whether the fact is even live.
     Read-only debug; never mutates.
+
+    Polymorphic: handles live FactPassport, live MetaFact,
+    singularity FactPassport, and singularity MetaFact (same four
+    locations as ``delete_body`` and ``query_memory``). For MetaFact
+    bodies the response carries ``kind="meta"``, ``weight``,
+    ``source_fact_ids``, and ``source_texts`` instead of SPO fields.
+    Consider ``explain_body`` as the symmetric name when working
+    with a ``body_id`` from ``query_memory``.
     """
     err = _validate_id(fact_id, "fact_id")
     if err is not None:
         return err
     return _store.explain_fact(fact_id)
+
+
+@mcp.tool()
+def explain_body(body_id: str) -> dict:
+    """USE WHEN: you got a ``body_id`` from ``query_memory`` and want to
+    decompose its gravity — alias for ``explain_fact`` with the
+    body-named contract.
+
+    Same response shape as ``explain_fact``: returns ``found``,
+    ``kind`` (``fact``/``meta``/``singularity_fact``/``singularity_meta``),
+    per-feature ``features``, current ``weights``, per-component
+    ``contributions``, and shape-specific fields (SPO for facts,
+    weight + lineage for metas). Read-only debug; never mutates.
+    """
+    err = _validate_id(body_id, "body_id")
+    if err is not None:
+        return err
+    return _store.explain_body(body_id)
 
 
 @mcp.tool()

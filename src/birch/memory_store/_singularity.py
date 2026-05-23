@@ -324,41 +324,55 @@ class SingularityMixin:
                 facts_updated_n = len(updated_facts)
                 metas_updated_n = len(updated_metas)
                 updated = facts_updated_n + metas_updated_n
-
-        # Quick distribution snapshot so the caller can see what landed.
-        ranges = {"safe": 0, "kinetic": 0, "near_horizon": 0, "predicted_fall": 0}
-        for score in scores.values():
-            if score >= 0.7:
-                ranges["safe"] += 1
-            elif score >= 0.3:
-                ranges["kinetic"] += 1
-            elif score > 0.0:
-                ranges["near_horizon"] += 1
-            else:
-                ranges["predicted_fall"] += 1
-        result_payload = {
-            "horizon_ticks": horizon_ticks,
-            "cached": False,
-            # Kept for wire-format stability; aliases of the new keys.
-            "facts_forecasted": len(scores),
-            "facts_updated": updated,
-            # Clearer keys: forecast now covers both FactPassports and
-            # MetaFacts (both carry forecast_stability), so the operator
-            # can see how the update split across body types.
-            "bodies_forecasted": len(scores),
-            "bodies_updated": updated,
-            "facts_updated_count": facts_updated_n,
-            "metas_updated_count": metas_updated_n,
-            "distribution": ranges,
-            "_hint": (
-                "facts_forecasted / facts_updated are legacy aliases — "
-                "they actually count BODIES (FactPassport + MetaFact). "
-                "Prefer bodies_forecasted / bodies_updated, or read the "
-                "per-type split via facts_updated_count and "
-                "metas_updated_count."
-            ),
-        }
-        # Cache the response keyed by the snapshot we forecasted against.
-        # Subsequent calls with no intervening writes hit the cache.
-        self._forecast_cache = (cache_key, dict(result_payload))
+                # Distribution snapshot + payload construction +
+                # cache-slot write all happen under the writeback
+                # lock — _forecast_cache is shared mutable state and
+                # two concurrent forecasts racing into the slot
+                # could tear the assignment. The lock that already
+                # guards _facts / _meta_facts / _mutation_version
+                # also owns the cache slot.
+                ranges = {
+                    "safe": 0, "kinetic": 0,
+                    "near_horizon": 0, "predicted_fall": 0,
+                }
+                for score in scores.values():
+                    if score >= 0.7:
+                        ranges["safe"] += 1
+                    elif score >= 0.3:
+                        ranges["kinetic"] += 1
+                    elif score > 0.0:
+                        ranges["near_horizon"] += 1
+                    else:
+                        ranges["predicted_fall"] += 1
+                result_payload = {
+                    "horizon_ticks": horizon_ticks,
+                    "cached": False,
+                    # Kept for wire-format stability; aliases of the
+                    # new keys.
+                    "facts_forecasted": len(scores),
+                    "facts_updated": updated,
+                    # Clearer keys: forecast now covers both
+                    # FactPassports and MetaFacts (both carry
+                    # forecast_stability), so the operator can see
+                    # how the update split across body types.
+                    "bodies_forecasted": len(scores),
+                    "bodies_updated": updated,
+                    "facts_updated_count": facts_updated_n,
+                    "metas_updated_count": metas_updated_n,
+                    "distribution": ranges,
+                    "_hint": (
+                        "facts_forecasted / facts_updated are legacy "
+                        "aliases — they actually count BODIES "
+                        "(FactPassport + MetaFact). Prefer "
+                        "bodies_forecasted / bodies_updated, or read "
+                        "the per-type split via facts_updated_count "
+                        "and metas_updated_count."
+                    ),
+                }
+                # Cache the response keyed by the snapshot we
+                # forecasted against. Subsequent calls with no
+                # intervening writes hit the cache.
+                self._forecast_cache = (
+                    cache_key, dict(result_payload),
+                )
         return result_payload

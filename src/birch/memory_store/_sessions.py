@@ -272,7 +272,26 @@ class SessionsMixin:
         # behavioural / semantic / repetition computation entirely.
         scoring_source = "heuristic"
         if r_override is not None:
-            r_value = float(max(-1.0, min(1.0, r_override)))
+            # NaN / Infinity / non-numeric reject at the core
+            # boundary so library users get the same contract as
+            # MCP callers (server.py validates the same way before
+            # ever reaching this code). max(-1, min(1, NaN)) silently
+            # propagates NaN through Python's min/max, which then
+            # poisons every downstream comparison.
+            import math as _math
+            try:
+                r_raw = float(r_override)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"r_override must be a finite float in [-1, 1], "
+                    f"got {r_override!r}"
+                ) from exc
+            if not _math.isfinite(r_raw):
+                raise ValueError(
+                    "r_override must be a finite float in [-1, 1], "
+                    "got NaN or Infinity"
+                )
+            r_value = max(-1.0, min(1.0, r_raw))
             label = (
                 "resonant" if r_value > 0.35
                 else ("toxic" if r_value < -0.20 else "neutral")
