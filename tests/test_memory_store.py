@@ -13,8 +13,20 @@ def _build_store():
     return mem, f_go, f_python, f_db
 
 
-def test_deprecated_fact_absorbed_on_resonant_session():
+def test_deprecated_fact_absorbed_synchronously():
+    """deprecate() is now an alias for supersede_fact() — body lands in
+    the singularity synchronously at deprecate() time, not on the next
+    session_close. The legacy "absorbed on tick" behaviour was a vector
+    for deprecated facts leaking into live query() between deprecate and
+    next tick; the synchronous path closes that window.
+    """
     mem, f_go, f_python, f_db = _build_store()
+    # _build_store already called mem.deprecate(f_python, f_go) — by now
+    # f_python must already be in the singularity, not in _facts.
+    assert f_python.fact_id not in mem._facts
+    assert f_python.fact_id in mem._hole._singularity
+    assert mem.stats["black_hole_mass"] >= 1
+
     mem.session_start("session_A")
     mem.session_message("how to configure the mailer service on Go")
     mem.session_message("how to connect it to PostgreSQL")
@@ -22,8 +34,6 @@ def test_deprecated_fact_absorbed_on_resonant_session():
     mem._session_fact_ids = [f_go.fact_id, f_db.fact_id]
     summary = mem.session_close()
     assert summary["label"] == "resonant"
-    assert f_python.fact_id in summary["absorbed"], "deprecated fact should be absorbed"
-    assert mem.stats["black_hole_mass"] >= 1
 
 
 @needs_real_embeddings
@@ -400,7 +410,7 @@ def test_add_facts_batch_single_embed_call(monkeypatch):
 
 if __name__ == "__main__":
     tests = [
-        test_deprecated_fact_absorbed_on_resonant_session,
+        test_deprecated_fact_absorbed_synchronously,
         test_query_returns_relevant_facts,
         test_echo_detected_after_toxic_session,
         test_hawking_emission,

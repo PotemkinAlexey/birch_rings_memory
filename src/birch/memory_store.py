@@ -848,18 +848,20 @@ class MemoryStore:
                     self._storage.save_edge(from_id, to_id)
 
     def deprecate(self, old_id: str, new_id: str) -> None:
-        with self._lock:
-            with self._txn():
-                self._sync()
-                if old_id in self._facts:
-                    old = self._facts[old_id]
-                    old.deprecated_by = new_id
-                    # A deprecated fact is no longer the canonical bearer of its SPO.
-                    key = self._normalize_spo(old.subject, old.predicate, old.object)
-                    if self._spo_index.get(key) == old_id:
-                        del self._spo_index[key]
-                    if self._storage:
-                        self._storage.save_fact(old)
+        """Legacy alias for :meth:`supersede_fact`.
+
+        Older callers (tests, external integrations) used to set
+        ``deprecated_by`` directly without sending the body to the
+        singularity. That left the deprecated fact in the live store
+        until the next tick, where it could leak into ``query()`` as
+        if it were current. Now this just delegates to
+        ``supersede_fact``, which runs ``_absorb_dead`` synchronously
+        and keeps the body in the singularity with lineage intact.
+
+        Prefer ``supersede_fact`` directly in new code — this shim
+        exists only to keep the older surface working.
+        """
+        self.supersede_fact(old_id, new_id)
 
     def supersede_fact(self, old_id: str, new_id: str) -> dict:
         """Mark ``old_id`` as superseded by ``new_id`` and send it to the singularity.
@@ -935,23 +937,31 @@ class MemoryStore:
         primitive for atomic relations where multiple objects can coexist
         ("api uses Postgres" + "api uses Redis"). Pick by intent.
         """
-        slot_before = set()
-        with self._lock:
-            self._sync()
-            slot_before = set(self._live_slot_occupants(subject, predicate))
-
         # add_fact handles its own embedding, lock and SPO dedup. If the
         # full triple already exists it returns the existing fact unchanged.
         new_fact = self.add_fact(subject, predicate, obj, session_id=session_id)
 
-        # Any slot occupant that is NOT the new fact gets superseded.
+        # AUTHORITATIVE slot recompute inside a write transaction — the
+        # pre-add snapshot ``slot_before`` is not enough in multi-process:
+        # another writer could have inserted its own slot occupant between
+        # snapshot and add_fact. Recompute under the write lock so every
+        # current occupant other than ``new_fact`` is superseded.
         superseded: list[str] = []
-        for old_id in slot_before:
-            if old_id == new_fact.fact_id:
-                continue
-            result = self.supersede_fact(old_id, new_fact.fact_id)
-            if result.get("superseded"):
-                superseded.append(old_id)
+        already_existed = False
+        with self._lock:
+            with self._txn():
+                self._sync()
+                occupants = self._live_slot_occupants(subject, predicate)
+                already_existed = new_fact.fact_id in occupants
+                for old_id in occupants:
+                    if old_id == new_fact.fact_id:
+                        continue
+                    # supersede_fact takes its own lock/txn — that re-entry
+                    # is safe via the reentrant transaction(); the inner
+                    # call sees the same write context.
+                    result = self.supersede_fact(old_id, new_fact.fact_id)
+                    if result.get("superseded"):
+                        superseded.append(old_id)
 
         return {
             "set": True,
@@ -959,7 +969,7 @@ class MemoryStore:
             "subject": subject,
             "predicate": predicate,
             "object": obj,
-            "already_existed": new_fact.fact_id in slot_before,
+            "already_existed": already_existed,
             "superseded": superseded,
         }
 
@@ -1251,13 +1261,18 @@ class MemoryStore:
                 )
                 if persist and self._storage and hasattr(self._storage, "save_meta_facts"):
                     self._storage.save_meta_facts(new_metas)
-                    # The absorbed FactPassports are gone from the live store and
-                    # were never persisted as "absorbed" — but if storage was
-                    # tracking them as deleted-on-absorb, we should drop them now.
+                    # Source FactPassports now live as MetaFact lineage
+                    # (source_fact_ids / source_texts); their layer=-1 rows
+                    # in the facts table are no longer needed and would
+                    # otherwise be re-hydrated into the singularity on next
+                    # restart. Drop them — and their incident edges — now
+                    # that the bundle owns the lineage.
                     for meta in new_metas:
                         for fid in meta.source_fact_ids:
                             if hasattr(self._storage, "delete_fact"):
                                 self._storage.delete_fact(fid)
+                            if hasattr(self._storage, "delete_edges_for_fact"):
+                                self._storage.delete_edges_for_fact(fid)
                 self._last_collapse_at = time.time()
                 self._total_collapses += 1
                 self._collapse_counter = 0
@@ -1424,6 +1439,12 @@ class MemoryStore:
                 fact = self._facts.get(fid)
                 if fact is None:
                     continue
+                # Lifecycle filter — symmetric with the Hawking predicate.
+                # A deprecate() call sets deprecated_by without going through
+                # _absorb_dead, and TTL may expire between ticks. Either case
+                # used to leak the body into live results until next tick.
+                if fact.is_deprecated or fact.is_expired:
+                    continue
                 if not (min_layer <= fact.layer <= max_layer):
                     continue
                 if allowed_layers is not None and fact.layer not in allowed_layers:
@@ -1465,147 +1486,163 @@ class MemoryStore:
                     source=layer_labels.get(meta.layer, "kinetic"),
                 ))
 
-            # Hawking emission: black hole returns facts AND removes them from
-            # the singularity. We must re-register them in the live store and
-            # persist the resurrection. Scope filters (subject_prefix /
-            # min_gravity) act as a predicate so a scoped query does NOT
-            # resurrect bodies outside the requested scope as a side effect.
-            if hawking:
-                def _fact_predicate(f) -> bool:
-                    # Lifecycle: a fact that was superseded by set_fact /
-                    # supersede_fact, or expired via retire_fact, must NOT
-                    # come back through Hawking emission as if it were
-                    # current. The agent thinks it's reading live truth;
-                    # the body knows it has been retired. Default query
-                    # never returns these. (Explicit historical access
-                    # belongs to a different tool, not query_memory.)
-                    if f.is_deprecated or f.is_expired:
-                        return False
-                    if f.gravity_score < min_gravity:
-                        return False
-                    if prefix and not f.subject.lower().startswith(prefix):
-                        return False
-                    return True
-
-                def _meta_predicate(m) -> bool:
-                    # MetaFacts cannot be deprecated/expired in the current
-                    # surface, but keep the same shape for symmetry and
-                    # forward compatibility.
-                    if getattr(m, "is_deprecated", False):
-                        return False
-                    if getattr(m, "is_expired", False):
-                        return False
-                    if m.gravity_score < min_gravity:
-                        return False
-                    if prefix:
-                        # No single subject on a meta — only emit if any
-                        # source_text actually starts with the prefix.
-                        if not any((st or "").lower().startswith(prefix)
-                                   for st in m.source_texts):
-                            return False
-                    return True
-
-                emitted = self._hole.hawking_emit(vec, predicate=_fact_predicate)
-                # MetaFact Hawking emission — looser threshold so a centroid
-                # actually fires on a topically close query.
-                meta_emitted = self._hole.hawking_emit_metas(
-                    vec,
-                    threshold=_META_HAWKING_THRESHOLD,
-                    predicate=_meta_predicate,
-                )
-                # Only take the write lock when something was actually
-                # resurrected — the common read-only query persists nothing.
-                if emitted or meta_emitted:
-                    with self._txn():
-                        for fact in emitted:
-                            self._facts[fact.fact_id] = fact
-                            self._engine.register(fact)
-                            self._index.add(fact.fact_id, fact.vector)
-                            if not fact.is_deprecated:
-                                key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
-                                self._spo_index.setdefault(key, fact.fact_id)
-                            if self._storage:
-                                self._storage.save_fact(fact)
-                            sim = VectorIndex.similarity(vec, fact.vector)
-                            results.append(QueryResult(
-                                fact=fact,
-                                similarity=round(sim, 4),
-                                source="hawking",
-                            ))
-                        for meta in meta_emitted:
-                            self._meta_facts[meta.meta_id] = meta
-                            self._engine.register(meta)
-                            self._meta_index.add(meta.meta_id, meta.vector)
-                            if self._storage and hasattr(self._storage, "save_meta_fact"):
-                                self._storage.save_meta_fact(meta)
-                            sim = VectorIndex.similarity(vec, meta.vector)
-                            results.append(QueryResult(
-                                meta=meta,
-                                similarity=round(sim, 4),
-                                source="hawking_meta",
-                            ))
-
+            # Pre-Hawking sort / top_k slice — top selection is pure over
+            # the live snapshot; mutation (touch / attribute / Hawking pop /
+            # persist) happens together under the write transaction below.
             results.sort(key=lambda r: r.similarity, reverse=True)
             if min_similarity > 0.0:
                 results = [r for r in results if r.similarity >= min_similarity]
             top = results[:top_k]
-
-            # Attribution + touch — only on what the caller actually
-            # receives. Weight is the similarity itself; a body returned at
-            # cosine 0.95 ends up nine times more sensitive to session R
-            # than one returned at 0.10. Polymorphic over fact / meta.
             sid = self._resolve_sid(session_id)
-            ctx = self._sessions.get(sid) if sid else None
-            touched_facts: list[FactPassport] = []
-            touched_metas: list[MetaFact] = []
-            for r in top:
-                body = r.fact if r.fact is not None else r.meta
-                if body is None:
-                    continue
-                body.touch()
-                if r.fact is not None:
-                    touched_facts.append(r.fact)
-                else:
-                    assert r.meta is not None
-                    touched_metas.append(r.meta)
-                if ctx is not None:
-                    self._attribute_to(ctx, r.body_id, r.similarity)
 
-            # Persist touches + open-session attribution so that
-            # access_count / last_accessed / ctx.facts survive a crash
-            # between session_message calls. Without this the gravity
-            # formula's `access` term loses every read between closes.
-            # IMPORTANT: re-sync under the write lock and re-resolve every
-            # body from the authoritative dicts (rather than reusing the
-            # snapshot taken before the lock) so a write from another
-            # process between top selection and persist cannot get
-            # overwritten by stale snapshots.
-            need_persist = (
-                self._storage is not None
-                and (touched_facts or touched_metas or ctx is not None)
+            # Collect intentions (ids + attribution pairs) and the data
+            # Hawking needs (predicate closures + query vector). Apply them
+            # to authoritative state inside a single write transaction.
+            touched_fact_ids = [r.fact.fact_id for r in top if r.fact is not None]
+            touched_meta_ids = [r.meta.meta_id for r in top if r.meta is not None]
+            attribution_pairs: list[tuple[str, float]] = [
+                (r.body_id, r.similarity) for r in top
+            ]
+
+            need_write_path = (
+                hawking
+                or (self._storage is not None
+                    and (touched_fact_ids or touched_meta_ids or sid))
             )
-            if need_persist:
-                touched_fact_ids = [f.fact_id for f in touched_facts]
-                touched_meta_ids = [m.meta_id for m in touched_metas]
-                with self._txn():
-                    self._sync()
-                    fresh_facts = [
-                        self._facts[fid] for fid in touched_fact_ids
-                        if fid in self._facts
-                    ]
-                    fresh_metas = [
-                        self._meta_facts[mid] for mid in touched_meta_ids
-                        if mid in self._meta_facts
-                    ]
-                    if fresh_facts and self._storage:
+
+            if not need_write_path:
+                return top
+
+            # ---- Write path: one transaction, _sync inside, then mutate.
+            def _fact_predicate(f) -> bool:
+                # Lifecycle: a fact that was superseded by set_fact /
+                # supersede_fact, or expired via retire_fact, must NOT
+                # come back through Hawking emission as if it were
+                # current. The agent thinks it's reading live truth;
+                # the body knows it has been retired.
+                if f.is_deprecated or f.is_expired:
+                    return False
+                if f.gravity_score < min_gravity:
+                    return False
+                if prefix and not f.subject.lower().startswith(prefix):
+                    return False
+                return True
+
+            def _meta_predicate(m) -> bool:
+                if getattr(m, "is_deprecated", False):
+                    return False
+                if getattr(m, "is_expired", False):
+                    return False
+                if m.gravity_score < min_gravity:
+                    return False
+                if prefix:
+                    if not any((st or "").lower().startswith(prefix)
+                               for st in m.source_texts):
+                        return False
+                return True
+
+            with self._txn():
+                # Re-sync under the write lock; if another process committed
+                # we now hold the authoritative state.
+                self._sync()
+
+                # Hawking emission lives inside the transaction so the pop
+                # from the singularity, the re-registration in live stores,
+                # and the persistence land or roll back together. Doing it
+                # outside the txn (as before) was a state-mutation window
+                # the next persist could not unwind.
+                if hawking:
+                    emitted = self._hole.hawking_emit(
+                        vec, predicate=_fact_predicate)
+                    meta_emitted = self._hole.hawking_emit_metas(
+                        vec,
+                        threshold=_META_HAWKING_THRESHOLD,
+                        predicate=_meta_predicate,
+                    )
+                    for fact in emitted:
+                        self._facts[fact.fact_id] = fact
+                        self._engine.register(fact)
+                        self._index.add(fact.fact_id, fact.vector)
+                        if not fact.is_deprecated:
+                            key = self._normalize_spo(
+                                fact.subject, fact.predicate, fact.object)
+                            self._spo_index.setdefault(key, fact.fact_id)
+                        if self._storage:
+                            self._storage.save_fact(fact)
+                        sim = VectorIndex.similarity(vec, fact.vector)
+                        top.append(QueryResult(
+                            fact=fact,
+                            similarity=round(sim, 4),
+                            source="hawking",
+                        ))
+                        # Emitted bodies also participate in attribution.
+                        touched_fact_ids.append(fact.fact_id)
+                        attribution_pairs.append((fact.fact_id, sim))
+                    for meta in meta_emitted:
+                        self._meta_facts[meta.meta_id] = meta
+                        self._engine.register(meta)
+                        self._meta_index.add(meta.meta_id, meta.vector)
+                        if (self._storage
+                                and hasattr(self._storage, "save_meta_fact")):
+                            self._storage.save_meta_fact(meta)
+                        sim = VectorIndex.similarity(vec, meta.vector)
+                        top.append(QueryResult(
+                            meta=meta,
+                            similarity=round(sim, 4),
+                            source="hawking_meta",
+                        ))
+                        touched_meta_ids.append(meta.meta_id)
+                        attribution_pairs.append((meta.meta_id, sim))
+
+                # Re-sort after Hawking additions and re-clamp to top_k.
+                top.sort(key=lambda r: r.similarity, reverse=True)
+                top = top[:top_k]
+                # Restrict downstream work to bodies that survived the top
+                # slice (Hawking may have promoted, top_k may have demoted).
+                kept_ids = {r.body_id for r in top}
+                touched_fact_ids = [
+                    fid for fid in touched_fact_ids if fid in kept_ids
+                ]
+                touched_meta_ids = [
+                    mid for mid in touched_meta_ids if mid in kept_ids
+                ]
+                attribution_pairs = [
+                    pair for pair in attribution_pairs if pair[0] in kept_ids
+                ]
+
+                # Apply touch + attribution to AUTHORITATIVE objects (the
+                # ones currently in self._facts / self._meta_facts after
+                # _sync). Previously we touched pre-sync object refs and
+                # then saved fresh objects without re-applying the touch,
+                # so the bump silently vanished across a multi-process
+                # reload.
+                fresh_facts: list[FactPassport] = []
+                for fid in touched_fact_ids:
+                    f = self._facts.get(fid)
+                    if f is None:
+                        continue
+                    f.touch()
+                    fresh_facts.append(f)
+                fresh_metas: list[MetaFact] = []
+                for mid in touched_meta_ids:
+                    m = self._meta_facts.get(mid)
+                    if m is None:
+                        continue
+                    m.touch()
+                    fresh_metas.append(m)
+
+                fresh_ctx = self._sessions.get(sid) if sid else None
+                if fresh_ctx is not None:
+                    for body_id, sim in attribution_pairs:
+                        self._attribute_to(fresh_ctx, body_id, sim)
+
+                if self._storage:
+                    if fresh_facts:
                         self._storage.save_facts(fresh_facts)
-                    if (fresh_metas and self._storage
+                    if (fresh_metas
                             and hasattr(self._storage, "save_meta_facts")):
                         self._storage.save_meta_facts(fresh_metas)
-                    # Re-resolve the open session under the write lock too.
-                    fresh_ctx = (self._sessions.get(ctx.session_id)
-                                 if ctx is not None else None)
-                    if (fresh_ctx is not None and self._storage
+                    if (fresh_ctx is not None
                             and hasattr(self._storage, "save_open_session")):
                         self._storage.save_open_session(
                             fresh_ctx.session_id,
