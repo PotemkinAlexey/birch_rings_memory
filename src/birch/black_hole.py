@@ -63,6 +63,16 @@ class BlackHole:
         self._singularity[fact.fact_id] = SingularityRecord(fact=fact)
         self._index.add(fact.fact_id, fact.vector)
 
+    def restore_fact(self, fact: "FactPassport") -> None:
+        """Place a fact directly into the singularity without touching its
+        metadata. Symmetric with ``restore_meta``: used by
+        ``MemoryStore._load_from_storage`` to re-hydrate the black hole from
+        SQLite rows whose ``layer == -1`` so absorbed facts survive a
+        process restart and remain eligible for Hawking emission.
+        """
+        self._singularity[fact.fact_id] = SingularityRecord(fact=fact)
+        self._index.add(fact.fact_id, fact.vector)
+
     def absorb_meta(self, meta: "MetaFact") -> None:
         """Place a MetaFact in the singularity (typical: just after collapse)."""
         meta.layer = -1

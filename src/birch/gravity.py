@@ -41,8 +41,9 @@ _LAYER_UP = 0.70    # gravity > 0.70 → promote
 _LAYER_DOWN = 0.30  # gravity < 0.30 → demote
 
 # Resonance weight is fixed: resonance is observed value, not predicted.
-# The three pre-resonance weights live in AdaptiveWeights and are learned
-# from the user's actual session feedback.
+# The five pre-resonance weights (freshness, access, graph, recent_utility,
+# forecast_stability) live in AdaptiveWeights and are learned from the
+# user's actual session feedback.
 _W_RESONANCE = 0.35
 
 # Freshness half-life — a new fact rides high and sinks as it ages
@@ -101,7 +102,7 @@ def compute_gravity(
 ) -> float:
     """Compute gravity_score for a memory body in [0.0, 1.0].
 
-    The three pre-resonance weights are read from ``weights`` (learned),
+    The five pre-resonance weights are read from ``weights`` (learned),
     the resonance weight stays fixed. When ``weights`` is None we fall back
     to the hand-tuned prior — identical to the previous static formula.
     """

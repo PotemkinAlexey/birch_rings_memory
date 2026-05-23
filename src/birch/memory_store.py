@@ -341,6 +341,12 @@ class MemoryStore:
             if persisted is not None:
                 self._engine.weights = persisted
         for fact in self._storage.load_facts():
+            if fact.layer == -1:
+                # Absorbed body — restore into the singularity so Hawking
+                # emission and singularity collapse still see it after a
+                # process restart. Symmetric with MetaFacts at layer=-1.
+                self._hole.restore_fact(fact)
+                continue
             self._facts[fact.fact_id] = fact
             self._engine.register(fact)
             self._index.add(fact.fact_id, fact.vector)
@@ -368,6 +374,10 @@ class MemoryStore:
                 r_score=row["r_score"],
                 fact_weights=dict(row.get("fact_weights", {})),
                 echo_penalty=row.get("echo_penalty", 0.0),
+                # Preserve the original record time so TTL survives restart.
+                # Without this every restart resets timestamps to "now" and
+                # the penalty / resolved / default tiers stop being TTLs.
+                timestamp=float(row.get("recorded_at") or time.time()),
             )
         _SESSION_TTL = 86_400  # 24 h — discard crashed/orphaned sessions
         if hasattr(self._storage, "load_open_sessions"):
@@ -476,6 +486,7 @@ class MemoryStore:
         triples: list[tuple[str, str, str]],
         layer: int = 1,
         session_id: Optional[str] = None,
+        session_ids: Optional[list[Optional[str]]] = None,
     ) -> list[FactPassport]:
         """
         Batch-insert a list of (subject, predicate, object) triples.
@@ -483,10 +494,21 @@ class MemoryStore:
         One Ollama round-trip for all embeddings, one SQLite transaction for
         all inserts. Duplicate SPOs are touched and returned, not duplicated.
 
+        ``session_ids`` (optional) is a parallel list of per-item session_ids
+        — if present it must have the same length as ``triples``. Each fact
+        is attributed to its own session, falling back to the top-level
+        ``session_id`` when the per-item entry is None. This is what makes
+        the MCP ``record_facts`` per-item ``session_id`` contract real.
+
         Returns one FactPassport per input triple, in the same order.
         """
         if not triples:
             return []
+        if session_ids is not None and len(session_ids) != len(triples):
+            raise ValueError(
+                f"session_ids length ({len(session_ids)}) must match triples "
+                f"length ({len(triples)})"
+            )
 
         results: list[Optional[FactPassport]] = [None] * len(triples)
 
@@ -501,10 +523,13 @@ class MemoryStore:
             with self._txn():
                 # Reload under the write lock — the authoritative view.
                 self._sync()
-                sid = self._resolve_sid(session_id)
-                ctx = self._sessions.get(sid) if sid else None
                 for idx, (triple, vec) in enumerate(zip(triples, vectors)):
                     s, p, o = triple
+                    # Per-item session_id overrides the top-level default.
+                    raw_sid = (session_ids[idx] if session_ids is not None
+                               else None)
+                    sid = self._resolve_sid(raw_sid or session_id)
+                    ctx = self._sessions.get(sid) if sid else None
                     key = self._normalize_spo(s, p, o)
                     existing_id = self._spo_index.get(key)
                     if existing_id and existing_id in self._facts:
@@ -596,7 +621,7 @@ class MemoryStore:
             fact = self._facts.get(fid)
             if fact is None or fact.is_deprecated or fact.is_expired:
                 continue
-            if prefix and prefix not in fact.subject.lower():
+            if prefix and not fact.subject.lower().startswith(prefix):
                 continue
             hits.append({
                 "fact_id": fid,
@@ -1061,23 +1086,32 @@ class MemoryStore:
             self._storage.delete_open_session(sid)
 
     def _absorb_dead(self) -> list[str]:
-        """Send facts and live MetaFacts below the threshold back into the hole."""
+        """Send facts and live MetaFacts below the threshold back into the hole.
+
+        Absorbed bodies are NOT deleted from storage — they are persisted
+        with ``layer = -1`` so that a restart re-hydrates the singularity
+        via ``BlackHole.restore_fact`` (see ``_load_from_storage``) and
+        Hawking emission / collapse lineage survive the crash. Only the
+        explicit ``delete_fact`` primitive removes a row from storage.
+        """
         absorbed = []
         for fid, fact in list(self._facts.items()):
-            if fact.is_deprecated or fact.is_expired:
-                self._hole.absorb(fact)
-                del self._facts[fid]
-                self._index.remove(fid)
-                self._drop_from_spo_index(fact)
-                absorbed.append(fid)
-            elif fact.gravity_score < _ABSORPTION_THRESHOLD:
-                self._hole.absorb(fact)
-                del self._facts[fid]
-                self._index.remove(fid)
-                self._drop_from_spo_index(fact)
-                if self._storage:
-                    self._storage.delete_fact(fid)
-                absorbed.append(fid)
+            falls_to_hole = (
+                fact.is_deprecated or fact.is_expired
+                or fact.gravity_score < _ABSORPTION_THRESHOLD
+            )
+            if not falls_to_hole:
+                continue
+            fact.layer = -1
+            self._hole.absorb(fact)
+            del self._facts[fid]
+            self._index.remove(fid)
+            self._drop_from_spo_index(fact)
+            if self._storage:
+                # Persist the layer=-1 transition so the body survives
+                # restart inside the singularity (not as a live fact).
+                self._storage.save_fact(fact)
+            absorbed.append(fid)
         # Live MetaFacts use the same gravity floor — they came out of the
         # singularity once, they can fall back in.
         for mid, meta in list(self._meta_facts.items()):
@@ -1254,6 +1288,7 @@ class MemoryStore:
         min_similarity: float = 0.0,
         subject_prefix: Optional[str] = None,
         min_gravity: float = 0.0,
+        allowed_layers: Optional[set[int]] = None,
     ) -> list[QueryResult]:
         """
         Retrieve relevant facts by cosine similarity.
@@ -1288,9 +1323,11 @@ class MemoryStore:
                     continue
                 if not (min_layer <= fact.layer <= max_layer):
                     continue
+                if allowed_layers is not None and fact.layer not in allowed_layers:
+                    continue
                 if fact.gravity_score < min_gravity:
                     continue
-                if prefix and prefix not in fact.subject.lower():
+                if prefix and not fact.subject.lower().startswith(prefix):
                     continue
                 results.append(QueryResult(
                     fact=fact,
@@ -1309,12 +1346,14 @@ class MemoryStore:
                     continue
                 if not (min_layer <= meta.layer <= max_layer):
                     continue
+                if allowed_layers is not None and meta.layer not in allowed_layers:
+                    continue
                 if meta.gravity_score < min_gravity:
                     continue
                 if prefix:
                     # No single subject on a meta — only include if any
                     # source_text actually contains the prefix.
-                    if not any(prefix in (st or "").lower()
+                    if not any((st or "").lower().startswith(prefix)
                                for st in meta.source_texts):
                         continue
                 results.append(QueryResult(
@@ -1332,7 +1371,7 @@ class MemoryStore:
                 def _fact_predicate(f) -> bool:
                     if f.gravity_score < min_gravity:
                         return False
-                    if prefix and prefix not in f.subject.lower():
+                    if prefix and not f.subject.lower().startswith(prefix):
                         return False
                     return True
 
@@ -1342,7 +1381,7 @@ class MemoryStore:
                     if prefix:
                         # No single subject on a meta — only emit if any
                         # source_text actually contains the prefix.
-                        if not any(prefix in (st or "").lower()
+                        if not any((st or "").lower().startswith(prefix)
                                    for st in m.source_texts):
                             return False
                     return True
@@ -1398,13 +1437,43 @@ class MemoryStore:
             # than one returned at 0.10. Polymorphic over fact / meta.
             sid = self._resolve_sid(session_id)
             ctx = self._sessions.get(sid) if sid else None
+            touched_facts: list[FactPassport] = []
+            touched_metas: list[MetaFact] = []
             for r in top:
                 body = r.fact if r.fact is not None else r.meta
                 if body is None:
                     continue
                 body.touch()
+                if r.fact is not None:
+                    touched_facts.append(r.fact)
+                else:
+                    assert r.meta is not None
+                    touched_metas.append(r.meta)
                 if ctx is not None:
                     self._attribute_to(ctx, r.body_id, r.similarity)
+
+            # Persist touches + open-session attribution so that
+            # access_count / last_accessed / ctx.facts survive a crash
+            # between session_message calls. Without this the gravity
+            # formula's `access` term loses every read between closes.
+            if self._storage:
+                if touched_facts:
+                    with self._txn():
+                        self._storage.save_facts(touched_facts)
+                if (touched_metas
+                        and hasattr(self._storage, "save_meta_facts")):
+                    with self._txn():
+                        self._storage.save_meta_facts(touched_metas)
+            if (ctx is not None and self._storage
+                    and hasattr(self._storage, "save_open_session")):
+                with self._txn():
+                    self._storage.save_open_session(
+                        ctx.session_id,
+                        ctx.messages,
+                        ctx.vectors,
+                        ctx.facts,
+                        time.time(),
+                    )
 
         return top
 

@@ -38,7 +38,7 @@ def query_memory(
     has more than one live candidate among the hits, with a ``recommended_id``
     by gravity. Use that to spot "two competing HEAD values" cases.
 
-    Filters: ``subject_prefix`` (case-insensitive substring on subject),
+    Filters: ``subject_prefix`` (case-insensitive prefix on subject — startswith),
     ``min_gravity`` (drop low-confidence facts), ``layers`` (any of
     ``surface``/``kinetic``/``core``), ``min_similarity`` (cosine floor).
     Deprecated / expired facts are never returned (they live in the
@@ -51,21 +51,20 @@ def query_memory(
     """
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     if layers:
-        layer_ints = [layer_map[name] for name in layers if name in layer_map]
-        min_layer = min(layer_ints) if layer_ints else 0
-        max_layer = max(layer_ints) if layer_ints else 2
+        # Build an explicit set so layers=["surface", "core"] excludes
+        # kinetic — a range filter would silently include it.
+        allowed = {layer_map[name] for name in layers if name in layer_map}
     else:
-        min_layer, max_layer = 0, 2
+        allowed = None
     results = _store.query(
         text,
         top_k=top_k,
         hawking=True,
         session_id=session_id,
         min_similarity=min_similarity,
-        min_layer=min_layer,
-        max_layer=max_layer,
         subject_prefix=subject_prefix,
         min_gravity=min_gravity,
+        allowed_layers=allowed,
     )
     hits = [r.to_mcp_dict() for r in results]
 
@@ -182,9 +181,15 @@ def record_facts(
     ]
     # Check existence before batch insert (no per-item round-trip needed).
     existed = [_store.fact_exists(s, p, o) for s, p, o in triples]
-    # Resolve per-item session_id override, falling back to top-level.
-    sid = session_id
-    results_facts = _store.add_facts(triples, session_id=sid)
+    # Per-item session_id overrides the top-level one — honour the contract
+    # spelled out in the docstring. Items without their own session_id fall
+    # back to the top-level argument.
+    per_item_sids = [f.get("session_id") for f in facts]
+    results_facts = _store.add_facts(
+        triples,
+        session_id=session_id,
+        session_ids=per_item_sids,
+    )
     if not session_id:
         hint = (
             "open a session with session_open and pass session_id here "
@@ -356,7 +361,7 @@ def list_facts(
             continue
         if f.gravity_score < min_gravity:
             continue
-        if prefix and prefix not in f.subject.lower():
+        if prefix and not f.subject.lower().startswith(prefix):
             continue
         out.append({
             "fact_id": f.fact_id,
@@ -422,11 +427,21 @@ def explain_fact(fact_id: str) -> dict:
 
 
 @mcp.tool()
-def session_open(session_id: Optional[str] = None, agent_id: str = "default") -> dict:
+def session_open(
+    session_id: Optional[str] = None,
+    agent_id: str = "default",
+    first_message: Optional[str] = None,
+) -> dict:
     """USE WHEN: starting a conversation that will read or write memory and
     you want gravity feedback to land on the right facts. Always open a
     session before the first ``query_memory`` so retrieved facts get
     attributed to this session's outcome.
+
+    Pass ``first_message`` (the user's opening text) to trigger echo
+    detection on the same call: if the topic matches a past unresolved
+    problem at cosine ≥ 0.68, the past session's R is pulled into toxic
+    territory and the penalty propagates to the facts that misled it. The
+    echo result is returned in the response under ``echo``.
 
     Returns ``session_id`` — pass it to every subsequent ``record_fact``,
     ``record_facts``, ``set_fact``, ``query_memory``, ``session_push``. Close
@@ -436,13 +451,32 @@ def session_open(session_id: Optional[str] = None, agent_id: str = "default") ->
     """
     sid = session_id or f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(sid)
-    return {
+    response: dict = {
         "session_id": sid,
         "_hint": (
             "pass this session_id to record_fact, record_facts, query_memory, "
             "and session_push — then call session_close when done"
         ),
     }
+    if first_message:
+        response["echo"] = _store.check_echo(first_message, session_id=sid)
+    return response
+
+
+@mcp.tool()
+def check_echo(first_message: str, session_id: Optional[str] = None) -> dict:
+    """USE WHEN: you want to know whether the user is returning to an
+    unresolved problem before responding. Compares the first message against
+    past K-means session bundles; on a hit at cosine ≥ 0.68 the past
+    session's R is pulled into toxic territory and the penalty propagates to
+    every fact the past session touched (scaled by per-fact relevance).
+
+    Idempotent: a second echo on the same matched session returns
+    ``penalty=0``. Usually called automatically via ``session_open(first_message=...)``;
+    this tool is the explicit form when you want the check without opening a
+    new session, or when you've already opened one and want a late check.
+    """
+    return _store.check_echo(first_message, session_id=session_id)
 
 
 @mcp.tool()

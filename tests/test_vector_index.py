@@ -1,4 +1,6 @@
 """VectorIndex — numpy-backed cosine search."""
+import pytest
+
 from birch.vector_index import VectorIndex
 
 
@@ -41,11 +43,17 @@ def test_replace_updates_existing_row():
     assert sims["a"] < 0.01, "after replacement, sim should reflect the new vector"
 
 
-def test_mismatched_dim_is_ignored():
+def test_mismatched_dim_raises_loudly():
+    """An embedding-model change leaves stale rows; failing silently used to
+    leave them un-searchable but reachable through other paths. Now it
+    raises so the caller knows to reindex or pin BIRCH_EMBED_MODEL."""
+    from birch.vector_index import DimensionMismatchError
+
     idx = VectorIndex()
     idx.add("a", [1.0, 0.0, 0.0])
-    idx.add("bad", [1.0, 0.0])
-
+    with pytest.raises(DimensionMismatchError):
+        idx.add("bad", [1.0, 0.0])
+    # The mismatched body is NOT in the index, and the index dim is unchanged.
     assert "bad" not in idx
     assert len(idx) == 1
 

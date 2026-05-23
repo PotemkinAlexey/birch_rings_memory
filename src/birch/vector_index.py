@@ -16,6 +16,17 @@ from typing import Optional
 import numpy as np
 
 
+class DimensionMismatchError(ValueError):
+    """Raised when an incoming vector's dimension does not match the index.
+
+    Silently dropping mismatched dimensions is dangerous: the fact still
+    lives in ``MemoryStore._facts`` and on disk, but is unsearchable,
+    which usually means the embedding model name (``BIRCH_EMBED_MODEL``)
+    changed without a reindex. Raising loudly forces the caller to either
+    rebuild the index or pin the model.
+    """
+
+
 class VectorIndex:
     """L2-normalised cosine index keyed by fact_id."""
 
@@ -50,8 +61,12 @@ class VectorIndex:
             self._id_to_row = {fact_id: 0}
             return
         if v.shape[0] != self._dim:
-            # Silently skip mismatched dims rather than corrupting the matrix.
-            return
+            raise DimensionMismatchError(
+                f"Embedding dimension mismatch: index has dim={self._dim}, "
+                f"incoming vector has dim={v.shape[0]} for fact_id={fact_id!r}. "
+                "The embedding model probably changed under the store. "
+                "Either pin BIRCH_EMBED_MODEL or rebuild the store."
+            )
         # _matrix is allocated together with _dim above — both set or both None.
         assert self._matrix is not None
         if fact_id in self._id_to_row:
