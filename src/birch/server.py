@@ -781,6 +781,20 @@ def session_push(text: str, session_id: str) -> dict:
         _store.session_message(text, session_id=session_id)
     except EmbeddingError as exc:
         return _embedding_error_response(exc)
+    except KeyError as exc:
+        # Unknown / expired session_id used to leak raw KeyError to the
+        # MCP layer. Structured response so the agent gets an actionable
+        # hint instead of a stacktrace (round 15).
+        return {
+            "ok": False,
+            "error": "unknown_session",
+            "session_id": session_id,
+            "detail": str(exc),
+            "hint": (
+                "Call session_open first and pass the returned session_id, "
+                "or check the id hasn't been closed."
+            ),
+        }
     return {
         "session_id": session_id,
         "ok": True,
@@ -824,11 +838,25 @@ def session_close(
     ``"r_override"``) so the caller can confirm which path resolved R,
     and a fresh ``stats`` snapshot.
     """
-    summary = _store.session_close(
-        session_id=session_id,
-        sentiment=sentiment,
-        r_override=r_override,
-    )
+    try:
+        summary = _store.session_close(
+            session_id=session_id,
+            sentiment=sentiment,
+            r_override=r_override,
+        )
+    except ValueError as exc:
+        # Core raises ValueError on unknown sentiment label. Map to a
+        # structured response so the agent can read the allowed set
+        # instead of getting a stacktrace (round 15).
+        return {
+            "ok": False,
+            "error": "invalid_sentiment",
+            "session_id": session_id,
+            "detail": str(exc),
+            "allowed": [
+                "resonant", "positive", "neutral", "toxic", "negative",
+            ],
+        }
     return {
         "session_id": session_id,
         "label": summary.get("label"),
@@ -851,6 +879,29 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
     session. ``record_session`` is the fallback for "I forgot to open a
     session and now I want the resonance signal anyway".
     """
+    # Pre-validate the messages list before opening a session. Round
+    # 15: a string passed for messages would have iterated chars; a
+    # list with non-string items would have reached the embed layer
+    # as an opaque value. Reject up front with a structured response
+    # so we never half-open a session for a malformed input.
+    if not isinstance(messages, list):
+        return {
+            "ok": False,
+            "error": "invalid_messages",
+            "got_type": type(messages).__name__,
+            "hint": "messages must be a list of strings",
+        }
+    bad_items = [
+        i for i, m in enumerate(messages)
+        if not isinstance(m, str) or not m.strip()
+    ]
+    if bad_items:
+        return {
+            "ok": False,
+            "error": "invalid_message_item",
+            "indices": bad_items,
+            "hint": "each message must be a non-empty string",
+        }
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)
     # Symmetric with session_open(first_message=...) — if there's an

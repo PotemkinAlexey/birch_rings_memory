@@ -481,11 +481,20 @@ class SQLiteBackend:
                     raise ValueError("vectors must be a list")
                 if not isinstance(facts, dict):
                     raise ValueError("facts must be a dict")
+                # Coerce facts values to float here (round 15) rather
+                # than at the consumer. The consumer used to do
+                # {k: float(v) for ...} and would crash with raw
+                # ValueError if any value were non-numeric. Doing it
+                # at the loader gives the row a chance to be dropped
+                # cleanly instead of taking startup down.
+                coerced_facts: dict[str, float] = {}
+                for k, v in facts.items():
+                    coerced_facts[str(k)] = float(v)
                 out.append({
                     "session_id": r["session_id"],
                     "messages": messages,
                     "vectors": vectors,
-                    "facts": facts,
+                    "facts": coerced_facts,
                     "started_at": r["started_at"],
                 })
             except Exception as exc:

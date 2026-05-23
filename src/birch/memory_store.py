@@ -151,6 +151,11 @@ class MemoryStore:
         # heterogeneous".
         self._last_collapse_at: Optional[float] = None
         self._last_collapse_attempt_at: Optional[float] = None
+        # Async collapse failures used to be swallowed in close(). Now
+        # we capture the last error string and surface it in stats
+        # so an operator can see a worker crash without grepping logs.
+        # Process-lifetime, reset only on successful collapse (round 15).
+        self._last_collapse_error: Optional[str] = None
         self._total_collapses = 0
         self._total_collapse_attempts = 0
         self._collapse_executor: Optional[ThreadPoolExecutor] = None
@@ -1541,9 +1546,20 @@ class MemoryStore:
                 if report.groups > 0:
                     self._last_collapse_at = now_ts
                     self._total_collapses += 1
+                    # Successful collapse clears any prior captured
+                    # error — the worker is healthy again.
+                    self._last_collapse_error = None
                 # Reset counter regardless so we don't re-trigger on the
                 # same empty conditions in a tight loop.
                 self._collapse_counter = 0
+                # Round 15: collapse mutated _hole (singularity facts
+                # removed) and _meta_facts (new MetaFacts registered)
+                # if anything actually compressed. Forecast cache keys
+                # on body counts and feature state — must invalidate.
+                # Skip the bump on a no-op pass (report.groups == 0)
+                # so we don't churn the cache for empty attempts.
+                if report.groups > 0 or report.absorbed_facts > 0:
+                    self._bump_mutation_locked()
                 return report
 
     def _maybe_trigger_collapse_locked(self, absorbed_count: int) -> None:
@@ -1553,9 +1569,17 @@ class MemoryStore:
             return
         if self._collapse_counter < self.COLLAPSE_DELTA_TRIGGER:
             return
-        # Skip if a previous collapse is still running.
-        if self._inflight_collapse is not None and not self._inflight_collapse.done():
-            return
+        # Skip if a previous collapse is still running. If it finished
+        # but raised, capture the error before scheduling another one
+        # so a recurring background failure shows up in stats instead
+        # of staying buried in the future.
+        if self._inflight_collapse is not None:
+            if not self._inflight_collapse.done():
+                return
+            try:
+                self._inflight_collapse.result(timeout=0)
+            except Exception as exc:
+                self._last_collapse_error = repr(exc)
         if not self._collapse_async:
             self.collapse_singularity()
             return
@@ -1705,8 +1729,11 @@ class MemoryStore:
         if inflight is not None:
             try:
                 inflight.result(timeout=5.0)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Don't crash close() — but don't lose the error either.
+                # Stored on the instance (best effort, since stats may be
+                # read shortly after close in tests / shutdown handlers).
+                self._last_collapse_error = repr(exc)
         if executor is not None:
             executor.shutdown(wait=True)
         if storage is not None and hasattr(storage, "close"):
@@ -2253,6 +2280,7 @@ class MemoryStore:
                 "total_collapses": self._total_collapses,
                 "total_collapse_attempts": self._total_collapse_attempts,
                 "last_collapse_at": self._last_collapse_at,
+                "last_collapse_error": self._last_collapse_error,
                 "last_collapse_attempt_at": self._last_collapse_attempt_at,
                 "adaptive_weights": self._engine.weights.as_dict(),
                 "echo_sessions": len(self._echo),
