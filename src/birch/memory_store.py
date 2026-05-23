@@ -7,7 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Literal, Optional, Union, overload
 
 from .black_hole import BlackHole
 from .fact import FactPassport
@@ -463,6 +463,30 @@ class MemoryStore:
 
     # ── Fact management ─────────────────────────────────────────────────────
 
+    @overload
+    def add_fact(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        layer: int = ...,
+        session_id: Optional[str] = ...,
+        *,
+        return_status: Literal[False] = False,
+    ) -> FactPassport: ...
+
+    @overload
+    def add_fact(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        layer: int = ...,
+        session_id: Optional[str] = ...,
+        *,
+        return_status: Literal[True],
+    ) -> tuple[FactPassport, bool]: ...
+
     def add_fact(
         self,
         subject: str,
@@ -471,7 +495,7 @@ class MemoryStore:
         layer: int = 1,
         session_id: Optional[str] = None,
         return_status: bool = False,
-    ):
+    ) -> Union[FactPassport, tuple[FactPassport, bool]]:
         """
         Create, embed, and register a new fact.
 
@@ -1435,6 +1459,13 @@ class MemoryStore:
             "facts_updated_count": facts_updated_n,
             "metas_updated_count": metas_updated_n,
             "distribution": ranges,
+            "_hint": (
+                "facts_forecasted / facts_updated are legacy aliases — "
+                "they actually count BODIES (FactPassport + MetaFact). "
+                "Prefer bodies_forecasted / bodies_updated, or read the "
+                "per-type split via facts_updated_count and "
+                "metas_updated_count."
+            ),
         }
 
     def close(self) -> None:
@@ -1737,19 +1768,67 @@ class MemoryStore:
                     if pair[0] in kept_after_revalidate
                 ]
 
-                # Hawking emission lives inside the transaction so the pop
-                # from the singularity, the re-registration in live stores,
-                # and the persistence land or roll back together. Doing it
-                # outside the txn (as before) was a state-mutation window
-                # the next persist could not unwind.
+                # Hawking emission as a two-phase commit: PEEK candidates
+                # without popping, merge into the ranking, take top_k,
+                # then COMMIT (actually emit) only those that survived.
+                # Previously, hawking_emit popped and re-registered every
+                # eligible body even if it later fell below top_k — a
+                # state mutation the caller never received. min_similarity
+                # is applied to Hawking candidates too, symmetric with
+                # live results.
                 if hawking:
-                    emitted = self._hole.hawking_emit(
+                    fact_candidates = self._hole.peek_hawking_candidates(
                         vec, predicate=_fact_predicate)
-                    meta_emitted = self._hole.hawking_emit_metas(
+                    meta_candidates = self._hole.peek_hawking_meta_candidates(
                         vec,
                         threshold=_META_HAWKING_THRESHOLD,
                         predicate=_meta_predicate,
                     )
+                    for fact, sim in fact_candidates:
+                        if sim < min_similarity:
+                            continue
+                        top.append(QueryResult(
+                            fact=fact,
+                            similarity=round(sim, 4),
+                            source="hawking",
+                        ))
+                    for meta, sim in meta_candidates:
+                        if sim < min_similarity:
+                            continue
+                        top.append(QueryResult(
+                            meta=meta,
+                            similarity=round(sim, 4),
+                            source="hawking_meta",
+                        ))
+
+                # Re-sort after Hawking additions and re-clamp to top_k.
+                top.sort(key=lambda r: r.similarity, reverse=True)
+                top = top[:top_k]
+                kept_ids = {r.body_id for r in top}
+
+                # Commit: actually emit ONLY the Hawking survivors. Bodies
+                # that fell out of top_k stay in the singularity, untouched.
+                if hawking:
+                    hawking_survivor_fact_ids = {
+                        r.fact.fact_id for r in top
+                        if r.source == "hawking" and r.fact is not None
+                    }
+                    hawking_survivor_meta_ids = {
+                        r.meta.meta_id for r in top
+                        if r.source == "hawking_meta" and r.meta is not None
+                    }
+                    emitted = self._hole.hawking_emit(
+                        vec,
+                        predicate=_fact_predicate,
+                        only_ids=hawking_survivor_fact_ids or None,
+                    ) if hawking_survivor_fact_ids else []
+                    meta_emitted = self._hole.hawking_emit_metas(
+                        vec,
+                        threshold=_META_HAWKING_THRESHOLD,
+                        predicate=_meta_predicate,
+                        only_ids=hawking_survivor_meta_ids or None,
+                    ) if hawking_survivor_meta_ids else []
+
                     for fact in emitted:
                         self._facts[fact.fact_id] = fact
                         self._engine.register(fact)
@@ -1760,14 +1839,8 @@ class MemoryStore:
                             self._spo_index.setdefault(key, fact.fact_id)
                         if self._storage:
                             self._storage.save_fact(fact)
-                        sim = VectorIndex.similarity(vec, fact.vector)
-                        top.append(QueryResult(
-                            fact=fact,
-                            similarity=round(sim, 4),
-                            source="hawking",
-                        ))
-                        # Emitted bodies also participate in attribution.
                         touched_fact_ids.append(fact.fact_id)
+                        sim = VectorIndex.similarity(vec, fact.vector)
                         attribution_pairs.append((fact.fact_id, sim))
                     for meta in meta_emitted:
                         self._meta_facts[meta.meta_id] = meta
@@ -1776,21 +1849,11 @@ class MemoryStore:
                         if (self._storage
                                 and hasattr(self._storage, "save_meta_fact")):
                             self._storage.save_meta_fact(meta)
-                        sim = VectorIndex.similarity(vec, meta.vector)
-                        top.append(QueryResult(
-                            meta=meta,
-                            similarity=round(sim, 4),
-                            source="hawking_meta",
-                        ))
                         touched_meta_ids.append(meta.meta_id)
+                        sim = VectorIndex.similarity(vec, meta.vector)
                         attribution_pairs.append((meta.meta_id, sim))
 
-                # Re-sort after Hawking additions and re-clamp to top_k.
-                top.sort(key=lambda r: r.similarity, reverse=True)
-                top = top[:top_k]
-                # Restrict downstream work to bodies that survived the top
-                # slice (Hawking may have promoted, top_k may have demoted).
-                kept_ids = {r.body_id for r in top}
+                # Restrict downstream work to bodies that survived top_k.
                 touched_fact_ids = [
                     fid for fid in touched_fact_ids if fid in kept_ids
                 ]

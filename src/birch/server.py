@@ -306,8 +306,26 @@ def forecast_memory(horizon_ticks: int = 50) -> dict:
 
     Returns a summary: how many facts were forecasted and updated, and a
     coarse distribution across {safe / kinetic / near_horizon / predicted_fall}.
+    On mixed embedding dimensions in the store (after a BIRCH_EMBED_MODEL
+    swap without reindex) returns ``{"ok": false, "error":
+    "mixed_embedding_dimensions", "hint": "...", "detail": "..."}`` instead
+    of a raw exception so the agent gets actionable diagnostic.
     """
-    return _store.run_forecast(horizon_ticks=horizon_ticks)
+    from .vector_index import DimensionMismatchError
+
+    try:
+        return _store.run_forecast(horizon_ticks=horizon_ticks)
+    except DimensionMismatchError as exc:
+        return {
+            "ok": False,
+            "error": "mixed_embedding_dimensions",
+            "hint": (
+                "Store contains vectors of different sizes — likely the "
+                "embedding model changed under it. Pin BIRCH_EMBED_MODEL "
+                "or rebuild/reindex before running the forecast."
+            ),
+            "detail": str(exc),
+        }
 
 
 @mcp.tool()

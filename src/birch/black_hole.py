@@ -86,10 +86,61 @@ class BlackHole:
 
     # ── Hawking emission ────────────────────────────────────────────────────
 
+    def peek_hawking_candidates(
+        self,
+        query_vector: list[float],
+        predicate=None,
+    ) -> list[tuple["FactPassport", float]]:
+        """Return ``(fact, similarity)`` for every body that WOULD be
+        Hawking-emitted by this query — without popping anything.
+
+        Use ``peek_hawking_candidates`` to merge potential emissions into
+        the live ranking and decide top_k FIRST, then call
+        ``hawking_emit(..., only_ids=survivors)`` to commit only the
+        bodies that actually made it into the returned results.
+        Avoids the contract violation where a body was resurrected
+        (state mutation, persistence) but the caller never received it
+        because it was below top_k.
+        """
+        sims = self._index.all_similarities(query_vector)
+        out: list[tuple["FactPassport", float]] = []
+        for fid, score in sims.items():
+            if score < self._hawking_threshold:
+                continue
+            rec = self._singularity.get(fid)
+            if rec is None:
+                continue
+            if predicate is not None and not predicate(rec.fact):
+                continue
+            out.append((rec.fact, float(score)))
+        return out
+
+    def peek_hawking_meta_candidates(
+        self,
+        query_vector: list[float],
+        threshold: float | None = None,
+        predicate=None,
+    ) -> list[tuple["MetaFact", float]]:
+        """MetaFact counterpart of ``peek_hawking_candidates``."""
+        thr = self._hawking_threshold if threshold is None else threshold
+        sims = self._meta_index.all_similarities(query_vector)
+        out: list[tuple["MetaFact", float]] = []
+        for mid, score in sims.items():
+            if score < thr:
+                continue
+            rec = self._meta_singularity.get(mid)
+            if rec is None:
+                continue
+            if predicate is not None and not predicate(rec.meta):
+                continue
+            out.append((rec.meta, float(score)))
+        return out
+
     def hawking_emit(
         self,
         query_vector: list[float],
         predicate=None,
+        only_ids: set[str] | None = None,
     ) -> list["FactPassport"]:
         """
         Attempt Hawking emission of single FactPassports similar enough to
@@ -113,6 +164,8 @@ class BlackHole:
         for fid, score in sims.items():
             if score < self._hawking_threshold:
                 continue
+            if only_ids is not None and fid not in only_ids:
+                continue
             rec = self._singularity.get(fid)
             if rec is None:
                 continue
@@ -132,6 +185,7 @@ class BlackHole:
         query_vector: list[float],
         threshold: float | None = None,
         predicate=None,
+        only_ids: set[str] | None = None,
     ) -> list["MetaFact"]:
         """
         Attempt Hawking emission of MetaFacts.
@@ -151,6 +205,8 @@ class BlackHole:
         emitted: list["MetaFact"] = []
         for mid, score in sims.items():
             if score < thr:
+                continue
+            if only_ids is not None and mid not in only_ids:
                 continue
             rec = self._meta_singularity.get(mid)
             if rec is None:
