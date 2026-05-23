@@ -11,12 +11,18 @@ its `gravity_score`. Low gravity means the system itself doubts it.
 **Storing** — use triples that capture a relationship, not prose. One fact per
 `record_fact` call.
 
-**Changing** — if a fact is superseded, `record_fact` the new version and note
-the replacement. The old fact's gravity will naturally decay; do not delete
-manually.
+**Changing** — if a fact is superseded, `record_fact` the new version, then
+call `supersede_fact(old_id, new_id)`. The old body goes to the singularity
+with its `deprecated_by` pointer intact, so lineage is preserved and the
+body can still feed MetaFact compression or be Hawking-emitted. If a fact's
+topic is just over with no replacement, call `retire_fact(fact_id)` —
+same singularity benefits, no successor required.
 
-**Deleting** — only on explicit user order. The black hole handles decay; you
-handle intent.
+**Deleting** — only on explicit user order, and only with `delete_fact`,
+which is the destructive primitive (no singularity, no lineage). Reserve
+it for secrets / accidental writes / GDPR removal. For "stale / wrong /
+outdated" data, the right operation is `supersede_fact` or `retire_fact`
+— see the *Retiring a fact* table below.
 
 ---
 

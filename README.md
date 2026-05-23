@@ -66,10 +66,11 @@ into toxic territory, pulling down the gravity of facts it used.
 ### Gravity engine
 
 ```
-gravity = w_freshness × freshness   (learned; prior 0.35; ~2-week half-life)
-        + w_access    × access      (learned; prior 0.20; log-scaled, ~3-day decay)
-        + 0.35        × resonance   (fixed: observation, not prediction)
-        + w_graph     × graph       (learned; prior 0.10; degree / max-degree)
+gravity = w_freshness × freshness        (learned; prior 0.30; ~2-week half-life)
+        + w_access    × access           (learned; prior 0.15; log-scaled, ~3-day decay)
+        + w_graph     × graph            (learned; prior 0.10; degree / max-degree)
+        + w_utility   × recent_utility   (learned; prior 0.10; EWMA of closure-weighted R)
+        + 0.35        × resonance        (fixed: observation, not prediction)
 ```
 
 The **freshness** term is a grace period — a new fact rides high and is not
@@ -80,14 +81,25 @@ session R, one returned at 0.10 almost none; facts added or re-confirmed
 via `record_fact` are pinned at weight 1.0. Resonance contributes 0 until a
 session has actually scored the fact.
 
-**The three pre-resonance weights are learned, not hand-set.** Freshness,
-access and graph each carry a weight that starts at the values above (the
-prior) and adapts to the user's own resonance feedback — one regularised
-SGD step per closed session, fit against (R+1)/2 as ground truth. The
-resonance weight stays fixed at 0.35: resonance is observation, not
-prediction. `memory_stats` exposes the live weights and the training count
-so the formula stays legible — at zero data behaviour is identical to the
-hand-tuned formula, and as the store is used the weights drift toward
+**`recent_utility`** is an EWMA of closure-weighted resonance updated for
+every fact a session touched: `(1-α)·prev + α·target` with α=0.15 and
+target `(R · attribution_weight + 1) / 2`. It captures *how the sessions
+this fact participated in tended to end*, independently of how often it
+was touched. Default 0.5 is a Bayesian neutral prior — an untouched fact
+gets a soft floor and does not need to "prove itself" to escape junk
+status. Positive context is emergent: the user never labels anything, the
+gravity formula learns the attribution.
+
+**The four pre-resonance weights are learned, not hand-set.** Freshness,
+access, graph and utility each carry a weight that starts at the values
+above (the prior) and adapts to the user's own resonance feedback — one
+regularised SGD step per closed session, fit against `(R+1)/2` as ground
+truth. The resonance weight stays fixed at 0.35: resonance is
+observation, not prediction. A budget renormalisation keeps the four
+learned weights summing to 0.65 so the formula stays in `[0, 1]`.
+`memory_stats` exposes the live weights and the training count so the
+formula stays legible — at zero data behaviour is identical to the
+hand-tuned prior, and as the store is used the weights drift toward
 what predicts value *for you*.
 
 Layer migration happens on every `session_close()`. Each tick a fact steps
@@ -164,8 +176,9 @@ so polymorphic `query()` does four scans without ID collisions.
 
 | Module | Responsibility |
 |---|---|
-| `fact.py` | `FactPassport` — subject/predicate/object triple + gravity metadata |
+| `fact.py` | `FactPassport` — subject/predicate/object triple + gravity metadata (incl. `recent_utility`) |
 | `meta_fact.py` | `MetaFact` — dense centroid bundle with lineage + feedback-loop fields |
+| `adaptive_gravity.py` | `AdaptiveWeights` — four learned pre-resonance weights, regularised SGD with budget renormalisation |
 | `gravity.py` | `GravityEngine` — computes scores, triggers layer migration |
 | `black_hole.py` | `BlackHole` — irreversible sink + Hawking emission (facts + metas) |
 | `singularity_compactor.py` | `collapse_singularity()` — Union-Find collapse + center of mass |
@@ -333,20 +346,22 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Claude then has ten tools:
+Claude then has twelve tools:
 
 | Tool | What it does |
 |---|---|
 | `query_memory` | Semantic search — returns facts and MetaFacts ranked by similarity |
 | `record_fact` | Store one subject-predicate-object triple |
 | `record_facts` | Store many triples in one batch (one Ollama round-trip) |
-| `delete_fact` | Permanently remove a fact by `fact_id` — bypasses the black hole |
+| `supersede_fact` | Replace an old fact with a newer one — old body goes to the singularity with `deprecated_by` set; lineage preserved, MetaFact / Hawking still possible |
+| `retire_fact` | Send a no-longer-relevant fact to the singularity (no replacement) — `ttl=now`, same singularity benefits as supersede |
+| `delete_fact` | Hard-delete — data is GONE, no singularity, no lineage. Use only for secrets / accidental writes; prefer supersede or retire for stale data |
 | `list_facts` | List live facts by subject/predicate, sorted by gravity — audit without a query |
 | `session_open` | Open a named session so reads and writes can be attributed to it |
 | `session_push` | Append a user message to an open session |
 | `session_close` | Close a session — score resonance, update gravity, detect echo |
 | `record_session` | Score a completed session in one call (open + push messages + close) |
-| `memory_stats` | Report layer distribution and black hole status |
+| `memory_stats` | Report layer distribution, black hole status, and live adaptive weights |
 
 `query_memory` returns polymorphic hits. Every item has `kind`, `body_id`, `similarity`,
 `source`, `layer`, `gravity_score`. Fact hits (`kind: "fact"`) include `subject`,

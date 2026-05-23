@@ -354,6 +354,30 @@ BlackHole
   _meta_index       : VectorIndex                       # meta vectors
 ```
 
+### Intake — three ways a body enters the singularity
+
+`_absorb_dead()` is the single chokepoint; it is called from
+`session_close` and immediately by the explicit retirement operations.
+A body crosses the event horizon when **one** of these is true:
+
+| Trigger | Set by | Intent |
+|---|---|---|
+| `gravity_score < 0.10` | natural decay (the `tick()` formula) | the body proved itself unhelpful |
+| `is_deprecated` (`deprecated_by` is set) | `supersede_fact(old, new)` | newer fact replaces this one |
+| `is_expired` (`ttl <= now()`) | `retire_fact(fact_id)` | topic is over, no replacement |
+
+`MemoryStore.delete_fact` is **not** an intake — it removes the row
+from storage entirely, bypassing the singularity, losing the body to
+both MetaFact compression and Hawking emission. It is reserved for
+hard removal (secrets, accidental writes); the canonical agent-facing
+paths for stale data are `supersede_fact` and `retire_fact`.
+
+A symmetry property follows: a body that decays naturally and a body
+explicitly retired end up in the same place with the same affordances —
+they can be fused into a MetaFact, and they can be Hawking-emitted by a
+sufficiently close future query. Retirement is a fast path to a state
+gravity decay would reach on its own; it is not a separate fate.
+
 ### Hawking emission — facts
 
 ```python
@@ -504,8 +528,23 @@ class StorageBackend(Protocol):
     def save_meta_facts(self, metas: list[MetaFact]) -> None: ...   # batched
     def delete_meta_fact(self, meta_id: str) -> None: ...
     def load_meta_facts(self) -> list[MetaFact]: ...
+    # Cross-process coordination (optional — getattr-probed)
+    def data_version(self) -> int: ...
+    @contextmanager
+    def transaction(self) -> Iterator[None]: ...
+    # Adaptive gravity weights (optional — getattr-probed)
+    def save_adaptive_weights(self, weights: AdaptiveWeights) -> None: ...
+    def load_adaptive_weights(self) -> AdaptiveWeights | None: ...
     def close(self) -> None: ...
 ```
+
+`data_version` and `transaction` are the cross-process safety seam (see
+*Concurrency → Across processes* below); a backend without them runs
+single-process only and `MemoryStore` skips the reload-on-other-process
+machinery via `getattr`. `save_adaptive_weights` /
+`load_adaptive_weights` persist the singleton row of learned
+pre-resonance weights; a backend without them falls back to the prior
+on every restart, which is safe but loses the personalisation.
 
 `save_facts` and `save_meta_facts` have default implementations that
 loop the singular variant; concrete backends are encouraged to override
@@ -546,10 +585,11 @@ MemoryStore
 A `SessionContext` carries one session's messages, vectors, accumulated
 `fact_weights`, and the echo result returned at `session_start`. Every
 mutating public method (`add_fact`, `session_message`, `session_close`,
-`query`, `check_echo`, `link`, `deprecate`, `stats`) accepts an optional
-`session_id` and acquires `_lock` for the critical section. Embedding HTTP
-calls are made *outside* the lock so multiple agents don't serialize on
-Ollama.
+`query`, `check_echo`, `link`, `deprecate`, `supersede_fact`,
+`retire_fact`, `delete_fact`, `stats`) accepts an optional `session_id`
+where applicable and acquires `_lock` for the critical section. Embedding
+HTTP calls are made *outside* the lock so multiple agents don't serialize
+on Ollama.
 
 `_current_session_id` is still set by `session_start`/`session_close` so
 single-threaded callers can omit `session_id` exactly as before. The MCP
@@ -618,8 +658,8 @@ off-centre point — so the attention mass ships as a gentle perturber.
 
 ```
 src/birch/
-  adaptive_gravity.py       AdaptiveWeights — learned pre-resonance weights
-  fact.py                   FactPassport dataclass
+  adaptive_gravity.py       AdaptiveWeights — four learned pre-resonance weights, regularised SGD
+  fact.py                   FactPassport dataclass (incl. recent_utility EWMA)
   meta_fact.py              MetaFact dataclass + lineage + Hawking gravity helper
   gravity.py                GravityEngine — score computation + migration
   black_hole.py             BlackHole — polymorphic sink (facts + metas) + Hawking
