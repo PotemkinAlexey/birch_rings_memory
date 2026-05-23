@@ -26,11 +26,23 @@ import math
 import os
 import socket
 import sys
+import time
 import urllib.error
 import urllib.request
+from typing import Optional
 
 _BASE_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 _MODEL = os.environ.get("BIRCH_EMBED_MODEL", "nomic-embed-text")
+
+# Transient-failure retry budget for the Ollama HTTP client. Ollama
+# restarts and brief network blips are routine in dev; one retry with
+# a 200ms backoff turns most of them into invisible recoveries instead
+# of an MCP-visible embedding_provider_unavailable. HTTPErrors are
+# NEVER retried — 4xx is a client bug, 5xx is the model failing on the
+# same input, neither benefits from blind resend. Override the
+# attempt count with BIRCH_EMBED_RETRIES (default 2 = one retry).
+_RETRY_ATTEMPTS = max(1, int(os.environ.get("BIRCH_EMBED_RETRIES", "2")))
+_RETRY_BACKOFF_S = float(os.environ.get("BIRCH_EMBED_RETRY_BACKOFF_S", "0.2"))
 
 _BATCH_ENDPOINT = f"{_BASE_URL}/api/embed"
 _LEGACY_ENDPOINT = f"{_BASE_URL}/api/embeddings"
@@ -98,28 +110,46 @@ def _post(url: str, body: dict, timeout: float = 30.0) -> dict:
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        # Only let 404 escape untouched — that's the signal the caller
-        # uses to fall back to the legacy endpoint. Every other HTTP
-        # code (400 bad request, 500 model error, 503 etc.) is a real
-        # provider failure that should surface as a typed EmbeddingError
-        # at the MCP boundary, not as a raw stacktrace.
-        if exc.code == 404:
-            raise
+    # Transient-failure loop. We retry ONLY transport-level failures
+    # (URLError, socket.timeout, ConnectionError, generic OSError) —
+    # those are the Ollama-restarted / brief-network-blip class. HTTP
+    # responses (including 404, 5xx) bypass the loop entirely: a 4xx
+    # is a client bug and a 5xx is the model failing deterministically
+    # on the same input, neither is fixed by a retry.
+    last_transport_exc: Optional[BaseException] = None
+    raw: Optional[bytes] = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+            break
+        except urllib.error.HTTPError as exc:
+            # Only let 404 escape untouched — that's the signal the caller
+            # uses to fall back to the legacy endpoint. Every other HTTP
+            # code (400 bad request, 500 model error, 503 etc.) is a real
+            # provider failure that should surface as a typed EmbeddingError
+            # at the MCP boundary, not as a raw stacktrace.
+            if exc.code == 404:
+                raise
+            raise EmbeddingError(
+                f"Ollama HTTP {exc.code} at {url}: {exc.reason}"
+            ) from exc
+        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as exc:
+            last_transport_exc = exc
+            if attempt + 1 < _RETRY_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF_S)
+                continue
+            raise EmbeddingError(
+                f"cannot reach Ollama at {_BASE_URL} after "
+                f"{_RETRY_ATTEMPTS} attempt(s): {exc}. "
+                "Set BIRCH_EMBED_PROVIDER=mock for offline use, "
+                "or start Ollama with the configured model."
+            ) from exc
+    if raw is None:  # defensive — loop always either breaks or raises
         raise EmbeddingError(
-            f"Ollama HTTP {exc.code} at {url}: {exc.reason}"
-        ) from exc
-    except (urllib.error.URLError, socket.timeout, ConnectionError) as exc:
-        raise EmbeddingError(
-            f"cannot reach Ollama at {_BASE_URL}: {exc}. "
-            "Set BIRCH_EMBED_PROVIDER=mock for offline use, "
-            "or start Ollama with the configured model."
-        ) from exc
-    except OSError as exc:
-        raise EmbeddingError(f"network error talking to {url}: {exc}") from exc
+            f"unreachable: _post exited retry loop without response "
+            f"(last error: {last_transport_exc!r})"
+        )
     try:
         data = json.loads(raw)
     except ValueError as exc:

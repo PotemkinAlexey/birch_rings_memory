@@ -1712,49 +1712,73 @@ class MemoryStore:
         thr = self._collapse_threshold if threshold is None else threshold
         mgs = self._collapse_min_group_size if min_group_size is None else min_group_size
         with self._lock:
-            with self._txn():
-                self._sync()
-                new_metas, report = collapse_singularity(
-                    self._hole, threshold=thr, min_group_size=mgs,
-                )
-                if persist and self._storage and hasattr(self._storage, "save_meta_facts"):
-                    self._storage.save_meta_facts(new_metas)
-                    # Source FactPassports now live as MetaFact lineage
-                    # (source_fact_ids / source_texts); their layer=-1 rows
-                    # in the facts table are no longer needed and would
-                    # otherwise be re-hydrated into the singularity on next
-                    # restart. Drop them — and their incident edges — now
-                    # that the bundle owns the lineage.
-                    for meta in new_metas:
-                        for fid in meta.source_fact_ids:
-                            if hasattr(self._storage, "delete_fact"):
-                                self._storage.delete_fact(fid)
-                            if hasattr(self._storage, "delete_edges_for_fact"):
-                                self._storage.delete_edges_for_fact(fid)
-                now_ts = time.time()
-                self._last_collapse_attempt_at = now_ts
-                self._total_collapse_attempts += 1
-                # Only count as a successful collapse if something actually
-                # compressed; otherwise total_collapses would lie ("we
-                # collapsed 47 times" when nothing was bundled).
-                if report.groups > 0:
-                    self._last_collapse_at = now_ts
-                    self._total_collapses += 1
-                    # Successful collapse clears any prior captured
-                    # error — the worker is healthy again.
-                    self._last_collapse_error = None
-                # Reset counter regardless so we don't re-trigger on the
-                # same empty conditions in a tight loop.
-                self._collapse_counter = 0
-                # Collapse mutated _hole (singularity facts
-                # removed) and _meta_facts (new MetaFacts registered)
-                # if anything actually compressed. Forecast cache keys
-                # on body counts and feature state — must invalidate.
-                # Skip the bump on a no-op pass (report.groups == 0)
-                # so we don't churn the cache for empty attempts.
-                if report.groups > 0 or report.absorbed_facts > 0:
-                    self._bump_mutation_locked()
-                return report
+            # The compactor mutates self._hole (pops singularity
+            # members, registers MetaFacts) BEFORE the storage writes
+            # below. If a storage call raises mid-write, the SQLite
+            # txn rolls back cleanly — but the in-memory _hole is
+            # already mutated, and data_version doesn't bump on a
+            # rolled-back txn, so the next _sync() won't trigger
+            # _reload(). That would leave the in-memory view ahead of
+            # the on-disk truth until something else triggers a
+            # cross-process bump. Force a full _reload on any failure
+            # inside the txn to re-anchor every cache to disk.
+            collapse_succeeded = False
+            try:
+                with self._txn():
+                    self._sync()
+                    new_metas, report = collapse_singularity(
+                        self._hole, threshold=thr, min_group_size=mgs,
+                    )
+                    if persist and self._storage and hasattr(self._storage, "save_meta_facts"):
+                        self._storage.save_meta_facts(new_metas)
+                        # Source FactPassports now live as MetaFact lineage
+                        # (source_fact_ids / source_texts); their layer=-1 rows
+                        # in the facts table are no longer needed and would
+                        # otherwise be re-hydrated into the singularity on next
+                        # restart. Drop them — and their incident edges — now
+                        # that the bundle owns the lineage.
+                        for meta in new_metas:
+                            for fid in meta.source_fact_ids:
+                                if hasattr(self._storage, "delete_fact"):
+                                    self._storage.delete_fact(fid)
+                                if hasattr(self._storage, "delete_edges_for_fact"):
+                                    self._storage.delete_edges_for_fact(fid)
+                    collapse_succeeded = True
+            except Exception:
+                # Storage rolled back; in-memory _hole is desynced.
+                # Pull the authoritative state back from disk before
+                # propagating so subsequent callers don't see a
+                # phantom-collapsed view of the singularity.
+                self._reload()
+                raise
+            # Bookkeeping runs only on a clean commit. The except
+            # branch above re-raises, so we're guaranteed
+            # collapse_succeeded here.
+            assert collapse_succeeded
+            now_ts = time.time()
+            self._last_collapse_attempt_at = now_ts
+            self._total_collapse_attempts += 1
+            # Only count as a successful collapse if something actually
+            # compressed; otherwise total_collapses would lie ("we
+            # collapsed 47 times" when nothing was bundled).
+            if report.groups > 0:
+                self._last_collapse_at = now_ts
+                self._total_collapses += 1
+                # Successful collapse clears any prior captured
+                # error — the worker is healthy again.
+                self._last_collapse_error = None
+            # Reset counter regardless so we don't re-trigger on the
+            # same empty conditions in a tight loop.
+            self._collapse_counter = 0
+            # Collapse mutated _hole (singularity facts
+            # removed) and _meta_facts (new MetaFacts registered)
+            # if anything actually compressed. Forecast cache keys
+            # on body counts and feature state — must invalidate.
+            # Skip the bump on a no-op pass (report.groups == 0)
+            # so we don't churn the cache for empty attempts.
+            if report.groups > 0 or report.absorbed_facts > 0:
+                self._bump_mutation_locked()
+            return report
 
     def _maybe_trigger_collapse_locked(self, absorbed_count: int) -> None:
         """Caller must hold self._lock. Schedules collapse if thresholds met."""
