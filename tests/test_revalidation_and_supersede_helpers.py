@@ -1,11 +1,9 @@
-"""ChatGPT round-4 punch-list regressions.
+"""Query revalidation and supersede-helper regressions.
 
-Round 3 closed concurrency windows around the round-2 fixes. Round 4
-found that the round-3 fixes themselves had three concrete gaps:
-query() returned stale top results after the in-txn re-sync, set_fact
-reported already_existed=True for genuinely new facts, and the
-in-memory store skipped touch/attribution entirely because the gate
-was wired to storage existence.
+Three concrete gaps closed: query() returned stale top results after
+the in-txn re-sync, set_fact reported already_existed=True for
+genuinely new facts, and the in-memory store skipped touch/attribution
+entirely because the gate was wired to storage existence.
 """
 from __future__ import annotations
 

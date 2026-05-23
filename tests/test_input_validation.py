@@ -1,10 +1,9 @@
-"""ChatGPT round-9 punch-list regressions.
+"""Input-validation and corruption-tolerance regressions.
 
-Round 9 found input-validation / corruption-tolerance / sanitisation
-gaps the earlier rounds left in the long tail: load_meta_facts wasn't
-tolerant, _safe_loads didn't check vector shape, VectorIndex.search
-had an edge case for top_k=0, MCP enum inputs failed silently, batch
-items skipped per-item validation, loaded adaptive weights weren't
+Long-tail gaps closed in one pass: load_meta_facts wasn't tolerant,
+_safe_loads didn't check vector shape, VectorIndex.search had an edge
+case for top_k=0, MCP enum inputs failed silently, batch items
+skipped per-item validation, loaded adaptive weights weren't
 sanitised.
 """
 from __future__ import annotations

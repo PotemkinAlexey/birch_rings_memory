@@ -1,9 +1,9 @@
-"""ChatGPT review punch-list regressions.
+"""Black-hole persistence and query attribution regressions.
 
-Each test pins one of the bugs ChatGPT surfaced. The first one is the
-worst — facts that fell into the black hole via natural gravity decay
-used to be hard-deleted from storage, so Hawking emission and singularity
-collapse lineage evaporated on restart. That is now closed.
+The load-bearing fix here: facts that fell into the black hole via
+natural gravity decay used to be hard-deleted from storage, so Hawking
+emission and singularity collapse lineage evaporated on restart. That
+is now closed, alongside a handful of attribution-path bugs.
 """
 from __future__ import annotations
 

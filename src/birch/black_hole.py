@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 # Similarity threshold for Hawking emission — only the strongest queries
 # pull facts back. Sourced from the env-overridable Thresholds module
-# (round 12) so an operator with a different embedding model's cosine
+# so an operator with a different embedding model's cosine
 # distribution can tune it without forking.
 from .thresholds import Thresholds  # noqa: E402
 

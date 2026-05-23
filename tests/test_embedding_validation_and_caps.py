@@ -1,8 +1,6 @@
-"""ChatGPT round-11 punch-list regressions.
+"""Embedding numeric validation, error wrap, and cap-disclosure regressions.
 
-Round 11 was ChatGPT's first self-audited round (he acknowledged
-round 10 reviewed a stale snapshot, then checked main before raising
-new findings). All five surviving items shipped here:
+Covers:
 
   1. Embedding numeric validation in the HTTP path.
   2. Core MemoryStore.query top_k<=0 guard.
@@ -65,7 +63,7 @@ def test_validate_vector_coerces_int_list_to_float():
 def test_core_query_returns_empty_on_non_positive_top_k(tmp_path):
     """A negative top_k used to slice results[:top_k] from the right
     end (Python list semantics). Now the core boundary rejects it
-    explicitly — same contract the server layer added in round 10."""
+    explicitly — same contract the server layer enforces."""
     mem = MemoryStore(db_path=str(tmp_path / "m.db"))
     mem.add_fact("api", "runs on", "Go")
     mem.add_fact("db", "is", "Postgres")
@@ -208,8 +206,8 @@ def test_embedding_error_response_shape_inline():
 
 
 def test_metafact_empty_lineage_round_trip_preserved(tmp_path):
-    """The round-10 contract that '[]' saved -> [] loaded must still
-    hold after round 11 added the warning log. Body is preserved."""
+    """The contract that '[]' saved -> [] loaded must still hold
+    even with the empty-lineage warning log. Body is preserved."""
     db = str(tmp_path / "m.db")
     backend = SQLiteBackend(db)
     empty = MetaFact()

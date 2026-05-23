@@ -1,10 +1,10 @@
-"""ChatGPT round-6 punch-list regressions.
+"""Hawking two-phase emission regressions.
 
-Round 5 elevated contracts; round 6 finds the last side-effect leak
-in the Hawking path and a couple of API hygiene items. The most
-load-bearing fix here is the two-phase Hawking commit: previously a
-body could be popped from the singularity (state mutation, persisted
-write) even though it never made it to the caller's top_k.
+Closes the last side-effect leak in the Hawking path plus a couple of
+API hygiene items. The load-bearing fix is the two-phase Hawking
+commit: previously a body could be popped from the singularity (state
+mutation, persisted write) even though it never made it to the
+caller's top_k.
 """
 from __future__ import annotations
 

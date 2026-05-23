@@ -1,6 +1,6 @@
 """query_memory filters apply BEFORE top_k slice (the filter-before-topK fix).
 
-Cursor's review surfaced: previously subject_prefix and min_gravity were
+An earlier review surfaced: previously subject_prefix and min_gravity were
 applied AFTER ``MemoryStore.query`` had already sliced its top_k results.
 A narrow scope matching only the 9th best hit at top_k=5 returned empty
 when the user expected the match. Now filters live inside MemoryStore.query

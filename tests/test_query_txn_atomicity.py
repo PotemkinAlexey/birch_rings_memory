@@ -1,9 +1,9 @@
-"""ChatGPT round-3 punch-list regressions.
+"""Query/write-transaction atomicity regressions.
 
-Round 2 closed the obvious P1s. Round 3 surfaced the SECOND-order issues:
-the round-2 fixes themselves had concurrency-window bugs (query() saving
-pre-sync object refs, Hawking emission mutating state before the write
-txn, set_fact recomputing slot occupants without authoritative sync).
+Second-order concurrency-window bugs around the earlier persistence
+fixes: query() saving pre-sync object refs, Hawking emission mutating
+state before the write txn, set_fact recomputing slot occupants
+without authoritative sync.
 """
 from __future__ import annotations
 

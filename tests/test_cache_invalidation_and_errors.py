@@ -1,7 +1,6 @@
-"""ChatGPT round-12 punch-list regressions.
+"""Forecast cache invalidation and error-wrap completion regressions.
 
-Round 12 (second self-audited ChatGPT round). Six surviving findings,
-all shipped:
+Covers:
 
   1. forecast cache invalidation on same-process writes (SQLite
      PRAGMA data_version doesn't bump for same-connection writes).

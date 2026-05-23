@@ -1,15 +1,13 @@
-"""ChatGPT round-13 punch-list regressions.
+"""Session abort + partial-open contract regressions.
 
-Round 13 was a partial-stale-snapshot round — 5 of 10 findings were
-already shipped in round 12 (timing artifact: ChatGPT reviewed before
-my round-12 push reached him). The 3 genuinely new findings:
+Covers:
 
   1. record_session leaks an open session if embed fails mid-flow
      → MemoryStore.abort_session helper + wired into server.
   2. session_open(first_message=...) doesn't tell the agent whether
      first_message actually landed → first_message_recorded flag.
-  3. README compactor description was pre-mixed-dim (round 8) —
-     updated to per-dim partitioning.
+  3. README compactor description was pre-mixed-dim — updated to
+     per-dim partitioning.
 
 Deferred (design choices, not bugs):
   - list_facts envelope with effective_limit (would break the
@@ -200,9 +198,9 @@ def test_session_open_first_message_recorded_flag_on_failure():
 
 
 def test_readme_compactor_describes_per_dim_partitioning():
-    """After round 8 the compactor partitions by vector dim. README
-    used to say 'a single numpy matmul over all absorbed fact
-    vectors' which only held before the dim-mix fix."""
+    """The compactor partitions by vector dim. README used to say
+    'a single numpy matmul over all absorbed fact vectors' which only
+    held before the dim-mix safety fix."""
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1]

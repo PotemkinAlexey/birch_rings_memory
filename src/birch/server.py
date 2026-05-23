@@ -25,10 +25,10 @@ def _validate_spo_strings(
 ) -> Optional[dict]:
     """Type-validate the SPO triple at the MCP boundary.
 
-    Round 11 added this validator for ``record_facts`` (batch path).
-    Round 12 mirrors it to ``record_fact`` / ``set_fact`` (single
-    paths) so the failure mode is symmetric: subject=123 fails the
-    same way it would in a batch.
+    Mirrors the same validator across ``record_facts`` (batch path)
+    and ``record_fact`` / ``set_fact`` (single paths) so the failure
+    mode is symmetric: subject=123 fails the same way it would in
+    a batch.
 
     Returns ``None`` if all three fields are non-empty strings;
     otherwise a structured error dict with ``bad_fields`` and
@@ -104,7 +104,7 @@ def query_memory(
       ``hawking_meta`` — MetaFact bundle recovered from the black hole
     """
     # Bounds: reject non-positive / oversized top_k with a structured
-    # response. _store.query handles top_k=0 internally now (round 9),
+    # response. _store.query handles top_k=0 internally,
     # but the MCP contract should be explicit: an agent that asks for
     # zero hits gets told why, not silently empty results.
     if top_k <= 0:
@@ -223,7 +223,7 @@ def record_fact(
         return err
     # Transaction-honest: add_fact returns created from inside its own
     # write txn, so there's no race window between a fact_exists probe and
-    # the insert (same pattern set_fact uses since round 5).
+    # the insert (same pattern set_fact uses).
     try:
         fact, created = _store.add_fact(
             subject, predicate, object,
@@ -288,11 +288,11 @@ def record_facts(
         if missing:
             invalid.append({"index": i, "missing": missing})
             continue
-        # Type validation: round-9 caught missing/None/""; round 11
-        # catches the next layer — subject=123 / predicate=[] / object={}
-        # all pass the presence check but break embedding-text formatting
-        # and SPO normalisation downstream. Triples must be strings, and
-        # whitespace-only strings count as empty.
+        # Type validation: presence check above catches missing/None/"";
+        # this catches the next layer — subject=123 / predicate=[] /
+        # object={} all pass the presence check but break embedding-text
+        # formatting and SPO normalisation downstream. Triples must be
+        # strings, and whitespace-only strings count as empty.
         bad_type = [
             k for k in required
             if not isinstance(f[k], str) or not f[k].strip()
@@ -392,8 +392,8 @@ def set_fact(
         return err
     # set_fact -> add_fact -> embed(); wrap so an unreachable embedding
     # provider produces a structured failure instead of raw stacktrace
-    # at the MCP boundary (round 12, completes the wrap coverage that
-    # round 11 started for record_fact / record_facts / query_memory).
+    # at the MCP boundary (completes the wrap coverage shared with
+    # record_fact / record_facts / query_memory).
     try:
         return _store.set_fact(
             subject, predicate, object, session_id=session_id,
@@ -627,10 +627,9 @@ def find_similar(
     surfaces several stale HEAD entries; then ``set_fact(subject, "HEAD on
     master", new_value)`` collapses them in one call.
     """
-    # Bounds: explicit MCP contract. Round 9 added a top_k<=0 guard
-    # at VectorIndex.search; the server layer should surface that as
-    # a structured warning so the agent learns instead of silently
-    # getting nothing.
+    # Bounds: explicit MCP contract. VectorIndex.search guards top_k<=0
+    # internally; the server layer should surface that as a structured
+    # warning so the agent learns instead of silently getting nothing.
     if top_k <= 0:
         return {
             "query": text,
@@ -784,7 +783,7 @@ def session_push(text: str, session_id: str) -> dict:
     except KeyError as exc:
         # Unknown / expired session_id used to leak raw KeyError to the
         # MCP layer. Structured response so the agent gets an actionable
-        # hint instead of a stacktrace (round 15).
+        # hint instead of a stacktrace.
         return {
             "ok": False,
             "error": "unknown_session",
@@ -847,7 +846,7 @@ def session_close(
     except ValueError as exc:
         # Core raises ValueError on unknown sentiment label. Map to a
         # structured response so the agent can read the allowed set
-        # instead of getting a stacktrace (round 15).
+        # instead of getting a stacktrace.
         return {
             "ok": False,
             "error": "invalid_sentiment",

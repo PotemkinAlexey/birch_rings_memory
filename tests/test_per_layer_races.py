@@ -1,8 +1,7 @@
-"""ChatGPT round-7 punch-list regressions.
+"""Per-layer race fixes (server + storage symmetry) regressions.
 
-Round 6 closed Hawking peek-then-commit and min_similarity. Round 7
-caught the same race-prone already_existed bug in record_fact (server
-layer) that set_fact fixed back in round 5, plus a couple of API
+Catches the same race-prone already_existed bug in record_fact
+(server layer) that set_fact fixed in the core, plus a couple of API
 clarity items (deprecate result, record_facts created field).
 """
 from __future__ import annotations
@@ -100,10 +99,9 @@ def test_add_facts_return_status_includes_full_lifecycle_signal(tmp_path):
 
 
 def test_forecast_memory_runtime_covers_metafacts():
-    """Indirect sanity: run_forecast covers MetaFacts (already pinned by
-    round-4 / round-5 tests). Round 7's contribution is the docstring
-    sync — this test just confirms the runtime contract didn't regress
-    while we updated the docstring."""
+    """Indirect sanity: run_forecast covers MetaFacts (already pinned
+    by the forecast-polymorphism tests). This test confirms the
+    runtime contract didn't regress while the docstring was updated."""
     from birch.meta_fact import MetaFact
 
     mem = MemoryStore()

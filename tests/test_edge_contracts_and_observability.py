@@ -1,9 +1,7 @@
-"""ChatGPT round-15 punch-list regressions.
+"""Edge-contract validation and async observability regressions.
 
-Round 15 was the first fully-clean self-audit since round 12 (6 of
-7 findings real, 1 already shipped in round 13). Edge-contract
-slice: malformed inputs, observability, cache invalidation after
-manual/async maintenance.
+Edge-contract slice: malformed inputs, observability, cache
+invalidation after manual/async maintenance.
 
   1. load_open_sessions coerces facts values to float at the loader.
   2. collapse_singularity bumps _mutation_version on successful pass.
@@ -26,9 +24,9 @@ from birch.storage.sqlite import SQLiteBackend
 
 
 def test_load_open_sessions_drops_row_with_non_numeric_facts_value(tmp_path):
-    """The dict shape check landed in round 10. Round 15 also coerces
-    each value to float at the loader so a {"f1": "oops"} cell drops
-    the row instead of crashing the consumer downstream."""
+    """The dict shape check is layered with a per-value float coerce
+    at the loader, so a {"f1": "oops"} cell drops the row instead of
+    crashing the consumer downstream."""
     db = str(tmp_path / "m.db")
     backend = SQLiteBackend(db)
     backend.save_open_session("ok", [], [], {"f1": 0.5}, started_at=0.0)

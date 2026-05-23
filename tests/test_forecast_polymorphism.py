@@ -1,12 +1,11 @@
-"""ChatGPT round-5 punch-list regressions.
+"""Forecast polymorphism (FactPassport + MetaFact) regressions.
 
-Round 4 closed staleness in the round-3 fixes. Round 5 found subtler
-semantic gaps: signal honesty (set_fact already_existed had a race
-window), result completeness (query revalidation didn't backfill),
-write contention (Hawking write txn even when singularity was empty),
-signal consistency (check_echo updated resonance but not EWMA), and
-a couple of API clarity items (forecast typing, mixed dims silently
-accepted by build_galaxy).
+Subtler semantic gaps: signal honesty (set_fact already_existed had
+a race window), result completeness (query revalidation didn't
+backfill), write contention (Hawking write txn even when singularity
+was empty), signal consistency (check_echo updated resonance but not
+EWMA), and a couple of API clarity items (forecast typing, mixed dims
+silently accepted by build_galaxy).
 """
 from __future__ import annotations
 

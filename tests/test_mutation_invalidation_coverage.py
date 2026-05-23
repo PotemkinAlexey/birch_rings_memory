@@ -1,9 +1,6 @@
-"""ChatGPT round-14 punch-list regressions.
+"""Mutation-version invalidation coverage regressions.
 
-Round 14 was another partial-stale-snapshot round — 5 of 7 findings
-were already shipped in rounds 12 and 13 (set_fact wrap, record_session
-abort, session_open partial flag, non-404 HTTPError wrap, README
-compactor wording). 2 genuinely new findings shipped:
+Covers:
 
   1. _touch_existing (the dedupe path of add_fact, and the touch
      on every query hit) updates access_count/last_accessed which
@@ -16,8 +13,8 @@ compactor wording). 2 genuinely new findings shipped:
      observable on both sides momentarily.
 
 The shared _bump_mutation_locked helper makes future write paths
-unable to forget the bump+drop pair (which is exactly the trap
-round 12's scatter fell into).
+unable to forget the bump+drop pair (which is exactly the trap the
+scattered-call-site era fell into).
 """
 from __future__ import annotations
 
@@ -46,7 +43,7 @@ def test_repeat_add_fact_invalidates_forecast_cache(tmp_path):
 
 
 def test_query_hit_invalidates_forecast_cache(tmp_path):
-    """A query that hits a fact also touches it (round-1 attribution
+    """A query that hits a fact also touches it (the attribution
     contract). That mutation needs to invalidate the cache too."""
     mem = MemoryStore(db_path=str(tmp_path / "m.db"))
     mem.add_fact("api", "runs on", "Go")
@@ -97,15 +94,15 @@ def test_bump_mutation_helper_increments_and_drops_cache(tmp_path):
     mem.close()
 
 
-# --- meta: round 14 stale-snapshot artifact (5/7 already shipped) ------
+# --- meta: prior-shipped items pinned defensively -----------------------
 
 
-def test_round14_stale_items_actually_already_shipped(tmp_path):
-    """5 of the 7 round-14 findings were closed in rounds 12 and 13.
-    This test pins each as a regression — if any of them ever
-    actually regresses, the assertion fires."""
+def test_prior_shipped_items_still_in_place(tmp_path):
+    """A handful of contracts shipped in earlier passes get pinned
+    here as regressions — if any of them ever actually regresses,
+    the assertion fires."""
 
-    # Round 12: set_fact wraps EmbeddingError. Inline marker — the
+    # set_fact wraps EmbeddingError. Inline marker — the
     # server module imports the mcp SDK, so we just confirm the
     # error_response helper exists.
     import pathlib
@@ -123,12 +120,12 @@ def test_round14_stale_items_actually_already_shipped(tmp_path):
         "        return _embedding_error_response(exc)"
     ) in server_src
 
-    # Round 13: record_session aborts on embed failure.
+    # record_session aborts on embed failure.
     assert "_store.abort_session(session_id)" in server_src
-    # Round 13: session_open carries first_message_recorded.
+    # session_open carries first_message_recorded.
     assert "first_message_recorded" in server_src
 
-    # Round 12: _post wraps non-404 HTTPError.
+    # _post wraps non-404 HTTPError.
     embeddings_src = (
         pathlib.Path(__file__).resolve().parents[1]
         / "src" / "birch" / "resonance" / "embeddings.py"
@@ -136,7 +133,7 @@ def test_round14_stale_items_actually_already_shipped(tmp_path):
     assert "if exc.code == 404:" in embeddings_src
     assert "Ollama HTTP {exc.code}" in embeddings_src
 
-    # Round 13: README per-dim compactor note.
+    # README per-dim compactor note.
     readme = (
         pathlib.Path(__file__).resolve().parents[1] / "README.md"
     ).read_text()

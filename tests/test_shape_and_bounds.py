@@ -1,10 +1,9 @@
-"""ChatGPT round-10 punch-list regressions.
+"""Semantic-shape validation and MCP bounds regressions.
 
-Round 10 (after DeepSeek round 1) found semantic-shape gaps the
-round-9 JSON-parse pre-validation missed (MetaFact silently coerced
-to lineage-less body), MCP bounds gaps (top_k/limit <= 0 leaked
-through), and a load_open_sessions shape gap (valid JSON in the
-wrong shape would crash the consumer).
+Semantic-shape gaps the JSON-parse pre-validation missed (MetaFact
+silently coerced to lineage-less body), MCP bounds gaps (top_k/limit
+<= 0 leaked through), and a load_open_sessions shape gap (valid JSON
+in the wrong shape would crash the consumer).
 """
 from __future__ import annotations
 
@@ -18,9 +17,10 @@ from birch.storage.sqlite import SQLiteBackend
 
 def test_load_meta_facts_drops_row_with_dict_shaped_lineage(tmp_path):
     """Cell is valid JSON but a dict where a list is required. The
-    round-9 pre-validation only caught unparseable cells; round 10
-    catches parsed-but-wrong-shape too. The round-trip contract for
-    legitimately empty MetaFacts ([] saved → [] loaded) still holds."""
+    earlier JSON-parse pre-validation only caught unparseable cells;
+    the shape check catches parsed-but-wrong-shape too. The round-
+    trip contract for legitimately empty MetaFacts ([] saved → []
+    loaded) still holds."""
     db = str(tmp_path / "m.db")
     backend = SQLiteBackend(db)
 
@@ -34,9 +34,9 @@ def test_load_meta_facts_drops_row_with_dict_shaped_lineage(tmp_path):
     backend.close()
 
     # Plant a row whose source_texts is valid JSON but a dict, not a
-    # list. _load_list would silently coerce it to []; round 10 drops
-    # the row instead so the body never enters _meta_facts as a
-    # lineage-less ghost.
+    # list. _load_list would silently coerce it to []; the shape
+    # check drops the row instead so the body never enters
+    # _meta_facts as a lineage-less ghost.
     conn = sqlite3.connect(db)
     conn.execute(
         "INSERT OR REPLACE INTO meta_facts "

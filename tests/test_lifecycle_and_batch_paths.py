@@ -1,10 +1,9 @@
-"""ChatGPT round-2 punch-list regressions.
+"""Lifecycle predicate, EWMA, batch-path regressions.
 
-The first round (test_review_round01.py) closed black-hole persistence
-and several contracts. ChatGPT then re-reviewed the fixed code and found
-the next layer of bugs — most importantly that Hawking emission would
-resurrect deprecated/expired bodies as if they were live truth, and that
-the new write-on-query path was not doing reload-under-transaction.
+Covers the second layer of fixes around the black-hole persistence
+work — most importantly that Hawking emission would resurrect
+deprecated/expired bodies as if they were live truth, and that the
+new write-on-query path was not doing reload-under-transaction.
 """
 from __future__ import annotations
 

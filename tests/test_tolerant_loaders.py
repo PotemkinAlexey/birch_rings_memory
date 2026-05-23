@@ -1,8 +1,8 @@
-"""ChatGPT round-8 punch-list regressions.
+"""Tolerant JSON loaders and compactor dim-grouping regressions.
 
-Round 8 widened scope: storage robustness, compactor mixed-dim safety,
-collapse metric truthfulness, echo exclude semantics. The big one is
-the tolerant JSON loaders — one corrupted row used to bring down the
+Covers storage robustness, compactor mixed-dim safety, collapse
+metric truthfulness, and echo exclude semantics. The big one is the
+tolerant JSON loaders — one corrupted row used to bring down the
 entire MemoryStore boot.
 """
 from __future__ import annotations

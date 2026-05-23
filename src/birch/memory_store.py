@@ -26,9 +26,9 @@ from .thresholds import Thresholds
 from .vector_index import VectorIndex
 
 # Module-level aliases kept for the existing call sites; the values
-# now come from the centralised env-overridable Thresholds module
-# (round 12 / Gemini round 1). Operators can pin every threshold via
-# BIRCH_* env vars to match their embedding model's cosine distribution.
+# now come from the centralised env-overridable Thresholds module.
+# Operators can pin every threshold via BIRCH_* env vars to match
+# their embedding model's cosine distribution.
 _ABSORPTION_THRESHOLD = Thresholds.ABSORPTION
 _META_HAWKING_THRESHOLD = Thresholds.HAWKING_META
 
@@ -114,8 +114,8 @@ class MemoryStore:
     """
 
     # Minimum cosine similarity for auto-linking two facts. Sourced
-    # from the env-overridable Thresholds module (round 12) so an
-    # operator pinning a different embedding model can tune it.
+    # from the env-overridable Thresholds module so an operator pinning
+    # a different embedding model can tune it.
     AUTO_LINK_THRESHOLD: float = Thresholds.AUTO_LINK
     # Max neighbours considered per new fact to keep startup cost linear.
     AUTO_LINK_TOP_K: int = 5
@@ -154,7 +154,7 @@ class MemoryStore:
         # Async collapse failures used to be swallowed in close(). Now
         # we capture the last error string and surface it in stats
         # so an operator can see a worker crash without grepping logs.
-        # Process-lifetime, reset only on successful collapse (round 15).
+        # Process-lifetime, reset only on successful collapse.
         self._last_collapse_error: Optional[str] = None
         self._total_collapses = 0
         self._total_collapse_attempts = 0
@@ -264,7 +264,7 @@ class MemoryStore:
         # data_version (which bumps for other-process writes), but
         # explicit invalidation here closes the subtle window where
         # a multi-process race could leave the same data_version
-        # value briefly observable on both sides. Round 14.
+        # value briefly observable on both sides.
         self._forecast_cache = None
 
     @contextmanager
@@ -618,11 +618,10 @@ class MemoryStore:
         Used in two situations:
 
         1. Any write path that mutates _facts / _meta_facts / _hole
-           or persisted fact state (round 12 introduced this). The
-           mutation_version composes with SQLite's data_version
-           (which only bumps for OTHER-connection writes) so the
-           forecast cache key fully captures "something changed,
-           recompute".
+           or persisted fact state. The mutation_version composes
+           with SQLite's data_version (which only bumps for OTHER-
+           connection writes) so the forecast cache key fully
+           captures "something changed, recompute".
 
         2. After _reload: cross-process sync rebuilds in-memory state
            from disk, and any cached recompute keyed on the old
@@ -631,10 +630,10 @@ class MemoryStore:
            captures data_version, but explicit invalidation removes
            any subtle race).
 
-        Round 14 made this a helper so future write paths can't
-        forget the bump+cache-drop pair (the previous round-12
-        scatter missed _touch_existing, where access_count/
-        last_accessed updates change galaxy/forecast inputs).
+        Centralised as a helper so future write paths can't forget
+        the bump+cache-drop pair (the earlier scattered call-sites
+        missed _touch_existing, where access_count/last_accessed
+        updates change galaxy/forecast inputs).
         """
         self._mutation_version += 1
         self._forecast_cache = None
@@ -658,7 +657,7 @@ class MemoryStore:
         # access_count and last_accessed feed gravity → galaxy →
         # forecast_stability. Without this bump, a touch on a
         # duplicate add_fact / query hit could serve a stale
-        # forecast cache. Round 14 fix.
+        # forecast cache.
         self._bump_mutation_locked()
         return existing
 
@@ -1552,7 +1551,7 @@ class MemoryStore:
                 # Reset counter regardless so we don't re-trigger on the
                 # same empty conditions in a tight loop.
                 self._collapse_counter = 0
-                # Round 15: collapse mutated _hole (singularity facts
+                # Collapse mutated _hole (singularity facts
                 # removed) and _meta_facts (new MetaFacts registered)
                 # if anything actually compressed. Forecast cache keys
                 # on body counts and feature state — must invalidate.
@@ -1776,7 +1775,7 @@ class MemoryStore:
             session's resonance later propagates back to its gravity.
         """
         # top_k guard at the core boundary. The server layer rejects
-        # non-positive top_k with a structured response (round 10), but
+        # non-positive top_k with a structured response, but
         # MemoryStore.query is a public core API used in tests and
         # embedded mode too — a negative top_k would slice
         # results[:top_k] from the right end (returning all-except-last),
@@ -2159,7 +2158,7 @@ class MemoryStore:
                             fresh_ctx.facts,
                             time.time(),
                         )
-                # Round 14: query() touches every returned body
+                # query() touches every returned body
                 # (access_count / last_accessed), which feeds gravity
                 # → galaxy → forecast. Without a mutation bump the
                 # forecast cache could return stale results on a

@@ -481,7 +481,7 @@ class SQLiteBackend:
                     raise ValueError("vectors must be a list")
                 if not isinstance(facts, dict):
                     raise ValueError("facts must be a dict")
-                # Coerce facts values to float here (round 15) rather
+                # Coerce facts values to float here rather
                 # than at the consumer. The consumer used to do
                 # {k: float(v) for ...} and would crash with raw
                 # ValueError if any value were non-numeric. Doing it

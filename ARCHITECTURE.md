@@ -806,11 +806,9 @@ query(text, session_id)                                 │
 
 ## Operational notes from external review
 
-The system has been through 16 reviews across 5 reviewers (ChatGPT
-11 rounds, DeepSeek 1, Codex 1, Cursor 2, chemist-professor 1).
-A few recurring concerns were deferred as design choices or future
-work — documented here so the next reviewer (or contributor) doesn't
-re-raise them:
+A few recurring concerns surfaced during external review were
+deferred as design choices or future work — documented here so the
+next reviewer (or contributor) doesn't re-raise them:
 
 ### Vector index O(N·d) at scale
 `VectorIndex` is a numpy L2-normalised matrix; cosine search is one
@@ -836,13 +834,13 @@ write txn for its entire pass. No race conditions — every other
 ``MemoryStore`` operation serialises behind it. The real concern is
 **latency**: a long collapse on a huge singularity blocks
 interactive queries. Mitigations already in place: per-dim
-partitioning (round 8), bounded ``min_group_size``, the matmul
+partitioning, bounded ``min_group_size``, the matmul
 itself is fast for the few-thousand-body regime. If collapse
 latency ever becomes user-visible, the next step is snapshot-under-
 lock / compute-outside-lock / re-acquire-to-apply — over-engineered
 for now.
 
-### Hard-coded cosine thresholds (closed in round 12)
+### Hard-coded cosine thresholds (closed)
 ``Thresholds`` (``birch/thresholds.py``) centralises every cosine
 and gravity threshold. Each is overridable via ``BIRCH_*`` env
 vars — pin them to your embedding model's cosine distribution.

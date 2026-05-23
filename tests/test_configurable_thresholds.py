@@ -1,8 +1,10 @@
-"""Gemini round-1 punch-list regressions.
+"""Configurable cosine/gravity thresholds regressions.
 
-First Gemini review. Of 4 findings, 1 was a real shippable bug
-(hard-coded cosine thresholds across the codebase — a mine under
-embedding-model swaps), the other 3 deferred:
+The shippable item: hard-coded cosine thresholds were scattered
+across the codebase — a mine under embedding-model swaps. They are
+now centralised and overridable via env.
+
+Deferred (not bugs):
 
   - O(N·d) vector index → known FAISS roadmap, not at scale yet.
   - SPO temporal collapse → by design (Birch vs Vertical Brain
