@@ -261,7 +261,7 @@ def record_fact(
     already_existed = not created
     similar: list[dict] = []
     if created and fact.vector:
-        similar = _store._find_similar_by_vector(
+        similar = _store.find_similar_by_vector(
             fact.vector,
             top_k=3,
             min_similarity=0.85,
@@ -557,11 +557,18 @@ def forecast_memory(horizon_ticks: int = 50) -> dict:
 @mcp.tool()
 def delete_fact(fact_id: str) -> dict:
     """
-    Hard-delete a fact — destructive primitive, the data is GONE.
+    Legacy hard-delete — handles ONLY live FactPassports.
 
-    Removes the fact from all live layers, the vector index, the SPO dedup
-    index, AND storage. Does NOT send it to the black hole; there is no
-    lineage, no MetaFact compression, no Hawking rescue. Use only for:
+    Use ``delete_body(body_id)`` for the polymorphic version that also
+    handles live MetaFacts, singularity FactPassports, and singularity
+    MetaFacts — a ``query_memory`` result's ``body_id`` may point at any
+    of those. ``delete_fact`` is kept for backward compatibility and
+    cases where the caller knows the id is specifically a live fact.
+
+    Destructive primitive: data is GONE. Removes the fact from live
+    layers, the vector index, the SPO dedup index, AND storage. Does
+    NOT send it to the black hole; no lineage, no MetaFact compression,
+    no Hawking rescue. Use only for:
 
       - Secrets / sensitive data that must not exist (GDPR-style removal)
       - Facts you just recorded by accident in the same session
@@ -574,6 +581,30 @@ def delete_fact(fact_id: str) -> dict:
     """
     deleted = _store.delete_fact(fact_id)
     return {"deleted": deleted, "fact_id": fact_id}
+
+
+@mcp.tool()
+def delete_body(body_id: str) -> dict:
+    """
+    Polymorphic hard-delete — handles ALL four body locations.
+
+    ``query_memory`` returns polymorphic hits (live FactPassport, live
+    MetaFact, singularity FactPassport, or singularity MetaFact) under
+    a single ``body_id``. ``delete_body`` checks all four locations and
+    deletes wherever the id lives. Use this when you got a ``body_id``
+    from a query and want to remove it regardless of what kind of body
+    it is — for example GDPR removal of MetaFact-aggregated content,
+    or accidental absorbed-body cleanup.
+
+    Returns ``{"deleted": True, "kind": "fact"|"meta"|"singularity_fact"|
+    "singularity_meta", "body_id": ...}`` on success, or
+    ``{"deleted": False, "body_id": ...}`` if not found.
+
+    Same destructive contract as delete_fact: data GONE, no singularity
+    rescue, no MetaFact lineage. Prefer supersede_fact / retire_fact
+    for stale data — both preserve the body for resonance feedback.
+    """
+    return _store.delete_body(body_id)
 
 
 @mcp.tool()
@@ -908,6 +939,33 @@ def session_close(
     ``"r_override"``) so the caller can confirm which path resolved R,
     and a fresh ``stats`` snapshot.
     """
+    # Validate r_override BEFORE calling core. Core's float(r_override)
+    # would raise ValueError for non-numeric input which the catch
+    # below maps to "invalid_sentiment" — wrong error class, misleading
+    # message. Validate at the boundary so the response is honest.
+    # NaN and Infinity also rejected explicitly: core does
+    # max(-1.0, min(1.0, r)) which on NaN gives a surprising number
+    # rather than failing cleanly.
+    if r_override is not None:
+        import math as _math
+        try:
+            r_check = float(r_override)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "error": "invalid_r_override",
+                "session_id": session_id,
+                "got_type": type(r_override).__name__,
+                "hint": "r_override must be a finite float in [-1, 1]",
+            }
+        if not _math.isfinite(r_check):
+            return {
+                "ok": False,
+                "error": "invalid_r_override",
+                "session_id": session_id,
+                "detail": "NaN or Infinity",
+                "hint": "r_override must be a finite float in [-1, 1]",
+            }
     try:
         summary = _store.session_close(
             session_id=session_id,
@@ -917,7 +975,8 @@ def session_close(
     except ValueError as exc:
         # Core raises ValueError on unknown sentiment label. Map to a
         # structured response so the agent can read the allowed set
-        # instead of getting a stacktrace.
+        # instead of getting a stacktrace. r_override path is now
+        # validated above, so this catch only fires for sentiment.
         return {
             "ok": False,
             "error": "invalid_sentiment",

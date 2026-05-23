@@ -906,7 +906,7 @@ class MemoryStore:
         if not text.strip():
             return []
         vec = embed(text)
-        return self._find_similar_by_vector(
+        return self.find_similar_by_vector(
             vec,
             top_k=top_k,
             min_similarity=min_similarity,
@@ -914,7 +914,14 @@ class MemoryStore:
             exclude_ids=exclude_ids,
         )
 
-    def _find_similar_by_vector(
+    # Backward-compat alias — previous name was leading-underscore
+    # "private". Server.py and external callers can keep importing
+    # the old name while we migrate; will be removed after one
+    # release cycle.
+    def _find_similar_by_vector(self, *args, **kwargs) -> list[dict]:
+        return self.find_similar_by_vector(*args, **kwargs)
+
+    def find_similar_by_vector(
         self,
         vec: list[float],
         top_k: int = 5,
@@ -1099,6 +1106,12 @@ class MemoryStore:
                     self._hole._index.remove(body_id)
                     if self._storage:
                         self._storage.delete_fact(body_id)
+                        # Same edge cleanup as the live-fact branch
+                        # above — destructive delete must leave no
+                        # orphan edge rows on disk that would inflate
+                        # _degrees on next load.
+                        if hasattr(self._storage, "delete_edges_for_fact"):
+                            self._storage.delete_edges_for_fact(body_id)
                     self._mutation_version += 1
                     return {"deleted": True,
                             "kind": "singularity_fact",
