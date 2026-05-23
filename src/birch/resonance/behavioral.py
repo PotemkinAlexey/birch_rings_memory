@@ -12,28 +12,52 @@ class ClosureSignal(Enum):
     NEUTRAL = "neutral"
 
 
-# Positive closure patterns — user got what they needed
+# Positive closure patterns — user got what they needed.
+# Word alternation needs \b on both sides; emojis are non-word characters,
+# so they match outside the \b group.
 _POSITIVE = re.compile(
-    r"\b("
-    r"работает|взлетело|заработало|всё\s*ок|всё\s*окей|спасибо|понял|разобрался"
-    r"|got\s*it|found\s*it|figured\s*it\s*out|works|perfect|done|thanks|thank\s*you|solved|fixed|great"
-    r"|окей|ок|👍|✅|🎉"
-    r")\b",
+    r"(?:\b("
+    # Russian — resolution
+    r"работает|сработало|получилось|помогло|взлетело|заработало"
+    # Russian — affirmations
+    r"|всё\s*ок|всё\s*окей|всё\s*хорошо|всё\s*нормально|всё\s*на\s*месте"
+    r"|всё\s*ясно|всё\s*получилось"
+    # Russian — acknowledgements
+    r"|спасибо|понял|поняла|понятно|разобрался|разобралась"
+    # Russian — enthusiasm
+    r"|отлично|супер|круто|класс|огонь|красота|ура|идеально|красавчик|чудно"
+    r"|окей|ок"
+    # English
+    r"|got\s*it|found\s*it|figured\s*it\s*out|works|perfect|done|thanks|thank\s*you"
+    r"|solved|fixed|great|nice|awesome|brilliant"
+    r")\b)"
+    # Emojis (no word boundary — they are non-word chars).
+    r"|👍|✅|🎉|🔥|🚀|💯",
     re.IGNORECASE,
 )
 
-# Negative closure patterns — user stuck or frustrated
+# Negative closure patterns — user stuck or frustrated.
 _NEGATIVE = re.compile(
     r"\b("
-    r"не\s*работает|опять|снова|всё\s*равно|не\s*понимаю|что\s*за\s*ерунда"
-    r"|почему\s*не|не\s*получается|ничего\s*не"
-    r"|doesn'?t\s*work|still\s*not|again|error|failed|broken|wtf|not\s*working"
+    # Russian — explicit non-work
+    r"не\s*работает|не\s*пашет|не\s*сработало"
+    r"|не\s*получается|не\s*получилось|не\s*помогло|не\s*понимаю"
+    # Russian — frustration
+    r"|опять|снова|всё\s*равно|ничего\s*не"
+    r"|сломалось|вылетает|крашится|падает"
+    r"|что\s*за\s*ерунда|что\s*за\s*хрень|фигня|хрень"
+    r"|почему\s*не"
+    # English
+    r"|doesn'?t\s*work|still\s*not|again|error|failed|broken|wtf|not\s*working|stuck|crashes"
     r")\b",
     re.IGNORECASE,
 )
 
-# Unfinished session — abrupt stop mid-thought
-_UNFINISHED = re.compile(r"\.\.\.|^(подожди|wait|стоп|stop)", re.IGNORECASE)
+# Unfinished session — abrupt stop mid-thought.
+_UNFINISHED = re.compile(
+    r"\.\.\.|^(подожди|погоди|секунду|минут(?:у|ку)|стой|wait|hold\s*on|стоп|stop)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
