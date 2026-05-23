@@ -704,24 +704,50 @@ def session_push(text: str, session_id: str) -> dict:
 
 
 @mcp.tool()
-def session_close(session_id: str) -> dict:
+def session_close(
+    session_id: str,
+    sentiment: Optional[str] = None,
+    r_override: Optional[float] = None,
+) -> dict:
     """USE WHEN: a conversation that wrote or read facts ends. Closes the
-    session, scores R from the message trajectory, propagates R to every
-    touched fact's gravity, runs `_absorb_dead`, may trigger background
-    singularity collapse. Call exactly once per opened session — repeated
-    closes corrupt the resonance signal.
+    session, scores R from the message trajectory (or from explicit
+    ``sentiment`` / ``r_override``), propagates R to every touched fact's
+    gravity, runs `_absorb_dead`, may trigger background singularity
+    collapse. Call exactly once per opened session — repeated closes
+    corrupt the resonance signal.
 
-    Returns: ``label`` (resonant / neutral / toxic), ``r_score``,
-    ``migrations`` (count of facts that moved layer), ``absorbed`` (count of
-    facts that fell into the singularity), and a fresh ``stats`` snapshot.
+    Resonance scoring — three paths:
+      - Default (neither arg set): heuristic over the message text
+        (behavioural + semantic + repetition). The original contract.
+        Works well for natural conversation; mis-classifies grumpy-
+        sounding technical summaries ("stale snapshot", "failure
+        mode", "no repeats") as toxic even when the session was a
+        clean win — words look bad, context was good.
+      - ``sentiment``: pass one of ``"resonant"`` / ``"neutral"`` /
+        ``"toxic"`` (or aliases ``"positive"`` / ``"negative"``) when
+        you KNOW the outcome but the message text doesn't reflect it.
+        Maps to ±0.7 / 0.0 — lands inside the label band without
+        saturating.
+      - ``r_override``: pass an exact float in [-1, 1] when you want
+        precise control. Beats ``sentiment`` when both are set.
+
+    Returns: ``label``, ``r_score``, ``migrations``, ``absorbed``,
+    ``scoring_source`` (``"heuristic"`` / ``"sentiment"`` /
+    ``"r_override"``) so the caller can confirm which path resolved R,
+    and a fresh ``stats`` snapshot.
     """
-    summary = _store.session_close(session_id=session_id)
+    summary = _store.session_close(
+        session_id=session_id,
+        sentiment=sentiment,
+        r_override=r_override,
+    )
     return {
         "session_id": session_id,
         "label": summary.get("label"),
         "r_score": round(summary.get("r", 0.0), 3),
         "migrations": len(summary.get("migrations", [])),
         "absorbed": len(summary.get("absorbed", [])),
+        "scoring_source": summary.get("scoring_source"),
         "stats": _store.stats,
     }
 

@@ -7,14 +7,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Literal, Optional, Union, overload
+from typing import ClassVar, Iterator, Literal, Optional, Union, overload
 
 from .black_hole import BlackHole
 from .fact import FactPassport
 from .gravity import GravityEngine, pre_resonance_features
 from .meta_fact import MetaFact
 from .resonance.cluster import ClusterBundle
-from .resonance.detector import compute_resonance
+from .resonance.detector import ResonanceResult, compute_resonance
 from .resonance.echo import EchoStore, StoredSession
 from .resonance.embeddings import embed, embed_batch
 from .singularity_compactor import (
@@ -1146,13 +1146,48 @@ class MemoryStore:
                         sid, ctx.messages, ctx.vectors, ctx.facts, time.time()
                     )
 
-    def session_close(self, session_id: Optional[str] = None) -> dict:
+    # Sentiment shortcut → R value mapping. Discrete choices spelled
+    # out so a calling agent doesn't have to memorise which float means
+    # what. 0.7 / -0.7 land cleanly inside the resonant / toxic bands
+    # (threshold 0.35 / -0.20 per detector.classify) without saturating.
+    _SENTIMENT_MAP: ClassVar[dict[str, float]] = {
+        "resonant": 0.7,
+        "positive": 0.7,
+        "neutral": 0.0,
+        "toxic": -0.7,
+        "negative": -0.7,
+    }
+
+    def session_close(
+        self,
+        session_id: Optional[str] = None,
+        sentiment: Optional[str] = None,
+        r_override: Optional[float] = None,
+    ) -> dict:
         """
         Close session: compute resonance, propagate R to facts,
         record echo bundle, tick gravity, absorb dead facts.
 
         Operates on the named session if provided; otherwise on the
         most recently opened one.
+
+        Resonance scoring — three paths, caller's choice:
+          - ``r_override`` (float in [-1, 1]): use this exact value.
+            Wins over everything else. Right when the caller already
+            knows the realised value precisely.
+          - ``sentiment`` (``"resonant"`` / ``"neutral"`` / ``"toxic"``,
+            or aliases ``"positive"`` / ``"negative"``): discrete
+            shortcut. Maps to ±0.7 / 0.0 — lands cleanly inside the
+            label bands without saturating. Right when an agent
+            summarises declaratively ("round closed, 6 fixes, all
+            tests pass") and knows the heuristic will mis-classify
+            grumpy-sounding tech vocabulary as toxic.
+          - Neither: fall back to ``compute_resonance`` on the message
+            text. The original contract, unchanged when sentiment +
+            r_override are both None.
+
+        Response carries ``scoring_source`` (``"heuristic"`` /
+        ``"sentiment"`` / ``"r_override"``) for transparency.
         """
         with self._lock:
             self._sync()
@@ -1167,14 +1202,45 @@ class MemoryStore:
             vectors_snapshot = list(ctx.vectors)
             facts_snapshot = dict(ctx.facts)
 
-        # Resonance is pure computation on the snapshot — do it outside the
-        # lock so other agents can keep querying.
-        result = compute_resonance(
-            messages_snapshot,
-            start_vector=vectors_snapshot[0],
-            end_vector=vectors_snapshot[-1],
-            all_vectors=vectors_snapshot,
-        )
+        # Resolve the resonance score. Override paths skip the
+        # behavioural / semantic / repetition computation entirely.
+        scoring_source = "heuristic"
+        if r_override is not None:
+            r_value = float(max(-1.0, min(1.0, r_override)))
+            label = (
+                "resonant" if r_value > 0.35
+                else ("toxic" if r_value < -0.20 else "neutral")
+            )
+            result = ResonanceResult(
+                behavioral_score=0.0, semantic_score=0.0,
+                repetition_score=0.0, r=r_value, label=label,
+            )
+            scoring_source = "r_override"
+        elif sentiment is not None:
+            if sentiment not in self._SENTIMENT_MAP:
+                raise ValueError(
+                    f"sentiment must be one of "
+                    f"{sorted(self._SENTIMENT_MAP)}, got {sentiment!r}"
+                )
+            r_value = self._SENTIMENT_MAP[sentiment]
+            label = (
+                "resonant" if r_value > 0.35
+                else ("toxic" if r_value < -0.20 else "neutral")
+            )
+            result = ResonanceResult(
+                behavioral_score=0.0, semantic_score=0.0,
+                repetition_score=0.0, r=r_value, label=label,
+            )
+            scoring_source = "sentiment"
+        else:
+            # Heuristic path — pure computation on the snapshot, run
+            # outside the lock so other agents can keep querying.
+            result = compute_resonance(
+                messages_snapshot,
+                start_vector=vectors_snapshot[0],
+                end_vector=vectors_snapshot[-1],
+                all_vectors=vectors_snapshot,
+            )
 
         with self._lock:
             with self._txn():
@@ -1296,6 +1362,10 @@ class MemoryStore:
                     "label": result.label,
                     "migrations": migrations,
                     "absorbed": absorbed,
+                    # Tells the caller which path resolved R: heuristic
+                    # text scan (the original contract) vs an explicit
+                    # sentiment label vs a direct numeric override.
+                    "scoring_source": scoring_source,
                 }
                 self._pop_session_locked(sid)
 
