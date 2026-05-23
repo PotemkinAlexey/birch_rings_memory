@@ -23,6 +23,12 @@ packages = ["src/birch"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "chaos: multi-process concurrency stress tests; slower and potentially flaky on slow CI. Run before release with `pytest -m chaos`; excluded from the default suite with `-m 'not chaos'`.",
+]
+# Default selection excludes chaos so a fast `pytest` stays fast. CI
+# can override with `pytest -m chaos` in a release job.
+addopts = "-m 'not chaos'"
 
 [tool.ruff]
 line-length = 100
