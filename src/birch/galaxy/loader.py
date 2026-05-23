@@ -42,30 +42,48 @@ def fact_direction(
     return fallback_direction(fact.fact_id, dim)
 
 
-def _vitality(fact: FactPassport, value: float, now: float) -> float:
-    """How buoyant a fact starts — fresh or valued facts ride a high orbit."""
-    age_hours = max(0.0, (now - fact.created_at) / 3600)
+def _vitality(body, value: float, now: float) -> float:
+    """How buoyant a body starts — fresh or valued bodies ride a high orbit.
+
+    Polymorphic over FactPassport and MetaFact: both carry ``created_at``.
+    """
+    age_hours = max(0.0, (now - body.created_at) / 3600)
     freshness = math.exp(-age_hours * _LN2 / _FRESHNESS_HALFLIFE_HOURS)
     return min(1.0, freshness + 0.15 * value)
 
 
+def _body_label(body) -> str:
+    """Short human label for rendering — works for facts and MetaFacts."""
+    if hasattr(body, "subject"):
+        return f"{body.subject} {body.predicate} {body.object}"
+    sources = getattr(body, "source_texts", None) or []
+    if sources:
+        return f"meta[{getattr(body, 'weight', '?')}] {sources[0]}"
+    return f"meta:{getattr(body, 'fact_id', '?')}"
+
+
 def build_galaxy(
-    facts: list[FactPassport],
+    facts: list,
     *,
     now: float | None = None,
     galaxy: Galaxy | None = None,
 ) -> Galaxy:
-    """Build a Galaxy from BirchKM facts — a static snapshot, all placed at once."""
+    """Build a Galaxy from BirchKM bodies — a static snapshot, all placed at once.
+
+    Accepts a polymorphic list of FactPassport and MetaFact bodies. Both
+    expose the surface the placement needs (``fact_id``, ``vector``,
+    ``access_count``, ``resonance_sum``, ``created_at``).
+    """
     now = now if now is not None else time.time()
     gal = galaxy if galaxy is not None else Galaxy()
 
     projector = Projector.fit([f.vector for f in facts], dim=gal.dim)
-    for fact in facts:
-        value = math.log1p(fact.access_count) + max(0.0, fact.resonance_sum)
+    for body in facts:
+        value = math.log1p(body.access_count) + max(0.0, body.resonance_sum)
         mass = 1.0 + 1.5 * value
-        vitality = _vitality(fact, value, now)
+        vitality = _vitality(body, value, now)
         radius = gal.horizon + (gal.r_surface * 1.15 - gal.horizon) * vitality
-        direction = fact_direction(fact, projector, gal.dim)
-        label = f"{fact.subject} {fact.predicate} {fact.object}"
-        gal.place_in_orbit(fact.fact_id, radius, direction, mass, label[:60])
+        direction = fact_direction(body, projector, gal.dim)
+        label = _body_label(body)
+        gal.place_in_orbit(body.fact_id, radius, direction, mass, label[:60])
     return gal

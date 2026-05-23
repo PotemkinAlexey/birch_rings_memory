@@ -881,16 +881,29 @@ class MemoryStore:
         with self._lock:
             with self._txn():
                 self._sync()
-                if old_id not in self._facts:
-                    return {"superseded": False, "reason": "old_id not found"}
-                old = self._facts[old_id]
-                old.deprecated_by = new_id
-                key = self._normalize_spo(old.subject, old.predicate, old.object)
-                if self._spo_index.get(key) == old_id:
-                    del self._spo_index[key]
-                if self._storage:
-                    self._storage.save_fact(old)
-                absorbed = self._absorb_dead()
+                result = self._supersede_fact_locked(old_id, new_id)
+        return result
+
+    def _supersede_fact_locked(self, old_id: str, new_id: str) -> dict:
+        """Locked helper for supersede_fact. Caller MUST hold self._lock
+        AND be inside a write ``_txn()`` AND have already done ``_sync()``.
+
+        Exists so set_fact can supersede slot occupants inside its own
+        transaction without nesting public ``supersede_fact`` calls —
+        nesting works via reentrant transaction(), but the chain of
+        public-method ↔ public-method calls is harder to reason about
+        than a single transactional flow that uses this helper.
+        """
+        if old_id not in self._facts:
+            return {"superseded": False, "reason": "old_id not found"}
+        old = self._facts[old_id]
+        old.deprecated_by = new_id
+        key = self._normalize_spo(old.subject, old.predicate, old.object)
+        if self._spo_index.get(key) == old_id:
+            del self._spo_index[key]
+        if self._storage:
+            self._storage.save_fact(old)
+        absorbed = self._absorb_dead()
         return {
             "superseded": True,
             "old_id": old_id,
@@ -937,29 +950,37 @@ class MemoryStore:
         primitive for atomic relations where multiple objects can coexist
         ("api uses Postgres" + "api uses Redis"). Pick by intent.
         """
+        # already_existed must reflect "this exact SPO was in the store
+        # BEFORE this call ran". Capturing it AFTER add_fact would be
+        # always-True (the new fact is now in the store) — the agent
+        # would lose the signal "did I just create this or confirm it".
+        # fact_exists takes the lock and syncs, so it's race-honest.
+        already_existed = self.fact_exists(subject, predicate, obj)
+
         # add_fact handles its own embedding, lock and SPO dedup. If the
         # full triple already exists it returns the existing fact unchanged.
         new_fact = self.add_fact(subject, predicate, obj, session_id=session_id)
 
         # AUTHORITATIVE slot recompute inside a write transaction — the
-        # pre-add snapshot ``slot_before`` is not enough in multi-process:
-        # another writer could have inserted its own slot occupant between
-        # snapshot and add_fact. Recompute under the write lock so every
-        # current occupant other than ``new_fact`` is superseded.
+        # pre-add snapshot is not enough in multi-process: another writer
+        # could have inserted a same-(subject, predicate) body between
+        # the pre-check and add_fact. Recompute under the write lock so
+        # every current occupant other than the new fact is superseded.
         superseded: list[str] = []
-        already_existed = False
         with self._lock:
             with self._txn():
                 self._sync()
                 occupants = self._live_slot_occupants(subject, predicate)
-                already_existed = new_fact.fact_id in occupants
                 for old_id in occupants:
                     if old_id == new_fact.fact_id:
                         continue
-                    # supersede_fact takes its own lock/txn — that re-entry
-                    # is safe via the reentrant transaction(); the inner
-                    # call sees the same write context.
-                    result = self.supersede_fact(old_id, new_fact.fact_id)
+                    # Use the locked helper rather than the public
+                    # supersede_fact: we are already inside the lock + txn
+                    # and have just synced, so re-entering them just to
+                    # call the public wrapper would be wasteful and
+                    # harder to reason about.
+                    result = self._supersede_fact_locked(
+                        old_id, new_fact.fact_id)
                     if result.get("superseded"):
                         superseded.append(old_id)
 
@@ -1322,27 +1343,40 @@ class MemoryStore:
         with self._lock:
             with self._txn():
                 self._sync()
-                facts_snapshot = list(self._facts.values())
+                # Forecast both live FactPassports and live MetaFacts.
+                # MetaFacts carry forecast_stability and feed the same
+                # adaptive gravity formula, so leaving them at a neutral
+                # prior while facts get a learned forecast was an
+                # asymmetric contract.
+                bodies_snapshot: list = list(self._facts.values())
+                bodies_snapshot.extend(self._meta_facts.values())
 
         # The simulation itself is pure numpy and reads no shared state —
         # run it OUTSIDE the lock so other agents can keep querying.
-        scores = forecast_stability(facts_snapshot, horizon_ticks=horizon_ticks)
+        scores = forecast_stability(bodies_snapshot, horizon_ticks=horizon_ticks)
 
         with self._lock:
             with self._txn():
                 self._sync()
-                updated = 0
-                for fid, score in scores.items():
-                    fact = self._facts.get(fid)
-                    if fact is None:
+                updated_facts: list = []
+                updated_metas: list = []
+                for bid, score in scores.items():
+                    fact = self._facts.get(bid)
+                    if fact is not None:
+                        fact.forecast_stability = float(score)
+                        updated_facts.append(fact)
                         continue
-                    fact.forecast_stability = float(score)
-                    updated += 1
-                if updated and self._storage:
-                    self._storage.save_facts(
-                        [f for f in self._facts.values()
-                         if f.fact_id in scores]
-                    )
+                    meta = self._meta_facts.get(bid)
+                    if meta is not None:
+                        meta.forecast_stability = float(score)
+                        updated_metas.append(meta)
+                if self._storage:
+                    if updated_facts:
+                        self._storage.save_facts(updated_facts)
+                    if (updated_metas
+                            and hasattr(self._storage, "save_meta_facts")):
+                        self._storage.save_meta_facts(updated_metas)
+                updated = len(updated_facts) + len(updated_metas)
 
         # Quick distribution snapshot so the caller can see what landed.
         ranges = {"safe": 0, "kinetic": 0, "near_horizon": 0, "predicted_fall": 0}
@@ -1504,10 +1538,16 @@ class MemoryStore:
                 (r.body_id, r.similarity) for r in top
             ]
 
+            # Storage availability MUST NOT decide whether in-memory state
+            # mutates. An in-memory store (no storage backend) still needs
+            # touch/attribution to land — otherwise the feedback loop
+            # silently breaks for embedded / test usage. Persistence is a
+            # later concern, gated separately inside the txn block.
             need_write_path = (
                 hawking
-                or (self._storage is not None
-                    and (touched_fact_ids or touched_meta_ids or sid))
+                or touched_fact_ids
+                or touched_meta_ids
+                or sid is not None
             )
 
             if not need_write_path:
@@ -1545,6 +1585,43 @@ class MemoryStore:
                 # Re-sync under the write lock; if another process committed
                 # we now hold the authoritative state.
                 self._sync()
+
+                # Revalidate the pre-sync top: another process may have
+                # deprecated / retired / deleted bodies that were in our
+                # snapshot. Drop the vanished ones and replace each
+                # surviving QueryResult's body with the authoritative
+                # post-sync object, so the caller never sees a stale ref.
+                revalidated_top: list[QueryResult] = []
+                for r in top:
+                    if r.fact is not None:
+                        live = self._facts.get(r.fact.fact_id)
+                        if live is None or live.is_deprecated or live.is_expired:
+                            continue
+                        r.fact = live
+                        revalidated_top.append(r)
+                    elif r.meta is not None:
+                        live_meta = self._meta_facts.get(r.meta.meta_id)
+                        if live_meta is None:
+                            continue
+                        r.meta = live_meta
+                        revalidated_top.append(r)
+                top = revalidated_top
+                # Re-derive the touched / attribution lists from the
+                # surviving top so the persist step does not try to update
+                # bodies that disappeared during the race.
+                kept_after_revalidate = {r.body_id for r in top}
+                touched_fact_ids = [
+                    fid for fid in touched_fact_ids
+                    if fid in kept_after_revalidate
+                ]
+                touched_meta_ids = [
+                    mid for mid in touched_meta_ids
+                    if mid in kept_after_revalidate
+                ]
+                attribution_pairs = [
+                    pair for pair in attribution_pairs
+                    if pair[0] in kept_after_revalidate
+                ]
 
                 # Hawking emission lives inside the transaction so the pop
                 # from the singularity, the re-registration in live stores,
@@ -1673,16 +1750,31 @@ class MemoryStore:
             with self._txn():
                 self._sync()
                 result = self._echo.detect_echo(vec)
-                penalized_fact_ids: list[str] = []
+                penalized_body_ids: list[str] = []
                 if result.label == "echo" and result.penalty != 0.0 and result.fact_weights:
-                    self._engine.apply_session_resonance(result.fact_weights, result.penalty)
-                    penalized_fact_ids = list(result.fact_weights.keys())
+                    # engine.apply_session_resonance is polymorphic over
+                    # FactPassport and MetaFact — both are registered in
+                    # the engine. Previously we only persisted the
+                    # FactPassport changes, losing MetaFact penalty
+                    # updates on restart.
+                    self._engine.apply_session_resonance(
+                        result.fact_weights, result.penalty)
+                    penalized_body_ids = list(result.fact_weights.keys())
 
                     if self._storage:
-                        affected = [
-                            self._facts[fid] for fid in penalized_fact_ids if fid in self._facts
+                        affected_facts = [
+                            self._facts[bid] for bid in penalized_body_ids
+                            if bid in self._facts
                         ]
-                        self._storage.save_facts(affected)
+                        affected_metas = [
+                            self._meta_facts[bid] for bid in penalized_body_ids
+                            if bid in self._meta_facts
+                        ]
+                        if affected_facts:
+                            self._storage.save_facts(affected_facts)
+                        if (affected_metas
+                                and hasattr(self._storage, "save_meta_facts")):
+                            self._storage.save_meta_facts(affected_metas)
                         past = (
                             self._echo.get(result.matched_session_id)
                             if result.matched_session_id
@@ -1703,7 +1795,10 @@ class MemoryStore:
                     "matched_session": result.matched_session_id,
                     "similarity": result.similarity,
                     "penalty": result.penalty,
-                    "penalized_fact_ids": penalized_fact_ids,
+                    # Kept under the old key for wire-format stability.
+                    # The list may include MetaFact ids too — they all
+                    # received the echo penalty symmetrically.
+                    "penalized_fact_ids": penalized_body_ids,
                 }
 
     # ── Status ───────────────────────────────────────────────────────────────
