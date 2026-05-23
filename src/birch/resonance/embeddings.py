@@ -145,14 +145,24 @@ def _validate_vector(vec: object, where: str) -> list[float]:
     record was already partially committed. Catching both here turns
     them into a single typed ``EmbeddingError`` the MCP layer can wrap.
     """
+    import math
+
     if not isinstance(vec, list) or not vec:
         raise EmbeddingError(f"{where} is empty or wrong shape")
     try:
-        return [float(x) for x in vec]
+        out = [float(x) for x in vec]
     except (TypeError, ValueError) as exc:
         raise EmbeddingError(
             f"{where} contains non-numeric values"
         ) from exc
+    # NaN / Infinity pass float() but poison every downstream cosine
+    # comparison: similarity becomes NaN, sort order undefined, every
+    # threshold check returns False silently. Reject loudly here.
+    if not all(math.isfinite(x) for x in out):
+        raise EmbeddingError(
+            f"{where} contains NaN or Infinity"
+        )
+    return out
 
 
 def _ollama_embed_batch(texts: list[str]) -> list[list[float]]:

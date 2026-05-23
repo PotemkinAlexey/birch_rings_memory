@@ -22,6 +22,7 @@ that's what the test suite and quickstart exercise.
 """
 from __future__ import annotations
 
+import math
 import os
 
 
@@ -32,21 +33,24 @@ def _env_float(
     hi: float = 1.0,
 ) -> float:
     """Read a float from BIRCH_<name>; fall back to ``default`` on miss,
-    parse error, or out-of-range value. Logs nothing — startup-quiet
-    by intent.
+    parse error, non-finite value, or out-of-range value. Logs nothing
+    — startup-quiet by intent.
 
     Every threshold this module owns is a cosine or a gravity score,
     both naturally in [0, 1]. Out-of-range values silently fall back
-    to the default so an operator typo (BIRCH_HAWKING_FACT_THRESHOLD=2
-    or =-999) can't accidentally make every body Hawking-emit or
-    nothing collapse. Strict clamp would hide intent; default fallback
-    preserves the working contract."""
+    to the default so an operator typo (BIRCH_HAWKING_FACT_THRESHOLD=2,
+    =-999, or =nan) can't accidentally make every body Hawking-emit
+    or poison every threshold comparison. NaN check is explicit even
+    though range-check would catch it (NaN comparisons all return
+    False) — clearer intent + faster reject."""
     raw = os.environ.get(f"BIRCH_{name}")
     if raw is None:
         return default
     try:
         value = float(raw)
     except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
         return default
     if not lo <= value <= hi:
         return default

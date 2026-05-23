@@ -44,13 +44,22 @@ def _safe_vector(value: Any) -> list[float]:
     ``list[float]``. Returns an empty list in any non-conformant case so
     the fact loads but is unsearchable (caller's fallback path).
     """
+    import math
+
     raw = _safe_loads(value, [])
     if not isinstance(raw, list):
         return []
     try:
-        return [float(x) for x in raw]
+        out = [float(x) for x in raw]
     except (TypeError, ValueError):
         return []
+    # NaN / Infinity in stored vectors poison every downstream cosine
+    # comparison (similarity becomes NaN, sort order undefined). If
+    # the on-disk cell contains a non-finite value, treat the whole
+    # vector as missing so the fact loads but is unsearchable.
+    if not all(math.isfinite(x) for x in out):
+        return []
+    return out
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -496,6 +505,7 @@ class SQLiteBackend:
                 # vector by it — a corrupted ragged shape would crash
                 # the session_close path far from the loader. Drop the
                 # row here instead.
+                import math
                 coerced_vectors: list[list[float]] = []
                 expected_dim: int | None = None
                 for v in vectors:
@@ -504,6 +514,12 @@ class SQLiteBackend:
                             "vectors must be list[list[float]]"
                         )
                     coerced = [float(x) for x in v]
+                    # NaN / Infinity poisons every downstream resonance
+                    # / centroid / cosine calculation. Reject at loader.
+                    if not all(math.isfinite(x) for x in coerced):
+                        raise ValueError(
+                            "vectors contain NaN or Infinity"
+                        )
                     if expected_dim is None:
                         expected_dim = len(coerced)
                     elif len(coerced) != expected_dim:
