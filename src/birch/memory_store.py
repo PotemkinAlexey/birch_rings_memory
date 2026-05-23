@@ -253,6 +253,14 @@ class MemoryStore:
         self._current_session_id = None
         self._load_from_storage()
         self._data_version = self._data_version_now()
+        # Defensive: cross-process sync rebuilt everything in-memory,
+        # so any cached recompute keyed on the old snapshot is now
+        # formally invalid. The forecast cache key already includes
+        # data_version (which bumps for other-process writes), but
+        # explicit invalidation here closes the subtle window where
+        # a multi-process race could leave the same data_version
+        # value briefly observable on both sides. Round 14.
+        self._forecast_cache = None
 
     @contextmanager
     def _txn(self) -> Iterator[None]:
@@ -598,6 +606,34 @@ class MemoryStore:
                 self._mutation_version += 1
                 return (fact, True) if return_status else fact
 
+    def _bump_mutation_locked(self) -> None:
+        """Caller must hold self._lock. Single source of truth for
+        invalidating same-process caches that key on body state.
+
+        Used in two situations:
+
+        1. Any write path that mutates _facts / _meta_facts / _hole
+           or persisted fact state (round 12 introduced this). The
+           mutation_version composes with SQLite's data_version
+           (which only bumps for OTHER-connection writes) so the
+           forecast cache key fully captures "something changed,
+           recompute".
+
+        2. After _reload: cross-process sync rebuilds in-memory state
+           from disk, and any cached recompute keyed on the old
+           snapshot is now formally invalid even if data_version
+           happens to look familiar (defensive — cache key already
+           captures data_version, but explicit invalidation removes
+           any subtle race).
+
+        Round 14 made this a helper so future write paths can't
+        forget the bump+cache-drop pair (the previous round-12
+        scatter missed _touch_existing, where access_count/
+        last_accessed updates change galaxy/forecast inputs).
+        """
+        self._mutation_version += 1
+        self._forecast_cache = None
+
     def _touch_existing(
         self,
         existing_id: str,
@@ -614,6 +650,11 @@ class MemoryStore:
             if ctx is not None:
                 self._attribute_to(ctx, existing_id, 1.0)
                 self._persist_session_locked(ctx)
+        # access_count and last_accessed feed gravity → galaxy →
+        # forecast_stability. Without this bump, a touch on a
+        # duplicate add_fact / query hit could serve a stale
+        # forecast cache. Round 14 fix.
+        self._bump_mutation_locked()
         return existing
 
     def add_facts(
@@ -2091,6 +2132,13 @@ class MemoryStore:
                             fresh_ctx.facts,
                             time.time(),
                         )
+                # Round 14: query() touches every returned body
+                # (access_count / last_accessed), which feeds gravity
+                # → galaxy → forecast. Without a mutation bump the
+                # forecast cache could return stale results on a
+                # back-to-back query+forecast pattern.
+                if touched_fact_ids or touched_meta_ids:
+                    self._bump_mutation_locked()
 
         return top
 
