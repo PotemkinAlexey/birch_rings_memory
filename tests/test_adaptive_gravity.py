@@ -94,20 +94,23 @@ def test_compute_gravity_with_prior_matches_the_default():
 def test_sqlite_roundtrip_of_adaptive_weights(tmp_path):
     backend = SQLiteBackend(str(tmp_path / "m.db"))
     assert backend.load_adaptive_weights() is None
+    # Use values that already sum to BUDGET so load-side sanitize() is a
+    # no-op and we can assert exact round-trip values. (A separate test
+    # below covers the sanitize-renormalises-non-budget-rows path.)
     weights = AdaptiveWeights(
-        w_freshness=0.40, w_access=0.15, w_graph=0.10, w_utility=0.05,
-        w_stability=0.03,
+        w_freshness=0.30, w_access=0.15, w_graph=0.10, w_utility=0.05,
+        w_stability=0.05,   # sum = 0.65 = BUDGET
         train_count=7,
     )
     backend.save_adaptive_weights(weights)
     loaded = backend.load_adaptive_weights()
     backend.close()
     assert loaded is not None
-    assert abs(loaded.w_freshness - 0.40) < 1e-9
+    assert abs(loaded.w_freshness - 0.30) < 1e-9
     assert abs(loaded.w_access - 0.15) < 1e-9
     assert abs(loaded.w_graph - 0.10) < 1e-9
     assert abs(loaded.w_utility - 0.05) < 1e-9
-    assert abs(loaded.w_stability - 0.03) < 1e-9
+    assert abs(loaded.w_stability - 0.05) < 1e-9
     assert loaded.train_count == 7
 
 

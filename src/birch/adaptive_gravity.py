@@ -119,6 +119,35 @@ class AdaptiveWeights:
              self.w_utility, self.w_stability) = self.PRIOR
         self.train_count += 1
 
+    def sanitize(self) -> None:
+        """Clamp non-negative and renormalise to BUDGET in place.
+
+        Called on weights freshly loaded from storage. A row that was
+        corrupted, manually edited, or written by an old version with
+        a different invariant must not be served to ``compute_gravity``
+        as-is — gravity in ``[0, 1]`` is the safety contract. Same
+        clamp+renorm sequence ``update()`` uses after its SGD step.
+        """
+        self.w_freshness = max(0.0, self.w_freshness)
+        self.w_access    = max(0.0, self.w_access)
+        self.w_graph     = max(0.0, self.w_graph)
+        self.w_utility   = max(0.0, self.w_utility)
+        self.w_stability = max(0.0, self.w_stability)
+        total = (
+            self.w_freshness + self.w_access + self.w_graph
+            + self.w_utility + self.w_stability
+        )
+        if total > 0.0:
+            scale = self.BUDGET / total
+            self.w_freshness *= scale
+            self.w_access *= scale
+            self.w_graph *= scale
+            self.w_utility *= scale
+            self.w_stability *= scale
+        else:
+            (self.w_freshness, self.w_access, self.w_graph,
+             self.w_utility, self.w_stability) = self.PRIOR
+
     def as_dict(self) -> dict[str, float | int]:
         """Readable snapshot — handy for stats and debugging."""
         return {

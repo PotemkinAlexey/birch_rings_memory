@@ -35,6 +35,23 @@ def _safe_loads(value: Any, default: Any) -> Any:
         )
         return default
 
+
+def _safe_vector(value: Any) -> list[float]:
+    """Parse a JSON-encoded vector tolerantly with shape validation.
+
+    Valid JSON that is not a list of numbers (e.g. ``{"x": 1}``, ``"abc"``,
+    ``[1, "oops", 3]``) must not break downstream code that assumes
+    ``list[float]``. Returns an empty list in any non-conformant case so
+    the fact loads but is unsearchable (caller's fallback path).
+    """
+    raw = _safe_loads(value, [])
+    if not isinstance(raw, list):
+        return []
+    try:
+        return [float(x) for x in raw]
+    except (TypeError, ValueError):
+        return []
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     fact_id         TEXT PRIMARY KEY,
@@ -289,7 +306,7 @@ class SQLiteBackend:
                 out.append(FactPassport(
                     subject=r["subject"], predicate=r["predicate"], object=r["object"],
                     fact_id=r["fact_id"],
-                    vector=_safe_loads(r["vector"], []),
+                    vector=_safe_vector(r["vector"]),
                     gravity_score=r["gravity_score"], layer=r["layer"],
                     created_at=r["created_at"], ttl=r["ttl"],
                     source_session=r["source_session"], deprecated_by=r["deprecated_by"],
@@ -511,8 +528,45 @@ class SQLiteBackend:
 
     def load_meta_facts(self) -> list[MetaFact]:
         rows = self._conn.execute("SELECT * FROM meta_facts").fetchall()
-        # MetaFact.from_dict is tolerant of the JSON-string column shape.
-        return [MetaFact.from_dict(dict(r)) for r in rows]
+        # Tolerant per row — same robustness contract as load_facts /
+        # load_open_sessions / load_echo_sessions: one bad row must not
+        # take MemoryStore startup down. MetaFact.from_dict tolerates
+        # most JSON shape drift, but cell-level corruption (truncated
+        # JSON, manual edits, format changes between versions) can
+        # still raise. We skip + log + drop the row so it stops
+        # blocking future boots.
+        out: list[MetaFact] = []
+        for r in rows:
+            try:
+                # Pre-validate the JSON-encoded cells. MetaFact.from_dict is
+                # forgiving (returns [] on bad JSON), but a row whose JSON
+                # cells are all garbage is corruption, not drift — drop it
+                # rather than silently load a near-empty MetaFact.
+                bad_json = False
+                for cell in ("vector", "source_texts", "source_fact_ids"):
+                    raw = r[cell] if cell in r.keys() else None
+                    if isinstance(raw, str) and raw:
+                        try:
+                            json.loads(raw)
+                        except (TypeError, ValueError):
+                            bad_json = True
+                            break
+                if bad_json:
+                    raise ValueError("corrupted JSON cell")
+                out.append(MetaFact.from_dict(dict(r)))
+            except Exception as exc:
+                meta_id = r["meta_id"] if "meta_id" in r.keys() else "?"
+                _logger.warning(
+                    "SQLite load_meta_facts: dropping corrupted row "
+                    "meta_id=%r: %s",
+                    meta_id, exc,
+                )
+                try:
+                    if "meta_id" in r.keys():
+                        self.delete_meta_fact(r["meta_id"])
+                except Exception:   # pragma: no cover — best effort cleanup
+                    pass
+        return out
 
     # ── Adaptive gravity weights ─────────────────────────────────────────────
 
@@ -545,7 +599,7 @@ class SQLiteBackend:
         ).fetchone()
         if row is None:
             return None
-        return AdaptiveWeights(
+        weights = AdaptiveWeights(
             w_freshness=row["w_freshness"],
             w_access=row["w_access"],
             w_graph=row["w_graph"],
@@ -557,6 +611,12 @@ class SQLiteBackend:
             ),
             train_count=int(row["train_count"]),
         )
+        # Sanitise: a row that was corrupted, manually edited, or written
+        # by an old version with a different invariant must not be served
+        # to compute_gravity as-is. Clamp non-negative and renormalise to
+        # BUDGET so gravity stays in [0, 1].
+        weights.sanitize()
+        return weights
 
     def close(self) -> None:
         self._conn.close()

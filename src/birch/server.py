@@ -51,9 +51,21 @@ def query_memory(
     """
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     if layers:
+        # Validate enum: a typo like "surfase" used to silently produce an
+        # empty allowed set, returning zero results with no explanation.
+        # Now we reject the call with a structured error the agent can
+        # parse — much better MCP UX than an empty list lie.
+        unknown = [name for name in layers if name not in layer_map]
+        if unknown:
+            return {
+                "results": [],
+                "error": "unknown_layer",
+                "unknown_layers": unknown,
+                "allowed_layers": list(layer_map),
+            }
         # Build an explicit set so layers=["surface", "core"] excludes
         # kinetic — a range filter would silently include it.
-        allowed = {layer_map[name] for name in layers if name in layer_map}
+        allowed = {layer_map[name] for name in layers}
     else:
         allowed = None
     results = _store.query(
@@ -181,6 +193,30 @@ def record_facts(
     Each item must have ``subject``, ``predicate``, ``object``; per-item
     ``session_id`` overrides the top-level one.
     """
+    # Per-item validation: a malformed entry used to raise a raw KeyError
+    # straight through MCP. Now we collect the issues and return a typed
+    # response the agent can parse and fix in one round trip.
+    required = ("subject", "predicate", "object")
+    invalid: list[dict] = []
+    for i, f in enumerate(facts):
+        if not isinstance(f, dict):
+            invalid.append({
+                "index": i,
+                "error": "item_not_an_object",
+                "got_type": type(f).__name__,
+            })
+            continue
+        missing = [k for k in required if k not in f or f[k] in (None, "")]
+        if missing:
+            invalid.append({"index": i, "missing": missing})
+    if invalid:
+        return {
+            "ok": False,
+            "error": "invalid_fact_item",
+            "invalid": invalid,
+            "required_fields": list(required),
+        }
+
     triples = [
         (f["subject"], f["predicate"], f["object"])
         for f in facts
@@ -387,9 +423,19 @@ def list_facts(
     ``min_gravity`` (drop low-confidence facts), ``layer`` (one of
     ``surface``/``kinetic``/``core``).
     """
-    facts = _store.list_facts(subject=subject, predicate=predicate, limit=10_000)
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
+    # Validate enum: a typo used to silently produce target_layer=None,
+    # which then returned ALL layers — worse than empty because the
+    # agent thinks the filter applied. Now we return a structured
+    # error sentinel so the agent sees what went wrong.
+    if layer is not None and layer not in layer_map:
+        return [{
+            "error": "unknown_layer",
+            "got": layer,
+            "allowed": list(layer_map),
+        }]
     target_layer = layer_map.get(layer) if layer else None
+    facts = _store.list_facts(subject=subject, predicate=predicate, limit=10_000)
     prefix = subject_prefix.lower() if subject_prefix else None
     out: list[dict] = []
     for f in facts:

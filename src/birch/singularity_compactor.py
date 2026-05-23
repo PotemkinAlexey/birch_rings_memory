@@ -1,9 +1,13 @@
 """Singularity Compactor — collapses clusters of dead facts into MetaFacts.
 
 Facts that have fallen into the BlackHole at gravity < 0.10 are still
-hot mass: every absorbed body keeps a 768-dim vector in the index and a
-SingularityRecord in memory. Without compaction the singularity grows
-linearly with every session close.
+hot mass: every absorbed body keeps its full embedding vector in the
+index and a SingularityRecord in memory. (Dimensionality follows the
+active embedding provider — 64 for the mock used in tests / CI, 768
+for ``nomic-embed-text``, etc.; the compactor partitions by dim
+internally so mixed-model singularities still collapse cleanly.)
+Without compaction the singularity grows linearly with every session
+close.
 
 The compactor performs *gravitational collapse*: bodies that lie close
 to each other in semantic space (cosine ≥ ``threshold``) are merged into

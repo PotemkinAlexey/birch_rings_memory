@@ -92,7 +92,15 @@ class VectorIndex:
         top_k: int = 5,
         threshold: float = -1.0,
     ) -> list[tuple[str, float]]:
-        """Return (fact_id, similarity) sorted by similarity desc."""
+        """Return (fact_id, similarity) sorted by similarity desc.
+
+        ``top_k <= 0`` returns an empty list — guards against callers
+        passing 0 or a negative value (e.g. a misclamped MCP input);
+        numpy's argpartition is undefined / surprising on these edge
+        cases.
+        """
+        if top_k <= 0:
+            return []
         if self._matrix is None or not query_vector:
             return []
         q = self._normalise(np.asarray(query_vector, dtype=np.float32))
