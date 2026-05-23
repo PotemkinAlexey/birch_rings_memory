@@ -139,7 +139,15 @@ class MetaFact:
 
 
 def _load_list(value: Any, cast) -> list:
-    """Accept a JSON-encoded string, a Python list, or None."""
+    """Accept a JSON-encoded string, a Python list, or None.
+
+    Tolerant on item-level cast failures too — a list whose JSON
+    parsed cleanly but contains values the caster can't accept
+    (e.g. ``[1, "oops"]`` with ``float`` cast) returns ``[]``
+    rather than raising. The SQLite loader catches the row-level
+    case via its pre-validation, but direct callers (tests,
+    in-memory migrations) get the same forgiving contract here
+    — symmetric with FactPassport loading via ``_safe_vector``."""
     if value is None or value == "":
         return []
     if isinstance(value, str):
@@ -151,4 +159,7 @@ def _load_list(value: Any, cast) -> list:
         parsed = value
     if not isinstance(parsed, list):
         return []
-    return [cast(x) for x in parsed]
+    try:
+        return [cast(x) for x in parsed]
+    except (TypeError, ValueError):
+        return []

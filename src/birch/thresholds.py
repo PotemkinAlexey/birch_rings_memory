@@ -25,16 +25,32 @@ from __future__ import annotations
 import os
 
 
-def _env_float(name: str, default: float) -> float:
-    """Read a float from BIRCH_<name>; fall back to ``default`` on miss
-    or any parse error. Logs nothing — startup-quiet by intent."""
+def _env_float(
+    name: str,
+    default: float,
+    lo: float = 0.0,
+    hi: float = 1.0,
+) -> float:
+    """Read a float from BIRCH_<name>; fall back to ``default`` on miss,
+    parse error, or out-of-range value. Logs nothing — startup-quiet
+    by intent.
+
+    Every threshold this module owns is a cosine or a gravity score,
+    both naturally in [0, 1]. Out-of-range values silently fall back
+    to the default so an operator typo (BIRCH_HAWKING_FACT_THRESHOLD=2
+    or =-999) can't accidentally make every body Hawking-emit or
+    nothing collapse. Strict clamp would hide intent; default fallback
+    preserves the working contract."""
     raw = os.environ.get(f"BIRCH_{name}")
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         return default
+    if not lo <= value <= hi:
+        return default
+    return value
 
 
 class Thresholds:

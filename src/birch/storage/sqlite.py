@@ -490,10 +490,31 @@ class SQLiteBackend:
                 coerced_facts: dict[str, float] = {}
                 for k, v in facts.items():
                     coerced_facts[str(k)] = float(v)
+                # Vectors must be list[list[float]] with consistent dim.
+                # The consumer (compute_resonance → score_repetition →
+                # centroid) takes dim from vectors[0] and indexes every
+                # vector by it — a corrupted ragged shape would crash
+                # the session_close path far from the loader. Drop the
+                # row here instead.
+                coerced_vectors: list[list[float]] = []
+                expected_dim: int | None = None
+                for v in vectors:
+                    if not isinstance(v, list):
+                        raise ValueError(
+                            "vectors must be list[list[float]]"
+                        )
+                    coerced = [float(x) for x in v]
+                    if expected_dim is None:
+                        expected_dim = len(coerced)
+                    elif len(coerced) != expected_dim:
+                        raise ValueError(
+                            "vectors must share a single dimension"
+                        )
+                    coerced_vectors.append(coerced)
                 out.append({
                     "session_id": r["session_id"],
                     "messages": messages,
-                    "vectors": vectors,
+                    "vectors": coerced_vectors,
                     "facts": coerced_facts,
                     "started_at": r["started_at"],
                 })

@@ -439,7 +439,29 @@ class MemoryStore:
                 # Absorbed body — restore into the singularity so Hawking
                 # emission and singularity collapse still see it after a
                 # process restart. Symmetric with MetaFacts at layer=-1.
-                self._hole.restore_fact(fact)
+                # BlackHole's singularity is one VectorIndex per body
+                # type, so a mixed-dim singularity (post-model-swap)
+                # would crash here too. Same defence as live facts:
+                # log + clear vector, body keeps its record but stays
+                # out of the index until reindex. Singularity collapse
+                # already partitions by dim independently, so this is
+                # only the rehydrate path that needed the same wrap.
+                try:
+                    self._hole.restore_fact(fact)
+                except DimensionMismatchError:
+                    # restore_fact set the singularity record BEFORE
+                    # calling _index.add, so the body is already in
+                    # _singularity — it just isn't in the vector
+                    # index. Clear the vector so downstream code can't
+                    # try to use it; record remains visible for stats
+                    # and for collapse-by-dim partitioning, just
+                    # invisible to Hawking emission until reindex.
+                    _logger.warning(
+                        "absorbed fact %r rehydrated without index "
+                        "entry (singularity dim mismatch)",
+                        fact.fact_id,
+                    )
+                    fact.vector = []
                 continue
             self._facts[fact.fact_id] = fact
             self._engine.register(fact)
@@ -468,7 +490,19 @@ class MemoryStore:
         if hasattr(self._storage, "load_meta_facts"):
             for meta in self._storage.load_meta_facts():
                 if meta.layer == -1:
-                    self._hole.restore_meta(meta)
+                    try:
+                        self._hole.restore_meta(meta)
+                    except DimensionMismatchError:
+                        # Same defence as restore_fact: record was
+                        # set in _meta_singularity before _meta_index.add
+                        # raised, so the body lives but lacks an index
+                        # entry until reindex.
+                        _logger.warning(
+                            "absorbed metafact %r rehydrated "
+                            "without index entry (singularity meta "
+                            "dim mismatch)", meta.meta_id,
+                        )
+                        meta.vector = []
                 else:
                     self._meta_facts[meta.meta_id] = meta
                     try:
@@ -2367,4 +2401,11 @@ class MemoryStore:
                 # picked up. Operator can confirm BIRCH_* env vars
                 # took effect without reading the process environment.
                 "thresholds": Thresholds.as_dict(),
+                # Thresholds are resolved at module import time. An
+                # operator changing BIRCH_*_THRESHOLD env vars on a
+                # running process will NOT see the new values here
+                # until the process restarts. Flag is here so a
+                # caller comparing stats["thresholds"] to current
+                # env doesn't assume hot-reload.
+                "thresholds_are_import_time": True,
             }
