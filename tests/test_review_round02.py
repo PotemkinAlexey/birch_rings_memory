@@ -1,6 +1,6 @@
 """ChatGPT round-2 punch-list regressions.
 
-The first round (test_chatgpt_punch_list.py) closed black-hole persistence
+The first round (test_review_round01.py) closed black-hole persistence
 and several contracts. ChatGPT then re-reviewed the fixed code and found
 the next layer of bugs — most importantly that Hawking emission would
 resurrect deprecated/expired bodies as if they were live truth, and that
