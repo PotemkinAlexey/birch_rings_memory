@@ -603,24 +603,33 @@ class FactsMixin:
         the data is gone.
         """
         with self._lock:
-            with self._txn():
-                self._sync()
-                fact = self._facts.pop(fact_id, None)
-                if fact is None:
-                    return False
-                self._index.remove(fact_id)
-                self._drop_from_spo_index(fact)
-                self._engine.unregister(fact_id)
-                if self._storage:
-                    self._storage.delete_fact(fact_id)
-                    # Drop every edge incident to this fact — otherwise on
-                    # next load the orphan endpoints inflate _degrees and
-                    # depress graph_score for healthy facts.
-                    if hasattr(self._storage, "delete_edges_for_fact"):
-                        self._storage.delete_edges_for_fact(fact_id)
-                self._bump_mutation_locked()
-                return True
+            try:
+                with self._txn():
+                    self._sync()
+                    fact = self._facts.pop(fact_id, None)
+                    if fact is None:
+                        return False
+                    self._index.remove(fact_id)
+                    self._drop_from_spo_index(fact)
+                    self._engine.unregister(fact_id)
+                    if self._storage:
+                        self._storage.delete_fact(fact_id)
+                        # Drop every edge incident to this fact — otherwise on
+                        # next load the orphan endpoints inflate _degrees and
+                        # depress graph_score for healthy facts.
+                        if hasattr(self._storage, "delete_edges_for_fact"):
+                            self._storage.delete_edges_for_fact(fact_id)
+                    self._bump_mutation_locked()
+                    return True
 
+            except Exception:
+                # Storage rolled back mid-write; in-memory caches
+                # may be partially mutated (touches / unregisters /
+                # pops / engine state). Re-anchor every cache to
+                # disk truth before propagating — symmetric with
+                # add_fact / add_facts / query / collapse_singularity.
+                self._reload()
+                raise
     def explain_body(self, body_id: str) -> dict:
         """Polymorphic alias for ``explain_fact``.
 
@@ -656,61 +665,70 @@ class FactsMixin:
         or ``retire_fact`` for stale data.
         """
         with self._lock:
-            with self._txn():
-                self._sync()
-                # 1. Live FactPassport.
-                if body_id in self._facts:
-                    fact = self._facts.pop(body_id)
-                    self._index.remove(body_id)
-                    self._drop_from_spo_index(fact)
-                    self._engine.unregister(body_id)
-                    if self._storage:
-                        self._storage.delete_fact(body_id)
-                        if hasattr(self._storage, "delete_edges_for_fact"):
-                            self._storage.delete_edges_for_fact(body_id)
-                    self._bump_mutation_locked()
-                    return {"deleted": True, "kind": "fact",
-                            "body_id": body_id}
-                # 2. Live MetaFact.
-                if body_id in self._meta_facts:
-                    self._meta_facts.pop(body_id)
-                    self._meta_index.remove(body_id)
-                    self._engine.unregister(body_id)
-                    if (self._storage
-                            and hasattr(self._storage, "delete_meta_fact")):
-                        self._storage.delete_meta_fact(body_id)
-                    self._bump_mutation_locked()
-                    return {"deleted": True, "kind": "meta",
-                            "body_id": body_id}
-                # 3. Singularity FactPassport.
-                if body_id in self._hole._singularity:
-                    self._hole._singularity.pop(body_id)
-                    self._hole._index.remove(body_id)
-                    if self._storage:
-                        self._storage.delete_fact(body_id)
-                        # Same edge cleanup as the live-fact branch
-                        # above — destructive delete must leave no
-                        # orphan edge rows on disk that would inflate
-                        # _degrees on next load.
-                        if hasattr(self._storage, "delete_edges_for_fact"):
-                            self._storage.delete_edges_for_fact(body_id)
-                    self._bump_mutation_locked()
-                    return {"deleted": True,
-                            "kind": "singularity_fact",
-                            "body_id": body_id}
-                # 4. Singularity MetaFact.
-                if body_id in self._hole._meta_singularity:
-                    self._hole._meta_singularity.pop(body_id)
-                    self._hole._meta_index.remove(body_id)
-                    if (self._storage
-                            and hasattr(self._storage, "delete_meta_fact")):
-                        self._storage.delete_meta_fact(body_id)
-                    self._bump_mutation_locked()
-                    return {"deleted": True,
-                            "kind": "singularity_meta",
-                            "body_id": body_id}
-                return {"deleted": False, "body_id": body_id}
+            try:
+                with self._txn():
+                    self._sync()
+                    # 1. Live FactPassport.
+                    if body_id in self._facts:
+                        fact = self._facts.pop(body_id)
+                        self._index.remove(body_id)
+                        self._drop_from_spo_index(fact)
+                        self._engine.unregister(body_id)
+                        if self._storage:
+                            self._storage.delete_fact(body_id)
+                            if hasattr(self._storage, "delete_edges_for_fact"):
+                                self._storage.delete_edges_for_fact(body_id)
+                        self._bump_mutation_locked()
+                        return {"deleted": True, "kind": "fact",
+                                "body_id": body_id}
+                    # 2. Live MetaFact.
+                    if body_id in self._meta_facts:
+                        self._meta_facts.pop(body_id)
+                        self._meta_index.remove(body_id)
+                        self._engine.unregister(body_id)
+                        if (self._storage
+                                and hasattr(self._storage, "delete_meta_fact")):
+                            self._storage.delete_meta_fact(body_id)
+                        self._bump_mutation_locked()
+                        return {"deleted": True, "kind": "meta",
+                                "body_id": body_id}
+                    # 3. Singularity FactPassport.
+                    if body_id in self._hole._singularity:
+                        self._hole._singularity.pop(body_id)
+                        self._hole._index.remove(body_id)
+                        if self._storage:
+                            self._storage.delete_fact(body_id)
+                            # Same edge cleanup as the live-fact branch
+                            # above — destructive delete must leave no
+                            # orphan edge rows on disk that would inflate
+                            # _degrees on next load.
+                            if hasattr(self._storage, "delete_edges_for_fact"):
+                                self._storage.delete_edges_for_fact(body_id)
+                        self._bump_mutation_locked()
+                        return {"deleted": True,
+                                "kind": "singularity_fact",
+                                "body_id": body_id}
+                    # 4. Singularity MetaFact.
+                    if body_id in self._hole._meta_singularity:
+                        self._hole._meta_singularity.pop(body_id)
+                        self._hole._meta_index.remove(body_id)
+                        if (self._storage
+                                and hasattr(self._storage, "delete_meta_fact")):
+                            self._storage.delete_meta_fact(body_id)
+                        self._bump_mutation_locked()
+                        return {"deleted": True,
+                                "kind": "singularity_meta",
+                                "body_id": body_id}
+                    return {"deleted": False, "body_id": body_id}
 
+            except Exception:
+                # Storage rolled back mid-write; in-memory caches
+                # may be partially mutated (touches / unregisters /
+                # pops / engine state). Re-anchor every cache to
+                # disk truth before propagating — symmetric with
+                # add_fact / add_facts / query / collapse_singularity.
+                self._reload()
+                raise
     def list_facts(
         self,
         subject: Optional[str] = None,
@@ -737,12 +755,21 @@ class FactsMixin:
 
     def link(self, from_id: str, to_id: str) -> None:
         with self._lock:
-            with self._txn():
-                self._sync()
-                self._engine.link(from_id, to_id)
-                if self._storage:
-                    self._storage.save_edge(from_id, to_id)
+            try:
+                with self._txn():
+                    self._sync()
+                    self._engine.link(from_id, to_id)
+                    if self._storage:
+                        self._storage.save_edge(from_id, to_id)
 
+            except Exception:
+                # Storage rolled back mid-write; in-memory caches
+                # may be partially mutated (touches / unregisters /
+                # pops / engine state). Re-anchor every cache to
+                # disk truth before propagating — symmetric with
+                # add_fact / add_facts / query / collapse_singularity.
+                self._reload()
+                raise
     def deprecate(self, old_id: str, new_id: str) -> dict:
         """Legacy alias for :meth:`supersede_fact`.
 
@@ -776,9 +803,18 @@ class FactsMixin:
         and Hawking emission, and preserves the "we used to think X" record.
         """
         with self._lock:
-            with self._txn():
-                self._sync()
-                result = self._supersede_fact_locked(old_id, new_id)
+            try:
+                with self._txn():
+                    self._sync()
+                    result = self._supersede_fact_locked(old_id, new_id)
+            except Exception:
+                # Storage rolled back mid-write; in-memory caches
+                # may be partially mutated (touches / unregisters /
+                # pops / engine state). Re-anchor every cache to
+                # disk truth before propagating — symmetric with
+                # add_fact / add_facts / query / collapse_singularity.
+                self._reload()
+                raise
         return result
 
     def _supersede_fact_locked(self, old_id: str, new_id: str) -> dict:
@@ -996,18 +1032,27 @@ class FactsMixin:
         cease to exist (secrets, accidental insertions).
         """
         with self._lock:
-            with self._txn():
-                self._sync()
-                if fact_id not in self._facts:
-                    return self._not_a_factpassport_failure(
-                        "retired", fact_id,
-                    )
-                fact = self._facts[fact_id]
-                fact.ttl = time.time()
-                if self._storage:
-                    self._storage.save_fact(fact)
-                absorbed = self._absorb_dead()
-                self._bump_mutation_locked()
+            try:
+                with self._txn():
+                    self._sync()
+                    if fact_id not in self._facts:
+                        return self._not_a_factpassport_failure(
+                            "retired", fact_id,
+                        )
+                    fact = self._facts[fact_id]
+                    fact.ttl = time.time()
+                    if self._storage:
+                        self._storage.save_fact(fact)
+                    absorbed = self._absorb_dead()
+                    self._bump_mutation_locked()
+            except Exception:
+                # Storage rolled back mid-write; in-memory caches
+                # may be partially mutated (touches / unregisters /
+                # pops / engine state). Re-anchor every cache to
+                # disk truth before propagating — symmetric with
+                # add_fact / add_facts / query / collapse_singularity.
+                self._reload()
+                raise
         return {
             "retired": True,
             "fact_id": fact_id,

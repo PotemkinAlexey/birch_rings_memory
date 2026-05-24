@@ -606,66 +606,76 @@ class QueryMixin:
         vec = embed(first_message)
 
         with self._lock:
-            with self._txn():
-                self._sync()
-                result = self._echo.detect_echo(
-                    vec, exclude_session_id=session_id)
-                penalized_body_ids: list[str] = []
-                if result.label == "echo" and result.penalty != 0.0 and result.fact_weights:
-                    # engine.apply_session_resonance is polymorphic over
-                    # FactPassport and MetaFact — both are registered in
-                    # the engine. Previously we only persisted the
-                    # FactPassport changes, losing MetaFact penalty
-                    # updates on restart.
-                    self._engine.apply_session_resonance(
-                        result.fact_weights, result.penalty)
-                    # Mirror the EWMA update too: an echo penalty is
-                    # retroactive realised-negative-utility, so leaving
-                    # recent_utility unchanged would make the gravity
-                    # formula see contradictory signals (resonance got
-                    # worse, utility stayed where it was). Same helper
-                    # session_close uses.
-                    self._apply_recent_utility_locked(
-                        result.fact_weights, result.penalty)
-                    penalized_body_ids = list(result.fact_weights.keys())
+            try:
+                with self._txn():
+                    self._sync()
+                    result = self._echo.detect_echo(
+                        vec, exclude_session_id=session_id)
+                    penalized_body_ids: list[str] = []
+                    if result.label == "echo" and result.penalty != 0.0 and result.fact_weights:
+                        # engine.apply_session_resonance is polymorphic over
+                        # FactPassport and MetaFact — both are registered in
+                        # the engine. Previously we only persisted the
+                        # FactPassport changes, losing MetaFact penalty
+                        # updates on restart.
+                        self._engine.apply_session_resonance(
+                            result.fact_weights, result.penalty)
+                        # Mirror the EWMA update too: an echo penalty is
+                        # retroactive realised-negative-utility, so leaving
+                        # recent_utility unchanged would make the gravity
+                        # formula see contradictory signals (resonance got
+                        # worse, utility stayed where it was). Same helper
+                        # session_close uses.
+                        self._apply_recent_utility_locked(
+                            result.fact_weights, result.penalty)
+                        penalized_body_ids = list(result.fact_weights.keys())
 
-                    if self._storage:
-                        affected_facts = [
-                            self._facts[bid] for bid in penalized_body_ids
-                            if bid in self._facts
-                        ]
-                        affected_metas = [
-                            self._meta_facts[bid] for bid in penalized_body_ids
-                            if bid in self._meta_facts
-                        ]
-                        if affected_facts:
-                            self._storage.save_facts(affected_facts)
-                        if (affected_metas
-                                and hasattr(self._storage, "save_meta_facts")):
-                            self._storage.save_meta_facts(affected_metas)
-                        past = (
-                            self._echo.get(result.matched_session_id)
-                            if result.matched_session_id
-                            else None
-                        )
-                        if past:
-                            self._storage.save_echo_session(
-                                past.session_id,
-                                past.bundle.centroids,
-                                past.r_score,
-                                time.time(),
-                                fact_weights=past.fact_weights,
-                                echo_penalty=past.echo_penalty,
+                        if self._storage:
+                            affected_facts = [
+                                self._facts[bid] for bid in penalized_body_ids
+                                if bid in self._facts
+                            ]
+                            affected_metas = [
+                                self._meta_facts[bid] for bid in penalized_body_ids
+                                if bid in self._meta_facts
+                            ]
+                            if affected_facts:
+                                self._storage.save_facts(affected_facts)
+                            if (affected_metas
+                                    and hasattr(self._storage, "save_meta_facts")):
+                                self._storage.save_meta_facts(affected_metas)
+                            past = (
+                                self._echo.get(result.matched_session_id)
+                                if result.matched_session_id
+                                else None
                             )
-                    self._bump_mutation_locked()
+                            if past:
+                                self._storage.save_echo_session(
+                                    past.session_id,
+                                    past.bundle.centroids,
+                                    past.r_score,
+                                    time.time(),
+                                    fact_weights=past.fact_weights,
+                                    echo_penalty=past.echo_penalty,
+                                )
+                        self._bump_mutation_locked()
 
-                return {
-                    "echo": result.label == "echo",
-                    "matched_session": result.matched_session_id,
-                    "similarity": result.similarity,
-                    "penalty": result.penalty,
-                    # Kept under the old key for wire-format stability.
-                    # The list may include MetaFact ids too — they all
-                    # received the echo penalty symmetrically.
-                    "penalized_fact_ids": penalized_body_ids,
-                }
+                    return {
+                        "echo": result.label == "echo",
+                        "matched_session": result.matched_session_id,
+                        "similarity": result.similarity,
+                        "penalty": result.penalty,
+                        # Kept under the old key for wire-format stability.
+                        # The list may include MetaFact ids too — they all
+                        # received the echo penalty symmetrically.
+                        "penalized_fact_ids": penalized_body_ids,
+                    }
+
+            except Exception:
+                # Storage rolled back mid-write; in-memory caches
+                # may be partially mutated (touches / unregisters /
+                # pops / engine state). Re-anchor every cache to
+                # disk truth before propagating — symmetric with
+                # add_fact / add_facts / query / collapse_singularity.
+                self._reload()
+                raise
