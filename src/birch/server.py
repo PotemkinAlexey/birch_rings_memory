@@ -68,6 +68,40 @@ def _validate_optional_text(value, field_name: str) -> Optional[dict]:
     return None
 
 
+def _validate_optional_id(value, field_name: str) -> Optional[dict]:
+    """Same shape as _validate_id but ``None`` passes through. For
+    session_id-style args where omitted means "use current" or
+    "generate one"; only the explicit non-None case must be a
+    non-empty string."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return {
+            "ok": False,
+            "error": "invalid_id",
+            "field": field_name,
+            "got_type": type(value).__name__,
+            "hint": f"{field_name} must be a non-empty string when set",
+        }
+    return None
+
+
+def _validate_bool(value, field_name: str) -> Optional[dict]:
+    """Reject non-bool values for explicit bool flags. Python's truthy
+    semantics would let ``record_first_message="false"`` evaluate True
+    (non-empty string) and silently push the message — exactly the
+    opposite of what the caller meant. Strict isinstance check."""
+    if not isinstance(value, bool):
+        return {
+            "ok": False,
+            "error": "invalid_bool",
+            "field": field_name,
+            "got_type": type(value).__name__,
+            "hint": f"{field_name} must be true or false (JSON bool)",
+        }
+    return None
+
+
 def _validate_id(value, field_name: str = "fact_id") -> Optional[dict]:
     """Reject non-string or empty id arguments at the MCP boundary.
 
@@ -1095,6 +1129,20 @@ def session_open(
     resonance signal propagates to gravity. If ``session_id`` is omitted a
     unique one is generated.
     """
+    # Boundary validation: session_id (if explicitly passed) must be
+    # a non-empty string; record_first_message must be a real bool
+    # (Python truthy semantics on "false"/[1]/dict would silently push
+    # when caller meant skip); agent_id is a name used to mint the
+    # default session_id, must be a non-empty string.
+    err = _validate_optional_id(session_id, "session_id")
+    if err is not None:
+        return err
+    err = _validate_text(agent_id, "agent_id")
+    if err is not None:
+        return err
+    err = _validate_bool(record_first_message, "record_first_message")
+    if err is not None:
+        return err
     sid = session_id or f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     # session_start now returns whether a brand-new SessionContext was
     # created (True) or an existing in-flight one was promoted (False).
@@ -1176,6 +1224,9 @@ def check_echo(first_message: str, session_id: Optional[str] = None) -> dict:
     err = _validate_text(first_message, "first_message")
     if err is not None:
         return err
+    err = _validate_optional_id(session_id, "session_id")
+    if err is not None:
+        return err
     try:
         return _store.check_echo(first_message, session_id=session_id)
     except EmbeddingError as exc:
@@ -1193,6 +1244,9 @@ def session_push(text: str, session_id: str) -> dict:
     your replies.
     """
     err = _validate_text(text, "text")
+    if err is not None:
+        return err
+    err = _validate_id(session_id, "session_id")
     if err is not None:
         return err
     try:
@@ -1256,6 +1310,9 @@ def session_close(
     ``"r_override"``) so the caller can confirm which path resolved R,
     and a fresh ``stats`` snapshot.
     """
+    err = _validate_id(session_id, "session_id")
+    if err is not None:
+        return err
     # Validate r_override BEFORE calling core. Core's float(r_override)
     # would raise ValueError for non-numeric input which the catch
     # below maps to "invalid_sentiment" — wrong error class, misleading
@@ -1341,6 +1398,11 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
     session. ``record_session`` is the fallback for "I forgot to open a
     session and now I want the resonance signal anyway".
     """
+    # agent_id is used to mint the synthetic session_id below — must
+    # be a non-empty string or the generated id is junk.
+    err = _validate_text(agent_id, "agent_id")
+    if err is not None:
+        return err
     # Pre-validate the messages list before opening a session. Round
     # 15: a string passed for messages would have iterated chars; a
     # list with non-string items would have reached the embed layer

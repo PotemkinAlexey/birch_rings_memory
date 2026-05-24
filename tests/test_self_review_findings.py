@@ -167,7 +167,7 @@ def test_reload_restores_caches_on_load_failure(tmp_path, monkeypatch):
     saved_data_version = mem._data_version
 
     # Force _load_from_storage to raise.
-    def boom():
+    def boom(*args, **kwargs):
         raise RuntimeError("simulated transient SQLite failure")
 
     monkeypatch.setattr(mem, "_load_from_storage", boom)

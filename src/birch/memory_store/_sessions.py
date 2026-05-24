@@ -171,47 +171,67 @@ class SessionsMixin:
         can distinguish a fresh open from a recovered in-flight one.
         """
         with self._lock:
-            with self._txn():
-                self._sync()
-                if session_id in self._sessions:
-                    # Already open — preserve in-flight state. Just
-                    # promote to current and skip re-persistence
-                    # (storage row is already there, and overwriting
-                    # would clobber any attribution accumulated since
-                    # the first session_start).
+            try:
+                with self._txn():
+                    self._sync()
+                    if session_id in self._sessions:
+                        # Already open — preserve in-flight state. Just
+                        # promote to current and skip re-persistence
+                        # (storage row is already there, and overwriting
+                        # would clobber any attribution accumulated since
+                        # the first session_start).
+                        self._current_session_id = session_id
+                        _logger.info(
+                            "session_start: %r already open — preserving "
+                            "in-flight context (idempotent open)",
+                            session_id,
+                        )
+                        return False
+                    ctx = SessionContext(session_id=session_id)
+                    self._sessions[session_id] = ctx
                     self._current_session_id = session_id
-                    _logger.info(
-                        "session_start: %r already open — preserving "
-                        "in-flight context (idempotent open)",
-                        session_id,
-                    )
-                    return False
-                ctx = SessionContext(session_id=session_id)
-                self._sessions[session_id] = ctx
-                self._current_session_id = session_id
-                if self._storage and hasattr(self._storage, "save_open_session"):
-                    self._storage.save_open_session(
-                        session_id, ctx.messages, ctx.vectors, ctx.facts, time.time()
-                    )
-                return True
+                    if self._storage and hasattr(self._storage, "save_open_session"):
+                        self._storage.save_open_session(
+                            session_id, ctx.messages, ctx.vectors, ctx.facts, time.time()
+                        )
+                    return True
+            except Exception:
+                # Storage save_open_session raised after the in-memory
+                # session dict already had the new SessionContext.
+                # Re-anchor every cache to disk truth before propagating
+                # so callers don't see an in-memory session that disk
+                # never accepted — symmetric with the other write paths
+                # (commit 0f23a62).
+                self._reload()
+                raise
 
     def session_message(self, text: str, session_id: Optional[str] = None) -> None:
         """Record a user message in the named session (or the current one)."""
         # Embed outside the lock — slow HTTP call, must not serialize agents.
         vec = embed(text)
         with self._lock:
-            with self._txn():
-                self._sync()
-                sid = self._resolve_sid(session_id)
-                if sid is None or sid not in self._sessions:
-                    raise KeyError(f"unknown session: {sid!r}")
-                ctx = self._sessions[sid]
-                ctx.messages.append(text)
-                ctx.vectors.append(vec)
-                if self._storage and hasattr(self._storage, "save_open_session"):
-                    self._storage.save_open_session(
-                        sid, ctx.messages, ctx.vectors, ctx.facts, time.time()
-                    )
+            try:
+                with self._txn():
+                    self._sync()
+                    sid = self._resolve_sid(session_id)
+                    if sid is None or sid not in self._sessions:
+                        raise KeyError(f"unknown session: {sid!r}")
+                    ctx = self._sessions[sid]
+                    ctx.messages.append(text)
+                    ctx.vectors.append(vec)
+                    if self._storage and hasattr(self._storage, "save_open_session"):
+                        self._storage.save_open_session(
+                            sid, ctx.messages, ctx.vectors, ctx.facts, time.time()
+                        )
+            except Exception:
+                # ctx.messages / ctx.vectors were appended in-memory
+                # BEFORE the storage write; on failure the in-memory
+                # trajectory contains a message that disk doesn't have.
+                # session_close would then compute resonance over a
+                # message that never landed, and restart would diverge
+                # from pre-restart behaviour. Re-anchor.
+                self._reload()
+                raise
 
     # Sentiment shortcut → R value mapping. Discrete choices spelled
     # out so a calling agent doesn't have to memorise which float means
@@ -535,9 +555,19 @@ class SessionsMixin:
         no EWMA, no adaptive-weight training. Pure cleanup.
         """
         with self._lock:
-            with self._txn():
-                self._sync()
-                if session_id not in self._sessions:
-                    return False
-                self._pop_session_locked(session_id)
-                return True
+            try:
+                with self._txn():
+                    self._sync()
+                    if session_id not in self._sessions:
+                        return False
+                    self._pop_session_locked(session_id)
+                    return True
+            except Exception:
+                # _pop_session_locked drops from self._sessions in
+                # memory BEFORE the storage delete_open_session call.
+                # On storage failure the in-memory pop is irreversible
+                # without _reload — disk still has the session row,
+                # so without recovery the next restart would resurrect
+                # an "aborted" session.
+                self._reload()
+                raise

@@ -957,41 +957,94 @@ class FactsMixin:
         primitive for atomic relations where multiple objects can coexist
         ("api uses Postgres" + "api uses Redis"). Pick by intent.
         """
-        # add_fact returns an authoritative ``created`` flag from inside
-        # its own write transaction: True only when this call actually
-        # inserted the row, False when a dedup branch (pre-existing SPO
-        # or race-winner from another process) returned the existing
-        # fact. ``already_existed = not created`` is therefore
-        # transaction-honest — no race window between a pre-check and
-        # the insert.
-        new_fact, created = self.add_fact(
-            subject, predicate, obj,
-            session_id=session_id, return_status=True,
-        )
-        already_existed = not created
-
-        # AUTHORITATIVE slot recompute inside a write transaction — the
-        # pre-add snapshot is not enough in multi-process: another writer
-        # could have inserted a same-(subject, predicate) body between
-        # the pre-check and add_fact. Recompute under the write lock so
-        # every current occupant other than the new fact is superseded.
+        # Slot-replace is a SINGLE-transaction contract. Previously
+        # ran as two independent transactions — add_fact committed,
+        # then a second txn superseded occupants — so a failure of
+        # the second txn left the new fact committed alongside the
+        # old occupants, breaking slot uniqueness. Now: embed outside
+        # the lock (slow HTTP call), then do add + supersede in one
+        # atomic _txn(), wrapped in the standard rollback guard.
+        key = self._normalize_spo(subject, predicate, obj)
+        # Embed outside the lock — slow HTTP call, must not serialize.
+        vec = embed(f"{subject} {predicate} {obj}")
         superseded: list[str] = []
-        with self._lock:
-            with self._txn():
-                self._sync()
-                occupants = self._live_slot_occupants(subject, predicate)
-                for old_id in occupants:
-                    if old_id == new_fact.fact_id:
-                        continue
-                    # Use the locked helper rather than the public
-                    # supersede_fact: we are already inside the lock + txn
-                    # and have just synced, so re-entering them just to
-                    # call the public wrapper would be wasteful and
-                    # harder to reason about.
-                    result = self._supersede_fact_locked(
-                        old_id, new_fact.fact_id)
-                    if result.get("superseded"):
-                        superseded.append(old_id)
+        already_existed = False
+        new_fact: Optional[FactPassport] = None
+        try:
+            with self._lock:
+                with self._txn():
+                    self._sync()
+                    # Step 1: insert-or-touch the new fact. If the
+                    # exact SPO already exists in the slot, touch it
+                    # and reuse the existing fact_id; otherwise create
+                    # a new FactPassport.
+                    existing_id = self._spo_index.get(key)
+                    if existing_id and existing_id in self._facts:
+                        new_fact = self._touch_existing(
+                            existing_id, session_id,
+                        )
+                        already_existed = True
+                    else:
+                        # Preflight dim BEFORE any state mutation.
+                        if (vec and self._index._dim is not None
+                                and len(vec) != self._index._dim):
+                            raise DimensionMismatchError(
+                                f"Embedding dimension mismatch: "
+                                f"index has dim={self._index._dim}, "
+                                f"incoming vector has dim={len(vec)}. "
+                                f"Pin BIRCH_EMBED_MODEL or rebuild "
+                                f"the store before set_fact."
+                            )
+                        sid = self._resolve_sid(session_id)
+                        new_fact = FactPassport(
+                            subject=subject,
+                            predicate=predicate,
+                            object=obj,
+                            layer=1,
+                            source_session=sid,
+                        )
+                        new_fact.vector = vec
+                        self._facts[new_fact.fact_id] = new_fact
+                        self._engine.register(new_fact)
+                        self._index.add(new_fact.fact_id, vec)
+                        self._spo_index[key] = new_fact.fact_id
+                        self._auto_link_fact(new_fact.fact_id, vec)
+                        if self._storage:
+                            self._storage.save_fact(new_fact)
+                        if sid is not None:
+                            ctx = self._sessions.get(sid)
+                            if ctx is not None:
+                                self._attribute_to(
+                                    ctx, new_fact.fact_id, 1.0,
+                                )
+                                self._persist_session_locked(ctx)
+                        self._bump_mutation_locked()
+
+                    # Step 2: supersede every OTHER live occupant of
+                    # the (subject, predicate) slot — same transaction,
+                    # so either both halves succeed or both roll back
+                    # via the outer try/except + _reload below.
+                    occupants = self._live_slot_occupants(
+                        subject, predicate,
+                    )
+                    for old_id in occupants:
+                        if old_id == new_fact.fact_id:
+                            continue
+                        result = self._supersede_fact_locked(
+                            old_id, new_fact.fact_id,
+                        )
+                        if result.get("superseded"):
+                            superseded.append(old_id)
+        except Exception:
+            # Either the insert or any supersede failed — SQLite
+            # rolled back the disk, _reload() re-anchors in-memory
+            # to disk truth so callers don't see the half-applied
+            # slot replacement. Symmetric with collapse_singularity
+            # / add_facts / query — see commit 0f23a62.
+            with self._lock:
+                self._reload()
+            raise
+        assert new_fact is not None
 
         # Response now carries the same per-fact metadata that
         # record_fact / record_facts items return — agents that

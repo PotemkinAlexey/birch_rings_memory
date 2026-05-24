@@ -235,7 +235,15 @@ class MemoryStore(
         self._sessions = {}
         self._current_session_id = None
         try:
-            self._load_from_storage()
+            # _reload is the rollback-recovery path — must be strictly
+            # read-only. _load_from_storage's default (prune=True) does
+            # destructive cleanup (orphan edges + TTL'd sessions) which
+            # is the right behaviour at fresh process start (__init__)
+            # but not under recovery: a destructive write executed
+            # mid-rollback could shadow the failing transaction's
+            # original error and confuse the caller. Pass prune=False
+            # so reload truly only reads.
+            self._load_from_storage(prune=False)
         except Exception:
             # Restore the pre-reload view so callers don't see a
             # phantom-empty store. Force data_version to a sentinel
@@ -279,7 +287,17 @@ class MemoryStore(
 
     # ── Storage bootstrap ────────────────────────────────────────────────────
 
-    def _load_from_storage(self) -> None:
+    def _load_from_storage(self, *, prune: bool = True) -> None:
+        """Rebuild every in-memory cache from storage.
+
+        ``prune`` (default True for backwards compat — __init__ path
+        wants self-healing) controls whether destructive cleanup
+        runs during the load: orphan-edge GC + TTL-expired open
+        session sweep. Both write to disk. _reload sets ``prune=False``
+        so rollback-recovery rebuilds are strictly read-only — a
+        leaky cleanup mid-rollback could interact unexpectedly with
+        the failing transaction higher up.
+        """
         # Only ever called when storage is configured (from __init__ / _reload).
         assert self._storage is not None
         # Learned pre-resonance weights, if the user's history has trained any.
@@ -378,7 +396,7 @@ class MemoryStore(
                 self._engine.link(from_id, to_id)
             else:
                 stale_edges.append((from_id, to_id))
-        if (stale_edges and self._storage
+        if (prune and stale_edges and self._storage
                 and hasattr(self._storage, "delete_edges_for_fact")):
             # Cheaper to delete by endpoint than to add a per-edge delete;
             # the orphan list shares many endpoints in practice.
@@ -408,7 +426,11 @@ class MemoryStore(
             now = time.time()
             for row in self._storage.load_open_sessions():
                 if now - row["started_at"] > _SESSION_TTL:
-                    self._storage.delete_open_session(row["session_id"])
+                    if prune:
+                        self._storage.delete_open_session(row["session_id"])
+                    # Either way, skip rehydrating the expired session
+                    # into memory — restart-from-stale would otherwise
+                    # resurrect crashed sessions.
                     continue
                 ctx = SessionContext(session_id=row["session_id"])
                 ctx.messages = row["messages"]
