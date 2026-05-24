@@ -438,10 +438,21 @@ class MemoryStore(
                 inflight.result(timeout=5.0)
             except Exception as exc:
                 # Don't crash close() — but don't lose the error either.
-                # Stored on the instance (best effort, since stats may be
-                # read shortly after close in tests / shutdown handlers).
+                # Stored on the instance (best effort, since stats may
+                # be read shortly after close in tests / shutdown
+                # handlers).
                 self._last_collapse_error = repr(exc)
         if executor is not None:
-            executor.shutdown(wait=True)
+            # If the future already finished above (the common path)
+            # shutdown returns immediately. If it timed out, honour
+            # the bound — cancel anything still pending and skip the
+            # join. Previously this said `wait=True`, which silently
+            # ignored the 5-second timeout above and waited
+            # indefinitely; the timeout was misleading.
+            inflight_done = inflight is None or inflight.done()
+            if inflight_done:
+                executor.shutdown(wait=True)
+            else:
+                executor.shutdown(wait=False, cancel_futures=True)
         if storage is not None and hasattr(storage, "close"):
             storage.close()

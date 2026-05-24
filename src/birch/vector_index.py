@@ -110,8 +110,17 @@ class VectorIndex:
         if top_k >= len(sims):
             order = np.argsort(-sims)
         else:
-            # argpartition first, then sort just the top_k slice.
-            part = np.argpartition(-sims, top_k)[:top_k]
+            # argpartition's `kth` is a 0-indexed pivot position — to
+            # extract the top_k elements correctly the pivot must be
+            # at index top_k-1 (NOT top_k). With kth=top_k the slice
+            # [:top_k] would include indices [0..top_k-1], i.e. the
+            # top_k *smallest* in the negated array — correct positions
+            # but the boundary element may be swapped between slots
+            # top_k-1 and top_k. The downstream argsort over `sims[part]`
+            # re-sorts the slice so the final order is right either
+            # way; this fix is for idiom hygiene and to avoid the
+            # off-by-one trap if a future refactor drops the resort.
+            part = np.argpartition(-sims, top_k - 1)[:top_k]
             order = part[np.argsort(-sims[part])]
         out: list[tuple[str, float]] = []
         for idx in order:

@@ -372,6 +372,23 @@ class SingularityMixin:
                 # Cache the response keyed by the snapshot we
                 # forecasted against. Subsequent calls with no
                 # intervening writes hit the cache.
+                #
+                # INTENTIONAL non-bump: run_forecast writes
+                # forecast_stability into bodies but does NOT call
+                # _bump_mutation_locked(). Reason: this write is a
+                # *projection* of the (data_version, mutation_version)
+                # snapshot we just forecasted against — re-running on
+                # the same snapshot must hit the cache, so bumping
+                # would force a needless N² recompute on every
+                # consecutive call. The downstream consumers of
+                # forecast_stability (pre_resonance_features in
+                # gravity, SGD in session_close) read the new values
+                # on their next access; they don't subscribe to
+                # mutation_version for forecast specifically.
+                # If a future caller needs "tell me when forecast
+                # values changed" granularity, add a dedicated
+                # _forecast_version counter rather than coupling
+                # forecast writes to the general mutation bump.
                 self._forecast_cache = (
                     cache_key, dict(result_payload),
                 )

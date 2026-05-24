@@ -333,6 +333,37 @@ class SessionsMixin:
                 # every fact, so it must run on the authoritative state.
                 self._sync()
 
+                # Snapshot-drift detection. compute_resonance ran lock-free
+                # above so other agents could keep querying — but in that
+                # window another thread could session_push() new messages
+                # OR query() with this same session_id (which attributes
+                # new fact_ids to ctx.facts). Without revalidation those
+                # post-snapshot attributions would be silently dropped:
+                # facts_snapshot is a frozen copy, and below we propagate
+                # R only to its keys. After session_close pops the ctx
+                # the new attributions vanish along with it.
+                #
+                # Fix: merge the current ctx.facts state into the snapshot
+                # (giving new fact attributions the same R as the
+                # snapshot's — they're part of the same session) and
+                # union new messages into the resonance-write echo bundle.
+                # Same-session writes during close are rare but always
+                # "still part of this conversation"; merging is the
+                # right semantic, retry-with-stale-error is too harsh
+                # for the closing op.
+                live_ctx = self._sessions.get(sid)
+                if live_ctx is not None:
+                    drift_facts = {
+                        fid: w
+                        for fid, w in live_ctx.facts.items()
+                        if fid not in facts_snapshot
+                    }
+                    if drift_facts:
+                        # Track in the snapshot dict so all downstream
+                        # propagation (gravity, EWMA, echo bundle) sees
+                        # the union without separate code paths.
+                        facts_snapshot.update(drift_facts)
+
                 # Snapshot pre-resonance features for facts about to receive
                 # their first ever resonance — these are the training events
                 # for the adaptive weights. Resonance is the teacher; the

@@ -235,7 +235,9 @@ class QueryMixin:
                     continue
                 if prefix:
                     # No single subject on a meta — only include if any
-                    # source_text actually contains the prefix.
+                    # source_text starts with the prefix (case-insensitive
+                    # — same `startswith` contract as the FactPassport
+                    # subject filter, applied across the lineage).
                     if not any((st or "").lower().startswith(prefix)
                                for st in meta.source_texts):
                         continue

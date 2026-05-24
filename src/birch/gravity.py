@@ -179,6 +179,13 @@ class GravityEngine:
         self.weights = weights if weights is not None else AdaptiveWeights.from_prior()
         self._facts: dict[str, GravityBody] = {}
         self._degrees: dict[str, int] = {}     # fact_id → graph degree
+        # Track which (from, to) pairs already contributed to _degrees
+        # so a repeated link() call doesn't double-count. Storage
+        # de-dups via PRIMARY KEY (from_id, to_id) + INSERT OR IGNORE,
+        # but the in-memory counter was advancing on every call —
+        # which could inflate gravity (graph_score) until the next
+        # _reload rebuilt _degrees from disk's unique rows.
+        self._edges: set[tuple[str, str]] = set()
 
     def register(self, fact: GravityBody) -> None:
         self._facts[fact.fact_id] = fact
@@ -188,9 +195,28 @@ class GravityEngine:
         """Remove a fact from the engine — called on explicit deletion."""
         self._facts.pop(fact_id, None)
         self._degrees.pop(fact_id, None)
+        # Drop any edge touching this id so a later re-link of the
+        # same pair (e.g. after a fact is recreated with the same id —
+        # rare, but possible in tests / restart scenarios) increments
+        # the counter once, not zero or many times.
+        stale = {
+            edge for edge in self._edges
+            if edge[0] == fact_id or edge[1] == fact_id
+        }
+        self._edges.difference_update(stale)
 
     def link(self, from_id: str, to_id: str) -> None:
-        """Record a dependency edge — increases graph degree of to_id."""
+        """Record a dependency edge — increases graph degree of ``to_id``
+        the first time this exact ``(from_id, to_id)`` pair is seen.
+
+        Repeated calls with the same pair are no-ops in the in-memory
+        counter (mirrors the on-disk PRIMARY KEY + INSERT OR IGNORE
+        semantics in SQLiteBackend.save_edge).
+        """
+        pair = (from_id, to_id)
+        if pair in self._edges:
+            return
+        self._edges.add(pair)
         self._degrees[to_id] = self._degrees.get(to_id, 0) + 1
 
     def apply_session_resonance(self, facts, r: float) -> None:
