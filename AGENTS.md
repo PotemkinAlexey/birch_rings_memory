@@ -45,11 +45,28 @@ compression and Hawking emission still possible. If a fact's topic is
 just over with no replacement, call `retire_fact(fact_id)` — same
 singularity benefits, no successor required.
 
-**Deleting** — only on explicit user order, and only with `delete_fact`,
-which is the destructive primitive (no singularity, no lineage). Reserve
-it for secrets / accidental writes / GDPR removal. For "stale / wrong /
-outdated" data, the right operation is `supersede_fact` or `retire_fact`
-— see the *Retiring a fact* table below.
+**Deleting** — only on explicit user order. `delete_fact(fact_id)` is the
+FactPassport-only legacy destructive primitive; `delete_body(body_id)` is
+the polymorphic version that handles **all four body locations** (live
+FactPassport, live MetaFact, singularity FactPassport, singularity
+MetaFact). Use `delete_body` whenever the id came from `query_memory` —
+its `body_id` may point at any of the four. Both are destructive: no
+singularity, no lineage. Reserve for secrets / accidental writes / GDPR
+removal. For "stale / wrong / outdated" data, the right operation is
+`supersede_fact` or `retire_fact` (FactPassport-only by design — MetaFact
+lifecycle is read-only post-collapse; record contradicting facts and let
+next-cycle collapse re-aggregate).
+
+**Debugging gravity** — `explain_fact(fact_id)` is polymorphic and now
+handles all four body locations the same way `delete_body` does. The
+body-named alias `explain_body(body_id)` reads more naturally when the
+id came from `query_memory`. Both return per-feature decomposition
+(freshness / access / graph / utility / stability / resonance) plus
+shape-specific fields (SPO for facts, weight + lineage for metas).
+
+**Read-only surfacing** — `find_similar(text)` is the paraphrase-search
+tool. Use it before writing to surface candidates that `set_fact` should
+displace or that `supersede_fact` should retire. Always read-only.
 
 ---
 

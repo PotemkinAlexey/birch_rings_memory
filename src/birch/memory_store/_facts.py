@@ -775,9 +775,20 @@ class FactsMixin:
         nesting works via reentrant transaction(), but the chain of
         public-method ↔ public-method calls is harder to reason about
         than a single transactional flow that uses this helper.
+
+        FactPassport-only by design. MetaFacts are aggregate bundles
+        without a single SPO slot — there is no sane semantics for
+        "supersede a cluster with one new fact" (which slot would the
+        new fact occupy?). For destructive removal of any body kind
+        prefer ``delete_body`` (polymorphic); for stale MetaFact data
+        the model contract is: record contradicting facts and let
+        next-cycle collapse re-aggregate. Failure responses now echo
+        both ids so callers don't KeyError on ``result["old_id"]``.
         """
         if old_id not in self._facts:
-            return {"superseded": False, "reason": "old_id not found"}
+            return self._not_a_factpassport_failure(
+                "superseded", old_id, new_id=new_id,
+            )
         old = self._facts[old_id]
         old.deprecated_by = new_id
         key = self._normalize_spo(old.subject, old.predicate, old.object)
@@ -793,6 +804,68 @@ class FactsMixin:
             "new_id": new_id,
             "absorbed": absorbed,
         }
+
+    def _not_a_factpassport_failure(
+        self,
+        action_key: str,
+        body_id: str,
+        *,
+        new_id: Optional[str] = None,
+    ) -> dict:
+        """Failure response shared by supersede_fact / retire_fact when
+        the id is not a live FactPassport. Detects the four other body
+        locations so the response can tell the caller exactly what kind
+        of body the id points to (or that nothing matches at all).
+
+        ``action_key`` is ``"superseded"`` or ``"retired"`` so the
+        response has the same top-level boolean key the success path
+        uses — agents can branch on `if not result[action_key]`.
+        """
+        # Always echo the ids so callers can key on result["old_id"] /
+        # result["fact_id"] in both branches (was the documented but
+        # missing field that caused agent KeyError).
+        resp: dict = {
+            action_key: False,
+            "fact_id": body_id,
+        }
+        if new_id is not None:
+            resp["old_id"] = body_id
+            resp["new_id"] = new_id
+            # drop the redundant fact_id alias when both ids exist
+            resp.pop("fact_id", None)
+        # Polymorphic kind detection — mirrors delete_body / explain_fact.
+        if body_id in self._meta_facts:
+            resp["error"] = "not_a_factpassport"
+            resp["kind"] = "meta"
+            resp["hint"] = (
+                "Lifecycle ops (supersede / retire) are FactPassport-only "
+                "by design — MetaFacts have no SPO slot. Use delete_body "
+                "for destructive removal; record contradicting facts to "
+                "let next-cycle collapse re-aggregate."
+            )
+            return resp
+        if body_id in self._hole._singularity:
+            resp["error"] = "not_a_factpassport"
+            resp["kind"] = "singularity_fact"
+            resp["hint"] = (
+                "Body is already in the singularity (absorbed or "
+                "previously superseded). Use delete_body if you need "
+                "destructive removal."
+            )
+            return resp
+        if body_id in self._hole._meta_singularity:
+            resp["error"] = "not_a_factpassport"
+            resp["kind"] = "singularity_meta"
+            resp["hint"] = (
+                "Body is a singularity MetaFact aggregate. Use "
+                "delete_body for destructive removal; lifecycle ops "
+                "do not apply to clusters."
+            )
+            return resp
+        # Truly unknown.
+        resp["error"] = "not_found"
+        resp["reason"] = "id does not match any known body"
+        return resp
 
     def _live_slot_occupants(self, subject: str, predicate: str) -> list[str]:
         """Caller must hold self._lock. Live fact_ids with this (s, p) slot.
@@ -869,6 +942,14 @@ class FactsMixin:
                     if result.get("superseded"):
                         superseded.append(old_id)
 
+        # Response now carries the same per-fact metadata that
+        # record_fact / record_facts items return — agents that
+        # orchestrate writes through any of the three write tools
+        # can key on a uniform field set (layer, gravity_score,
+        # created). `created` is the explicit "this call inserted
+        # a row" boolean; `already_existed` says only "the SPO was
+        # already present" (could be touched, could be just
+        # re-recorded by an earlier item in this batch).
         return {
             "set": True,
             "fact_id": new_fact.fact_id,
@@ -876,7 +957,14 @@ class FactsMixin:
             "predicate": predicate,
             "object": obj,
             "already_existed": already_existed,
+            "created": not already_existed,
+            "layer": new_fact.layer,
+            "gravity_score": round(new_fact.gravity_score, 3),
             "superseded": superseded,
+            "_hint": (
+                "set_fact is the slot-replace primitive — every live "
+                "fact sharing (subject, predicate) was superseded."
+            ),
         }
 
     def retire_fact(self, fact_id: str) -> dict:
@@ -896,7 +984,9 @@ class FactsMixin:
             with self._txn():
                 self._sync()
                 if fact_id not in self._facts:
-                    return {"retired": False, "reason": "fact_id not found"}
+                    return self._not_a_factpassport_failure(
+                        "retired", fact_id,
+                    )
                 fact = self._facts[fact_id]
                 fact.ttl = time.time()
                 if self._storage:

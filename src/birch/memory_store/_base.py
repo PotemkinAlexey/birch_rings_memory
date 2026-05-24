@@ -189,9 +189,41 @@ class MemoryStore(
             self._reload()
 
     def _reload(self) -> None:
-        """Rebuild every in-memory cache from storage. Caller holds self._lock."""
+        """Rebuild every in-memory cache from storage. Caller holds self._lock.
+
+        Atomic-swap pattern. The previous version cleared every cache
+        BEFORE calling ``_load_from_storage`` — if the loader raised
+        mid-rebuild (transient ``database is locked``, a row class no
+        existing tolerant loader catches, etc.) the store was left
+        with empty caches AND ``_data_version`` unchanged from before
+        the clear. The next ``_sync`` then saw equal data_version and
+        skipped the retry — the store would silently return zero
+        results until something else bumped the version. ``_reload``
+        is the failsafe for every other invariant in this file; it
+        itself has to be crash-safe.
+
+        Build into fresh local instances first, install with whole-
+        attribute assignment only when ``_load_from_storage`` returns
+        cleanly. On any exception the previous caches stay live; we
+        also reset ``_data_version`` to a sentinel so the next call
+        retries instead of declaring the empty view authoritative.
+        """
         if self._storage is None:
             return
+        # Stash references to the live caches so we can swap atomically.
+        saved_facts = self._facts
+        saved_spo = self._spo_index
+        saved_index = self._index
+        saved_meta_facts = self._meta_facts
+        saved_meta_index = self._meta_index
+        saved_engine = self._engine
+        saved_hole = self._hole
+        saved_echo = self._echo
+        saved_sessions = self._sessions
+        saved_current = self._current_session_id
+        # Install fresh empty caches; _load_from_storage populates
+        # these by reading self._facts/etc., so we have to assign
+        # before the call. On failure we restore the saved refs.
         self._facts = {}
         self._spo_index = {}
         self._index = VectorIndex()
@@ -202,7 +234,25 @@ class MemoryStore(
         self._echo = EchoStore(default_k=self._echo_k)
         self._sessions = {}
         self._current_session_id = None
-        self._load_from_storage()
+        try:
+            self._load_from_storage()
+        except Exception:
+            # Restore the pre-reload view so callers don't see a
+            # phantom-empty store. Force data_version to a sentinel
+            # so the very next _sync retries instead of trusting the
+            # empty load.
+            self._facts = saved_facts
+            self._spo_index = saved_spo
+            self._index = saved_index
+            self._meta_facts = saved_meta_facts
+            self._meta_index = saved_meta_index
+            self._engine = saved_engine
+            self._hole = saved_hole
+            self._echo = saved_echo
+            self._sessions = saved_sessions
+            self._current_session_id = saved_current
+            self._data_version = -1
+            raise
         self._data_version = self._data_version_now()
         # Defensive: cross-process sync rebuilt everything in-memory,
         # so any cached recompute keyed on the old snapshot is now

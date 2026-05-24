@@ -490,7 +490,15 @@ class SQLiteBackend:
         self._maybe_commit()
 
     def load_open_sessions(self) -> list[dict]:
-        rows = self._conn.execute("SELECT * FROM open_sessions").fetchall()
+        # ORDER BY started_at so _reload restores `_current_session_id`
+        # deterministically — without the ORDER BY, the last row from
+        # `SELECT *` was driver-dependent and "current" after a cross-
+        # process reload was effectively arbitrary. Most-recently-
+        # started wins; matches the "this is the session you just
+        # opened" intuition of the back-compat shims.
+        rows = self._conn.execute(
+            "SELECT * FROM open_sessions ORDER BY started_at ASC"
+        ).fetchall()
         out: list[dict] = []
         for r in rows:
             try:

@@ -44,6 +44,30 @@ def _validate_text(
     return None
 
 
+def _validate_optional_text(value, field_name: str) -> Optional[dict]:
+    """Reject non-string values for optional text args (subject_prefix,
+    subject substring, predicate substring). ``None`` passes through;
+    empty strings pass through (callers treat them as "no filter").
+    Same family as ``_validate_text`` but allows omission.
+
+    Without this guard, ``subject_prefix=123`` reaches core where
+    ``.lower()`` raises raw ``AttributeError`` deep in the search
+    path. The string-handling tools (query_memory, list_facts,
+    find_similar) all forward these args unchanged.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return {
+            "ok": False,
+            "error": "invalid_text",
+            "field": field_name,
+            "got_type": type(value).__name__,
+            "hint": f"{field_name} must be a string or omitted",
+        }
+    return None
+
+
 def _validate_id(value, field_name: str = "fact_id") -> Optional[dict]:
     """Reject non-string or empty id arguments at the MCP boundary.
 
@@ -269,6 +293,9 @@ def query_memory(
     if err is not None:
         return {"results": [], **err}
     min_gravity = min_grav_validated  # type: ignore[assignment]
+    err = _validate_optional_text(subject_prefix, "subject_prefix")
+    if err is not None:
+        return {"results": [], **err}
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     if layers is not None:
         # Shape check: layers="surface" (string instead of list) used
@@ -644,7 +671,19 @@ def supersede_fact(old_fact_id: str, new_fact_id: str) -> dict:
     delete_fact for that; delete_fact is a destructive primitive for
     secrets and accidental writes.
 
-    Returns {"superseded": true, "old_id", "new_id", "absorbed": [...]}.
+    Returns ``{"superseded": true, "old_id", "new_id", "absorbed": [...]}``
+    on success. On failure returns ``{"superseded": false, "old_id",
+    "new_id", "error", ...}`` — both ids are always echoed so the
+    agent can key on ``result["old_id"]`` in both branches without a
+    KeyError. ``error`` is ``"not_a_factpassport"`` (with ``kind`` =
+    ``meta``/``singularity_fact``/``singularity_meta`` and a hint
+    explaining why the lifecycle op doesn't apply) or ``"not_found"``.
+
+    FactPassport-only by design — MetaFacts have no SPO slot, so
+    "supersede a cluster" has no defined semantics. For destructive
+    removal of any body kind use ``delete_body``; for stale MetaFact
+    data, record contradicting facts and let next-cycle collapse
+    re-aggregate.
     """
     err = _validate_id(old_fact_id, "old_fact_id")
     if err is not None:
@@ -670,7 +709,14 @@ def retire_fact(fact_id: str) -> dict:
     the "we used to think X, now Y" lineage. Use delete_fact only for
     truly destructive removal.
 
-    Returns {"retired": true, "fact_id", "absorbed": [...]}.
+    Returns ``{"retired": true, "fact_id", "absorbed": [...]}`` on
+    success. On failure returns ``{"retired": false, "fact_id",
+    "error", ...}`` — ``fact_id`` is always echoed. ``error`` is
+    ``"not_a_factpassport"`` (with ``kind`` and a hint) when the id
+    points at a MetaFact / singularity body, or ``"not_found"``.
+
+    FactPassport-only by design. See ``supersede_fact`` for the
+    same rationale.
     """
     err = _validate_id(fact_id, "fact_id")
     if err is not None:
@@ -867,6 +913,14 @@ def list_facts(
     if err is not None:
         return [err]
     min_gravity = min_grav_validated  # type: ignore[assignment]
+    for opt_name, opt_val in (
+        ("subject", subject),
+        ("predicate", predicate),
+        ("subject_prefix", subject_prefix),
+    ):
+        err = _validate_optional_text(opt_val, opt_name)
+        if err is not None:
+            return [err]
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     # Validate enum: a typo used to silently produce target_layer=None,
     # which then returned ALL layers — worse than empty because the
@@ -939,6 +993,9 @@ def find_similar(
     if err is not None:
         return {"query": text, "hits": [], **err}
     min_similarity = min_sim_validated  # type: ignore[assignment]
+    err = _validate_optional_text(subject_prefix, "subject_prefix")
+    if err is not None:
+        return {"query": text, "hits": [], **err}
     try:
         hits = _store.find_similar(
             text=text,
@@ -1306,6 +1363,17 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
             "error": "invalid_message_item",
             "indices": bad_items,
             "hint": "each message must be a non-empty string",
+        }
+    # Empty-list reject: symmetric with session_close's
+    # unknown_or_empty_session envelope. record_session([]) used to
+    # half-open a session, never embed anything, and quietly close
+    # to a neutral r_score=0.0 — indistinguishable from a real
+    # heuristic-scored neutral outcome.
+    if not messages:
+        return {
+            "ok": False,
+            "error": "empty_messages",
+            "hint": "messages must contain at least one entry",
         }
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)

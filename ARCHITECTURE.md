@@ -717,15 +717,21 @@ off-centre point — so the attention mass ships as a gentle perturber.
 
 ```
 src/birch/
-  adaptive_gravity.py       AdaptiveWeights — four learned pre-resonance weights, regularised SGD
-  fact.py                   FactPassport dataclass (incl. recent_utility EWMA)
+  adaptive_gravity.py       AdaptiveWeights — five learned pre-resonance weights (w_freshness, w_access, w_graph, w_utility, w_stability), regularised SGD
+  fact.py                   FactPassport dataclass (incl. recent_utility EWMA + forecast_stability)
   meta_fact.py              MetaFact dataclass + lineage + Hawking gravity helper
   gravity.py                GravityEngine — score computation + migration
   black_hole.py             BlackHole — polymorphic sink (facts + metas) + Hawking
   singularity_compactor.py  collapse_singularity() — Union-Find + center of mass
   vector_index.py           VectorIndex — numpy L2-normalised cosine search
-  memory_store.py           MemoryStore — unified API, sessions, RLock, collapse orchestration
-  server.py                 MCP server (FastMCP), threads session_id through
+  memory_store/             MemoryStore package — split for navigability after the unified API crossed 2500 LOC. Composition root `_base.py` (init + lifecycle + _reload atomicity + _sync + _txn) plus five mixin files:
+                              _sessions.py    SessionsMixin — open/push/close/attribution/SGD training step
+                              _facts.py       FactsMixin — CRUD, supersede/retire, set_fact, delete_body, explain_fact/explain_body, polymorphic body navigation
+                              _query.py       QueryMixin — query, find_similar, check_echo
+                              _singularity.py SingularityMixin — collapse + run_forecast (with snapshot revalidation)
+                              _stats.py       StatsMixin — memory_stats
+                            plus `_models.py` (QueryResult, SessionContext) and `_embed_proxy.py` (late-binding embed lookup so monkeypatch.setattr(birch.memory_store, "embed", ...) still propagates to mixin call sites after the split). Public import `from birch.memory_store import MemoryStore` is unchanged.
+  server.py                 MCP server (FastMCP), 19 tools, threads session_id through. Family of boundary validators: _validate_text, _validate_spo_strings, _validate_id, _validate_optional_text, _validate_int, _validate_float, _env_int.
   storage/
     base.py                 StorageBackend protocol + save_*_batch hooks
     sqlite.py               SQLiteBackend — executemany commits, schema migrations
