@@ -46,6 +46,7 @@ class QueryMixin:
     if TYPE_CHECKING:
         _sync: Callable[[], None]
         _txn: Callable[[], Any]
+        _reload: Callable[[], None]
         _resolve_sid: Callable[[Optional[str]], Optional[str]]
         _normalize_spo: Callable[[str, str, str], tuple[str, str, str]]
         _attribute_to: Callable[["SessionContext", str, float], None]
@@ -314,259 +315,275 @@ class QueryMixin:
                         return False
                 return True
 
-            with self._txn():
-                # Re-sync under the write lock; if another process committed
-                # we now hold the authoritative state.
-                self._sync()
+            # query() does heavy mutation under the txn (Hawking
+            # emission registers bodies back into _facts/_engine/
+            # _index/_spo_index; touches mutate access_count and
+            # last_accessed; session attribution writes to
+            # ctx.facts). If any storage call below raises mid-
+            # write, SQLite rolls back the disk but in-memory state
+            # is already mutated and the next _sync sees the same
+            # data_version — the divergence persists. Wrap in
+            # try/except + _reload() — symmetric with add_facts
+            # (1792d4f), collapse_singularity (b9412ab), and
+            # add_fact (just shipped).
+            try:
+                with self._txn():
+                    # Re-sync under the write lock; if another process committed
+                    # we now hold the authoritative state.
+                    self._sync()
 
-                # Revalidate the pre-sync top: another process may have
-                # deprecated / retired / deleted bodies that were in our
-                # snapshot. Drop the vanished ones and replace each
-                # surviving QueryResult's body with the authoritative
-                # post-sync object, so the caller never sees a stale ref.
-                revalidated_top: list[QueryResult] = []
-                for r in top:
-                    if r.fact is not None:
-                        live = self._facts.get(r.fact.fact_id)
-                        if live is None or live.is_deprecated or live.is_expired:
-                            continue
-                        r.fact = live
-                        revalidated_top.append(r)
-                    elif r.meta is not None:
-                        live_meta = self._meta_facts.get(r.meta.meta_id)
-                        if live_meta is None:
-                            continue
-                        r.meta = live_meta
-                        revalidated_top.append(r)
-                # Backfill: if revalidation dropped any hits, re-run the
-                # live search on the now-authoritative state so the caller
-                # gets up to top_k results instead of a short list. Only
-                # runs when we actually lost something — the common case
-                # (nothing was racing) costs nothing.
-                if len(revalidated_top) < len(top):
-                    already_in_top = {r.body_id for r in revalidated_top}
-                    backfill_candidates: list[QueryResult] = []
-                    fresh_sims = self._index.all_similarities(vec)
-                    for fid, sim in fresh_sims.items():
-                        if fid in already_in_top:
-                            continue
-                        fact = self._facts.get(fid)
-                        if fact is None or fact.is_deprecated or fact.is_expired:
-                            continue
-                        if not (min_layer <= fact.layer <= max_layer):
-                            continue
-                        if (allowed_layers is not None
-                                and fact.layer not in allowed_layers):
-                            continue
-                        if fact.gravity_score < min_gravity:
-                            continue
-                        if prefix and not fact.subject.lower().startswith(prefix):
-                            continue
-                        if sim < min_similarity:
-                            continue
-                        backfill_candidates.append(QueryResult(
-                            fact=fact,
-                            similarity=round(sim, 4),
-                            source=layer_labels.get(fact.layer, "kinetic"),
-                        ))
-                    fresh_meta_sims = self._meta_index.all_similarities(vec)
-                    for mid, sim in fresh_meta_sims.items():
-                        if mid in already_in_top:
-                            continue
-                        meta = self._meta_facts.get(mid)
-                        if meta is None:
-                            continue
-                        if not (min_layer <= meta.layer <= max_layer):
-                            continue
-                        if (allowed_layers is not None
-                                and meta.layer not in allowed_layers):
-                            continue
-                        if meta.gravity_score < min_gravity:
-                            continue
-                        if prefix and not any(
-                                (st or "").lower().startswith(prefix)
-                                for st in meta.source_texts):
-                            continue
-                        if sim < min_similarity:
-                            continue
-                        backfill_candidates.append(QueryResult(
-                            meta=meta,
-                            similarity=round(sim, 4),
-                            source=layer_labels.get(meta.layer, "kinetic"),
-                        ))
-                    backfill_candidates.sort(
-                        key=lambda r: r.similarity, reverse=True)
-                    needed = len(top) - len(revalidated_top)
-                    for picked in backfill_candidates[:needed]:
-                        revalidated_top.append(picked)
-                        if picked.fact is not None:
-                            touched_fact_ids.append(picked.fact.fact_id)
-                        elif picked.meta is not None:
-                            touched_meta_ids.append(picked.meta.meta_id)
-                        attribution_pairs.append(
-                            (picked.body_id, picked.similarity))
-                top = revalidated_top
-                # Re-derive the touched / attribution lists from the
-                # surviving top so the persist step does not try to update
-                # bodies that disappeared during the race.
-                kept_after_revalidate = {r.body_id for r in top}
-                touched_fact_ids = [
-                    fid for fid in touched_fact_ids
-                    if fid in kept_after_revalidate
-                ]
-                touched_meta_ids = [
-                    mid for mid in touched_meta_ids
-                    if mid in kept_after_revalidate
-                ]
-                attribution_pairs = [
-                    pair for pair in attribution_pairs
-                    if pair[0] in kept_after_revalidate
-                ]
+                    # Revalidate the pre-sync top: another process may have
+                    # deprecated / retired / deleted bodies that were in our
+                    # snapshot. Drop the vanished ones and replace each
+                    # surviving QueryResult's body with the authoritative
+                    # post-sync object, so the caller never sees a stale ref.
+                    revalidated_top: list[QueryResult] = []
+                    for r in top:
+                        if r.fact is not None:
+                            live = self._facts.get(r.fact.fact_id)
+                            if live is None or live.is_deprecated or live.is_expired:
+                                continue
+                            r.fact = live
+                            revalidated_top.append(r)
+                        elif r.meta is not None:
+                            live_meta = self._meta_facts.get(r.meta.meta_id)
+                            if live_meta is None:
+                                continue
+                            r.meta = live_meta
+                            revalidated_top.append(r)
+                    # Backfill: if revalidation dropped any hits, re-run the
+                    # live search on the now-authoritative state so the caller
+                    # gets up to top_k results instead of a short list. Only
+                    # runs when we actually lost something — the common case
+                    # (nothing was racing) costs nothing.
+                    if len(revalidated_top) < len(top):
+                        already_in_top = {r.body_id for r in revalidated_top}
+                        backfill_candidates: list[QueryResult] = []
+                        fresh_sims = self._index.all_similarities(vec)
+                        for fid, sim in fresh_sims.items():
+                            if fid in already_in_top:
+                                continue
+                            fact = self._facts.get(fid)
+                            if fact is None or fact.is_deprecated or fact.is_expired:
+                                continue
+                            if not (min_layer <= fact.layer <= max_layer):
+                                continue
+                            if (allowed_layers is not None
+                                    and fact.layer not in allowed_layers):
+                                continue
+                            if fact.gravity_score < min_gravity:
+                                continue
+                            if prefix and not fact.subject.lower().startswith(prefix):
+                                continue
+                            if sim < min_similarity:
+                                continue
+                            backfill_candidates.append(QueryResult(
+                                fact=fact,
+                                similarity=round(sim, 4),
+                                source=layer_labels.get(fact.layer, "kinetic"),
+                            ))
+                        fresh_meta_sims = self._meta_index.all_similarities(vec)
+                        for mid, sim in fresh_meta_sims.items():
+                            if mid in already_in_top:
+                                continue
+                            meta = self._meta_facts.get(mid)
+                            if meta is None:
+                                continue
+                            if not (min_layer <= meta.layer <= max_layer):
+                                continue
+                            if (allowed_layers is not None
+                                    and meta.layer not in allowed_layers):
+                                continue
+                            if meta.gravity_score < min_gravity:
+                                continue
+                            if prefix and not any(
+                                    (st or "").lower().startswith(prefix)
+                                    for st in meta.source_texts):
+                                continue
+                            if sim < min_similarity:
+                                continue
+                            backfill_candidates.append(QueryResult(
+                                meta=meta,
+                                similarity=round(sim, 4),
+                                source=layer_labels.get(meta.layer, "kinetic"),
+                            ))
+                        backfill_candidates.sort(
+                            key=lambda r: r.similarity, reverse=True)
+                        needed = len(top) - len(revalidated_top)
+                        for picked in backfill_candidates[:needed]:
+                            revalidated_top.append(picked)
+                            if picked.fact is not None:
+                                touched_fact_ids.append(picked.fact.fact_id)
+                            elif picked.meta is not None:
+                                touched_meta_ids.append(picked.meta.meta_id)
+                            attribution_pairs.append(
+                                (picked.body_id, picked.similarity))
+                    top = revalidated_top
+                    # Re-derive the touched / attribution lists from the
+                    # surviving top so the persist step does not try to update
+                    # bodies that disappeared during the race.
+                    kept_after_revalidate = {r.body_id for r in top}
+                    touched_fact_ids = [
+                        fid for fid in touched_fact_ids
+                        if fid in kept_after_revalidate
+                    ]
+                    touched_meta_ids = [
+                        mid for mid in touched_meta_ids
+                        if mid in kept_after_revalidate
+                    ]
+                    attribution_pairs = [
+                        pair for pair in attribution_pairs
+                        if pair[0] in kept_after_revalidate
+                    ]
 
-                # Hawking emission as a two-phase commit: PEEK candidates
-                # without popping, merge into the ranking, take top_k,
-                # then COMMIT (actually emit) only those that survived.
-                # Previously, hawking_emit popped and re-registered every
-                # eligible body even if it later fell below top_k — a
-                # state mutation the caller never received. min_similarity
-                # is applied to Hawking candidates too, symmetric with
-                # live results.
-                if hawking:
-                    fact_candidates = self._hole.peek_hawking_candidates(
-                        vec, predicate=_fact_predicate)
-                    meta_candidates = self._hole.peek_hawking_meta_candidates(
-                        vec,
-                        threshold=_META_HAWKING_THRESHOLD,
-                        predicate=_meta_predicate,
-                    )
-                    for fact, sim in fact_candidates:
-                        if sim < min_similarity:
-                            continue
-                        top.append(QueryResult(
-                            fact=fact,
-                            similarity=round(sim, 4),
-                            source="hawking",
-                        ))
-                    for meta, sim in meta_candidates:
-                        if sim < min_similarity:
-                            continue
-                        top.append(QueryResult(
-                            meta=meta,
-                            similarity=round(sim, 4),
-                            source="hawking_meta",
-                        ))
-
-                # Re-sort after Hawking additions and re-clamp to top_k.
-                top.sort(key=lambda r: r.similarity, reverse=True)
-                top = top[:top_k]
-                kept_ids = {r.body_id for r in top}
-
-                # Commit: actually emit ONLY the Hawking survivors. Bodies
-                # that fell out of top_k stay in the singularity, untouched.
-                if hawking:
-                    hawking_survivor_fact_ids = {
-                        r.fact.fact_id for r in top
-                        if r.source == "hawking" and r.fact is not None
-                    }
-                    hawking_survivor_meta_ids = {
-                        r.meta.meta_id for r in top
-                        if r.source == "hawking_meta" and r.meta is not None
-                    }
-                    emitted = self._hole.hawking_emit(
-                        vec,
-                        predicate=_fact_predicate,
-                        only_ids=hawking_survivor_fact_ids or None,
-                    ) if hawking_survivor_fact_ids else []
-                    meta_emitted = self._hole.hawking_emit_metas(
-                        vec,
-                        threshold=_META_HAWKING_THRESHOLD,
-                        predicate=_meta_predicate,
-                        only_ids=hawking_survivor_meta_ids or None,
-                    ) if hawking_survivor_meta_ids else []
-
-                    for fact in emitted:
-                        self._facts[fact.fact_id] = fact
-                        self._engine.register(fact)
-                        self._index.add(fact.fact_id, fact.vector)
-                        if not fact.is_deprecated:
-                            key = self._normalize_spo(
-                                fact.subject, fact.predicate, fact.object)
-                            self._spo_index.setdefault(key, fact.fact_id)
-                        if self._storage:
-                            self._storage.save_fact(fact)
-                        touched_fact_ids.append(fact.fact_id)
-                        sim = VectorIndex.similarity(vec, fact.vector)
-                        attribution_pairs.append((fact.fact_id, sim))
-                    for meta in meta_emitted:
-                        self._meta_facts[meta.meta_id] = meta
-                        self._engine.register(meta)
-                        self._meta_index.add(meta.meta_id, meta.vector)
-                        if (self._storage
-                                and hasattr(self._storage, "save_meta_fact")):
-                            self._storage.save_meta_fact(meta)
-                        touched_meta_ids.append(meta.meta_id)
-                        sim = VectorIndex.similarity(vec, meta.vector)
-                        attribution_pairs.append((meta.meta_id, sim))
-
-                # Restrict downstream work to bodies that survived top_k.
-                touched_fact_ids = [
-                    fid for fid in touched_fact_ids if fid in kept_ids
-                ]
-                touched_meta_ids = [
-                    mid for mid in touched_meta_ids if mid in kept_ids
-                ]
-                attribution_pairs = [
-                    pair for pair in attribution_pairs if pair[0] in kept_ids
-                ]
-
-                # Apply touch + attribution to AUTHORITATIVE objects (the
-                # ones currently in self._facts / self._meta_facts after
-                # _sync). Previously we touched pre-sync object refs and
-                # then saved fresh objects without re-applying the touch,
-                # so the bump silently vanished across a multi-process
-                # reload.
-                fresh_facts: list[FactPassport] = []
-                for fid in touched_fact_ids:
-                    f = self._facts.get(fid)
-                    if f is None:
-                        continue
-                    f.touch()
-                    fresh_facts.append(f)
-                fresh_metas: list[MetaFact] = []
-                for mid in touched_meta_ids:
-                    m = self._meta_facts.get(mid)
-                    if m is None:
-                        continue
-                    m.touch()
-                    fresh_metas.append(m)
-
-                fresh_ctx = self._sessions.get(sid) if sid else None
-                if fresh_ctx is not None:
-                    for body_id, sim in attribution_pairs:
-                        self._attribute_to(fresh_ctx, body_id, sim)
-
-                if self._storage:
-                    if fresh_facts:
-                        self._storage.save_facts(fresh_facts)
-                    if (fresh_metas
-                            and hasattr(self._storage, "save_meta_facts")):
-                        self._storage.save_meta_facts(fresh_metas)
-                    if (fresh_ctx is not None
-                            and hasattr(self._storage, "save_open_session")):
-                        self._storage.save_open_session(
-                            fresh_ctx.session_id,
-                            fresh_ctx.messages,
-                            fresh_ctx.vectors,
-                            fresh_ctx.facts,
-                            time.time(),
+                    # Hawking emission as a two-phase commit: PEEK candidates
+                    # without popping, merge into the ranking, take top_k,
+                    # then COMMIT (actually emit) only those that survived.
+                    # Previously, hawking_emit popped and re-registered every
+                    # eligible body even if it later fell below top_k — a
+                    # state mutation the caller never received. min_similarity
+                    # is applied to Hawking candidates too, symmetric with
+                    # live results.
+                    if hawking:
+                        fact_candidates = self._hole.peek_hawking_candidates(
+                            vec, predicate=_fact_predicate)
+                        meta_candidates = self._hole.peek_hawking_meta_candidates(
+                            vec,
+                            threshold=_META_HAWKING_THRESHOLD,
+                            predicate=_meta_predicate,
                         )
-                # query() touches every returned body
-                # (access_count / last_accessed), which feeds gravity
-                # → galaxy → forecast. Without a mutation bump the
-                # forecast cache could return stale results on a
-                # back-to-back query+forecast pattern.
-                if touched_fact_ids or touched_meta_ids:
-                    self._bump_mutation_locked()
+                        for fact, sim in fact_candidates:
+                            if sim < min_similarity:
+                                continue
+                            top.append(QueryResult(
+                                fact=fact,
+                                similarity=round(sim, 4),
+                                source="hawking",
+                            ))
+                        for meta, sim in meta_candidates:
+                            if sim < min_similarity:
+                                continue
+                            top.append(QueryResult(
+                                meta=meta,
+                                similarity=round(sim, 4),
+                                source="hawking_meta",
+                            ))
+
+                    # Re-sort after Hawking additions and re-clamp to top_k.
+                    top.sort(key=lambda r: r.similarity, reverse=True)
+                    top = top[:top_k]
+                    kept_ids = {r.body_id for r in top}
+
+                    # Commit: actually emit ONLY the Hawking survivors. Bodies
+                    # that fell out of top_k stay in the singularity, untouched.
+                    if hawking:
+                        hawking_survivor_fact_ids = {
+                            r.fact.fact_id for r in top
+                            if r.source == "hawking" and r.fact is not None
+                        }
+                        hawking_survivor_meta_ids = {
+                            r.meta.meta_id for r in top
+                            if r.source == "hawking_meta" and r.meta is not None
+                        }
+                        emitted = self._hole.hawking_emit(
+                            vec,
+                            predicate=_fact_predicate,
+                            only_ids=hawking_survivor_fact_ids or None,
+                        ) if hawking_survivor_fact_ids else []
+                        meta_emitted = self._hole.hawking_emit_metas(
+                            vec,
+                            threshold=_META_HAWKING_THRESHOLD,
+                            predicate=_meta_predicate,
+                            only_ids=hawking_survivor_meta_ids or None,
+                        ) if hawking_survivor_meta_ids else []
+
+                        for fact in emitted:
+                            self._facts[fact.fact_id] = fact
+                            self._engine.register(fact)
+                            self._index.add(fact.fact_id, fact.vector)
+                            if not fact.is_deprecated:
+                                key = self._normalize_spo(
+                                    fact.subject, fact.predicate, fact.object)
+                                self._spo_index.setdefault(key, fact.fact_id)
+                            if self._storage:
+                                self._storage.save_fact(fact)
+                            touched_fact_ids.append(fact.fact_id)
+                            sim = VectorIndex.similarity(vec, fact.vector)
+                            attribution_pairs.append((fact.fact_id, sim))
+                        for meta in meta_emitted:
+                            self._meta_facts[meta.meta_id] = meta
+                            self._engine.register(meta)
+                            self._meta_index.add(meta.meta_id, meta.vector)
+                            if (self._storage
+                                    and hasattr(self._storage, "save_meta_fact")):
+                                self._storage.save_meta_fact(meta)
+                            touched_meta_ids.append(meta.meta_id)
+                            sim = VectorIndex.similarity(vec, meta.vector)
+                            attribution_pairs.append((meta.meta_id, sim))
+
+                    # Restrict downstream work to bodies that survived top_k.
+                    touched_fact_ids = [
+                        fid for fid in touched_fact_ids if fid in kept_ids
+                    ]
+                    touched_meta_ids = [
+                        mid for mid in touched_meta_ids if mid in kept_ids
+                    ]
+                    attribution_pairs = [
+                        pair for pair in attribution_pairs if pair[0] in kept_ids
+                    ]
+
+                    # Apply touch + attribution to AUTHORITATIVE objects (the
+                    # ones currently in self._facts / self._meta_facts after
+                    # _sync). Previously we touched pre-sync object refs and
+                    # then saved fresh objects without re-applying the touch,
+                    # so the bump silently vanished across a multi-process
+                    # reload.
+                    fresh_facts: list[FactPassport] = []
+                    for fid in touched_fact_ids:
+                        f = self._facts.get(fid)
+                        if f is None:
+                            continue
+                        f.touch()
+                        fresh_facts.append(f)
+                    fresh_metas: list[MetaFact] = []
+                    for mid in touched_meta_ids:
+                        m = self._meta_facts.get(mid)
+                        if m is None:
+                            continue
+                        m.touch()
+                        fresh_metas.append(m)
+
+                    fresh_ctx = self._sessions.get(sid) if sid else None
+                    if fresh_ctx is not None:
+                        for body_id, sim in attribution_pairs:
+                            self._attribute_to(fresh_ctx, body_id, sim)
+
+                    if self._storage:
+                        if fresh_facts:
+                            self._storage.save_facts(fresh_facts)
+                        if (fresh_metas
+                                and hasattr(self._storage, "save_meta_facts")):
+                            self._storage.save_meta_facts(fresh_metas)
+                        if (fresh_ctx is not None
+                                and hasattr(self._storage, "save_open_session")):
+                            self._storage.save_open_session(
+                                fresh_ctx.session_id,
+                                fresh_ctx.messages,
+                                fresh_ctx.vectors,
+                                fresh_ctx.facts,
+                                time.time(),
+                            )
+                    # query() touches every returned body
+                    # (access_count / last_accessed), which feeds gravity
+                    # → galaxy → forecast. Without a mutation bump the
+                    # forecast cache could return stale results on a
+                    # back-to-back query+forecast pattern.
+                    if touched_fact_ids or touched_meta_ids:
+                        self._bump_mutation_locked()
+
+            except Exception:
+                self._reload()
+                raise
 
         return top
 

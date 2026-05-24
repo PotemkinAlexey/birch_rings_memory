@@ -82,6 +82,20 @@ class SingularityMixin:
             del self._facts[fid]
             self._index.remove(fid)
             self._drop_from_spo_index(fact)
+            # Unregister from the gravity engine too. delete_fact /
+            # delete_body do this; _absorb_dead used to forget,
+            # leaving absorbed bodies tracked by GravityEngine.tick()
+            # and apply_session_resonance() as if they were still
+            # live. The `is_deprecated or is_expired` guard in tick()
+            # catches the lifecycle-driven absorbs but NOT the
+            # gravity-below-threshold path (line 76) — that body is
+            # neither deprecated nor expired, just dim. After
+            # restart _load_from_storage routes layer=-1 to the hole
+            # and does NOT re-register in engine, so pre-restart and
+            # post-restart behaviour diverged silently. Symmetric
+            # unregister closes both gaps and re-aligns the runtime
+            # with the disk truth.
+            self._engine.unregister(fid)
             if self._storage:
                 # Persist the layer=-1 transition so the body survives
                 # restart inside the singularity (not as a live fact).
@@ -94,6 +108,8 @@ class SingularityMixin:
                 self._hole.absorb_meta(meta)
                 del self._meta_facts[mid]
                 self._meta_index.remove(mid)
+                # Same engine-unregister symmetry for MetaFacts.
+                self._engine.unregister(mid)
                 if self._storage and hasattr(self._storage, "save_meta_fact"):
                     # absorb_meta resets layer to -1, persist that.
                     self._storage.save_meta_fact(meta)

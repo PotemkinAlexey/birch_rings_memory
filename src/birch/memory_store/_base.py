@@ -442,17 +442,33 @@ class MemoryStore(
                 # be read shortly after close in tests / shutdown
                 # handlers).
                 self._last_collapse_error = repr(exc)
+        # cancel_futures only stops PENDING futures; a worker already
+        # running keeps going. So we have to choose between:
+        #  - wait=True: bounded by however long collapse takes;
+        #  - wait=False + closing storage: worker hits closed SQLite
+        #    connection mid-write, surfaces as opaque background
+        #    exception after close().
+        # Pick safety: if the inflight finished (common case), shutdown
+        # and close cleanly. If it timed out, leave the storage handle
+        # open so the still-running worker can finish its writes —
+        # leaking the handle until process exit is much better than
+        # corrupting an in-flight collapse with a closed connection.
+        # The leak is bounded (close() is end-of-life), the corruption
+        # would not be.
+        inflight_done = inflight is None or inflight.done()
         if executor is not None:
-            # If the future already finished above (the common path)
-            # shutdown returns immediately. If it timed out, honour
-            # the bound — cancel anything still pending and skip the
-            # join. Previously this said `wait=True`, which silently
-            # ignored the 5-second timeout above and waited
-            # indefinitely; the timeout was misleading.
-            inflight_done = inflight is None or inflight.done()
             if inflight_done:
                 executor.shutdown(wait=True)
             else:
                 executor.shutdown(wait=False, cancel_futures=True)
         if storage is not None and hasattr(storage, "close"):
-            storage.close()
+            if inflight_done:
+                storage.close()
+            else:
+                # Record the leak so tests / observers can see why
+                # the handle is dangling.
+                self._last_collapse_error = (
+                    (self._last_collapse_error or "")
+                    + " | storage handle leaked: collapse worker still "
+                    "running at close()"
+                ).strip(" |")

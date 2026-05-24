@@ -159,71 +159,86 @@ class FactsMixin:
         key = self._normalize_spo(subject, predicate, obj)
 
         # Fast path: SPO already present — skip the embed entirely.
+        # Wrapped in try/except + _reload so a storage failure inside
+        # _touch_existing (which mutates access_count / last_accessed
+        # on the live fact BEFORE saving) doesn't leak in-memory
+        # touches after a SQLite rollback.
         with self._lock:
             self._sync()
             existing_id = self._spo_index.get(key)
             if existing_id and existing_id in self._facts:
-                with self._txn():
-                    self._sync()
-                    eid = self._spo_index.get(key)
-                    if eid and eid in self._facts:
-                        fact = self._touch_existing(eid, session_id)
-                        return (fact, False) if return_status else fact
-                # Raced away between sync and the write lock — fall through.
+                try:
+                    with self._txn():
+                        self._sync()
+                        eid = self._spo_index.get(key)
+                        if eid and eid in self._facts:
+                            fact = self._touch_existing(eid, session_id)
+                            return (fact, False) if return_status else fact
+                    # Raced away between sync and write lock — fall through.
+                except Exception:
+                    # Storage rolled back; in-memory fact.touch() and
+                    # any session attribution applied inside
+                    # _touch_existing are now divergent from disk.
+                    # Re-anchor before propagating.
+                    self._reload()
+                    raise
 
         # Slow path: embed without holding the lock.
         vec = embed(f"{subject} {predicate} {obj}")
 
-        with self._lock:
-            with self._txn():
-                # Reload under the write lock — the authoritative view.
-                self._sync()
-                # Double-check: another process may have created the same
-                # triple while we were embedding.
-                existing_id = self._spo_index.get(key)
-                if existing_id and existing_id in self._facts:
-                    fact = self._touch_existing(existing_id, session_id)
-                    return (fact, False) if return_status else fact
+        try:
+            with self._lock:
+                with self._txn():
+                    # Reload under the write lock — authoritative view.
+                    self._sync()
+                    # Double-check: another process may have created
+                    # the same triple while we were embedding.
+                    existing_id = self._spo_index.get(key)
+                    if existing_id and existing_id in self._facts:
+                        fact = self._touch_existing(existing_id, session_id)
+                        return (fact, False) if return_status else fact
 
-                sid = self._resolve_sid(session_id)
-                # Preflight: if the embedding model changed under the
-                # store, _index.add() will raise DimensionMismatchError.
-                # Doing it BEFORE we mutate _facts/_engine means a
-                # mismatch leaves no half-state behind (otherwise the
-                # fact would live in _facts + _engine but not in the
-                # vector index, and storage rollback wouldn't undo
-                # the in-memory writes).
-                if (vec and self._index._dim is not None
-                        and len(vec) != self._index._dim):
-                    raise DimensionMismatchError(
-                        f"Embedding dimension mismatch: index has "
-                        f"dim={self._index._dim}, incoming vector has "
-                        f"dim={len(vec)}. The embedding model probably "
-                        f"changed under the store. Pin BIRCH_EMBED_MODEL "
-                        f"or rebuild the store before writing facts."
+                    sid = self._resolve_sid(session_id)
+                    # Preflight dim check BEFORE mutating any state
+                    # so a mismatch leaves no half-state behind.
+                    if (vec and self._index._dim is not None
+                            and len(vec) != self._index._dim):
+                        raise DimensionMismatchError(
+                            f"Embedding dimension mismatch: index has "
+                            f"dim={self._index._dim}, incoming vector "
+                            f"has dim={len(vec)}. The embedding model "
+                            f"probably changed under the store. Pin "
+                            f"BIRCH_EMBED_MODEL or rebuild the store "
+                            f"before writing facts."
+                        )
+                    fact = FactPassport(
+                        subject=subject,
+                        predicate=predicate,
+                        object=obj,
+                        layer=layer,
+                        source_session=sid,
                     )
-                fact = FactPassport(
-                    subject=subject,
-                    predicate=predicate,
-                    object=obj,
-                    layer=layer,
-                    source_session=sid,
-                )
-                fact.vector = vec
-                self._facts[fact.fact_id] = fact
-                self._engine.register(fact)
-                self._index.add(fact.fact_id, vec)
-                self._spo_index[key] = fact.fact_id
-                self._auto_link_fact(fact.fact_id, vec)
-                if self._storage:
-                    self._storage.save_fact(fact)
-                if sid is not None:
-                    ctx = self._sessions.get(sid)
-                    if ctx is not None:
-                        self._attribute_to(ctx, fact.fact_id, 1.0)
-                        self._persist_session_locked(ctx)
-                self._bump_mutation_locked()
-                return (fact, True) if return_status else fact
+                    fact.vector = vec
+                    self._facts[fact.fact_id] = fact
+                    self._engine.register(fact)
+                    self._index.add(fact.fact_id, vec)
+                    self._spo_index[key] = fact.fact_id
+                    self._auto_link_fact(fact.fact_id, vec)
+                    if self._storage:
+                        self._storage.save_fact(fact)
+                    if sid is not None:
+                        ctx = self._sessions.get(sid)
+                        if ctx is not None:
+                            self._attribute_to(ctx, fact.fact_id, 1.0)
+                            self._persist_session_locked(ctx)
+                    self._bump_mutation_locked()
+                    return (fact, True) if return_status else fact
+        except Exception:
+            # Storage rolled back; in-memory _facts/_engine/_index/
+            # _spo_index/_auto_link edges may be partially populated.
+            # Re-anchor every cache to disk truth before propagating.
+            self._reload()
+            raise
 
     def _bump_mutation_locked(self) -> None:
         """Caller must hold self._lock. Single source of truth for

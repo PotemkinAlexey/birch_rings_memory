@@ -193,17 +193,27 @@ class GravityEngine:
 
     def unregister(self, fact_id: str) -> None:
         """Remove a fact from the engine — called on explicit deletion."""
-        self._facts.pop(fact_id, None)
-        self._degrees.pop(fact_id, None)
-        # Drop any edge touching this id so a later re-link of the
-        # same pair (e.g. after a fact is recreated with the same id —
-        # rare, but possible in tests / restart scenarios) increments
-        # the counter once, not zero or many times.
-        stale = {
+        # Identify edges that need cleanup BEFORE dropping the body.
+        stale = [
             edge for edge in self._edges
             if edge[0] == fact_id or edge[1] == fact_id
-        }
+        ]
+        # For each outgoing edge A→B where A is being unregistered,
+        # decrement degree of the surviving target B. Previously the
+        # _edges set was cleared but B's degree (incremented by the
+        # original link call at line 220) stayed inflated until next
+        # _reload rebuilt _degrees from disk's unique edge rows.
+        # Same accounting that storage's delete_edges_for_fact does
+        # on disk; mirror in-memory so graph_score stays honest
+        # without depending on reload.
+        for from_id, to_id in stale:
+            if to_id == fact_id:
+                continue  # B == removed body; _degrees[B] dropped below
+            if to_id in self._degrees:
+                self._degrees[to_id] = max(0, self._degrees[to_id] - 1)
         self._edges.difference_update(stale)
+        self._facts.pop(fact_id, None)
+        self._degrees.pop(fact_id, None)
 
     def link(self, from_id: str, to_id: str) -> None:
         """Record a dependency edge — increases graph degree of ``to_id``

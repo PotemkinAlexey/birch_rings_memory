@@ -343,14 +343,25 @@ class SessionsMixin:
                 # R only to its keys. After session_close pops the ctx
                 # the new attributions vanish along with it.
                 #
-                # Fix: merge the current ctx.facts state into the snapshot
-                # (giving new fact attributions the same R as the
-                # snapshot's — they're part of the same session) and
-                # union new messages into the resonance-write echo bundle.
-                # Same-session writes during close are rare but always
-                # "still part of this conversation"; merging is the
-                # right semantic, retry-with-stale-error is too harsh
-                # for the closing op.
+                # Fix: merge the current ctx.facts state into the
+                # snapshot — giving new fact attributions the same R
+                # as the snapshot's, because they're part of the same
+                # session. Same-session writes during close are rare
+                # but always "still part of this conversation".
+                #
+                # Scope of merge — facts ONLY. messages_snapshot and
+                # vectors_snapshot are intentionally NOT updated:
+                # result.r was already computed lock-free over the
+                # snapshot trajectory and re-running compute_resonance
+                # under the writeback lock would (a) hold the lock
+                # for the heavy compute and (b) potentially churn R
+                # if new messages just barely tip the heuristic.
+                # Late messages therefore don't influence R or the
+                # echo bundle this round; they remain available as
+                # the agent's open ctx — but session_close pops it,
+                # so they're effectively dropped from THIS round.
+                # That's the documented contract; if you need late
+                # messages to count, push them BEFORE session_close.
                 live_ctx = self._sessions.get(sid)
                 if live_ctx is not None:
                     drift_facts = {
