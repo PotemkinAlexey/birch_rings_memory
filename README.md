@@ -569,6 +569,12 @@ layer) with [Vertical Brain](https://github.com/PotemkinAlexey/vertical-brain-fo
 (governance layer) under a unified MCP surface. Pattern is documented
 in [`docs/STRUCTURED_LIVING_MEMORY.md`](docs/STRUCTURED_LIVING_MEMORY.md).
 
+To talk to both backends from one MCP client, install
+[`memorybricks-mcp`](https://github.com/PotemkinAlexey/memorybricks/tree/main/packages/memorybricks-mcp) —
+it spawns `birch-mcp` and the VB server as children and exposes
+`recall` / `remember` / `forget` that route between facts and chunks
+in one call. The native Birch tools above stay available alongside.
+
 ## License
 
 Apache 2.0
