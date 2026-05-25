@@ -259,6 +259,39 @@ def _has_instruction_markers(text: str) -> bool:
     return any(m in text for m in _LLM_INSTRUCTION_MARKERS)
 
 
+def _check_non_empty_after_sanitize(
+    field_values: dict[str, str],
+) -> Optional[dict]:
+    """Re-validate non-emptiness AFTER ``_sanitize_for_llm`` ran.
+
+    The MCP boundary validators (``_validate_text`` /
+    ``_validate_spo_strings``) check non-emptiness BEFORE sanitisation.
+    A payload of pure zero-width Unicode (ZWSP/ZWNJ/ZWJ/BOM) passes
+    those validators (str.strip() doesn't strip zero-width) but the
+    sanitiser strips it to ``""``. Without this re-check the write
+    path would persist an empty subject/predicate/object — a
+    legitimate-looking row that's actually informationless.
+
+    Returns ``None`` if every value still has content after strip(),
+    otherwise a structured ``field_empty_after_sanitization`` error
+    naming the offending fields. Pairs naturally with the existing
+    ``invalid_text`` / ``invalid_fact_fields`` shapes.
+    """
+    bad = [name for name, val in field_values.items() if not val.strip()]
+    if not bad:
+        return None
+    return {
+        "ok": False,
+        "error": "field_empty_after_sanitization",
+        "bad_fields": bad,
+        "hint": (
+            "Input contained only invisible control characters or "
+            "zero-width Unicode; after sanitisation the field is "
+            "empty. Provide visible non-empty content."
+        ),
+    }
+
+
 def _validate_int(
     value, field_name: str, *, lo: int = 1, hi: int = 500,
 ) -> tuple[Optional[int], Optional[dict]]:
@@ -658,6 +691,16 @@ def record_fact(
     subject = _sanitize_for_llm(subject)
     predicate = _sanitize_for_llm(predicate)
     object = _sanitize_for_llm(object)
+    # Re-validate after sanitisation. _validate_spo_strings ran on the
+    # ORIGINAL input; if the input was pure invisible-bytes payload
+    # (ZWSP-only subject etc.) the validator passed but the sanitiser
+    # just stripped it to "". Without this re-check the write path
+    # persists a legitimate-looking row with empty fields.
+    err = _check_non_empty_after_sanitize(
+        {"subject": subject, "predicate": predicate, "object": object}
+    )
+    if err is not None:
+        return err
     # Transaction-honest: add_fact returns created from inside its own
     # write txn, so there's no race window between a fact_exists probe and
     # the insert (same pattern set_fact uses).
@@ -826,16 +869,45 @@ def record_facts(
             "required_fields": list(required),
         }
 
-    # Invisible-char strip per item symmetric with record_fact /
-    # set_fact. Done after all per-item validation passed.
-    triples = [
-        (
-            _sanitize_for_llm(f["subject"]),
-            _sanitize_for_llm(f["predicate"]),
-            _sanitize_for_llm(f["object"]),
-        )
-        for f in facts
-    ]
+    # Invisible-char strip per item + post-sanitisation non-empty
+    # re-check symmetric with record_fact / set_fact. A ZWSP-only
+    # input would pass per-item type validation above but collapse
+    # to "" after sanitisation. Collect every offending item index
+    # so the caller can fix multiple bad items in one round trip
+    # (same pattern as the invalid list above).
+    triples: list[tuple[str, str, str]] = []
+    emptied: list[dict] = []
+    for i, f in enumerate(facts):
+        clean_s = _sanitize_for_llm(f["subject"])
+        clean_p = _sanitize_for_llm(f["predicate"])
+        clean_o = _sanitize_for_llm(f["object"])
+        bad = [
+            name for name, val in (
+                ("subject", clean_s),
+                ("predicate", clean_p),
+                ("object", clean_o),
+            ) if not val.strip()
+        ]
+        if bad:
+            emptied.append({
+                "index": i,
+                "error": "field_empty_after_sanitization",
+                "bad_fields": bad,
+            })
+            continue
+        triples.append((clean_s, clean_p, clean_o))
+    if emptied:
+        return {
+            "ok": False,
+            "error": "invalid_fact_item",
+            "invalid": emptied,
+            "hint": (
+                "Items contained only invisible control characters "
+                "or zero-width Unicode in the listed fields; after "
+                "sanitisation those fields are empty. Provide "
+                "visible non-empty content."
+            ),
+        }
     # Per-item session_id overrides the top-level one — honour the contract
     # spelled out in the docstring. Items without their own session_id fall
     # back to the top-level argument.
@@ -918,6 +990,14 @@ def set_fact(
     subject = _sanitize_for_llm(subject)
     predicate = _sanitize_for_llm(predicate)
     object = _sanitize_for_llm(object)
+    # Re-validate post-sanitisation symmetric with record_fact —
+    # ZWSP-only inputs pass _validate_spo_strings but sanitiser
+    # strips them to "".
+    err = _check_non_empty_after_sanitize(
+        {"subject": subject, "predicate": predicate, "object": object}
+    )
+    if err is not None:
+        return err
     # set_fact -> add_fact -> embed(); wrap so an unreachable embedding
     # provider produces a structured failure instead of raw stacktrace
     # at the MCP boundary (completes the wrap coverage shared with

@@ -344,16 +344,17 @@ class BlackHole:
                 continue
             if predicate is not None and not predicate(rec.fact):
                 continue
-            # Now commit: pop from singularity, remove from bucket,
-            # reset gravity, return. forget_fact handles bucket
-            # lifecycle (lazy prune when empty).
-            self._singularity.pop(fid)
-            idx.remove(fid)
+            # Commit via the single owner of bucket lifecycle:
+            # forget_fact pops singularity, removes from the right
+            # bucket, and lazy-prunes the bucket if it just went
+            # empty. Encapsulates what used to be three manual
+            # operations + a separate prune call; if the bucket
+            # layout changes again, only forget_fact needs to know.
+            self.forget_fact(fid)
             rec.fact.gravity_score = _HAWKING_GRAVITY
             rec.fact.layer = 1
             self._total_emissions += 1
             emitted.append(rec.fact)
-        self._prune_empty_fact_bucket(dim)
         return emitted
 
     def hawking_emit_metas(
@@ -395,13 +396,14 @@ class BlackHole:
                 continue
             if predicate is not None and not predicate(rec.meta):
                 continue
-            self._meta_singularity.pop(mid)
-            idx.remove(mid)
+            # Same single-owner-of-bucket-lifecycle pattern as
+            # hawking_emit (see comment above): forget_meta is the
+            # one place that knows how to pop+remove+prune.
+            self.forget_meta(mid)
             rec.meta.gravity_score = rec.meta.gravity_on_emission(_HAWKING_GRAVITY)
             rec.meta.layer = 1
             self._total_emissions += 1
             emitted.append(rec.meta)
-        self._prune_empty_meta_bucket(dim)
         return emitted
 
     # ── Status ──────────────────────────────────────────────────────────────

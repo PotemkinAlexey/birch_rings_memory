@@ -123,7 +123,22 @@ class SingularityMixin:
         # singularity once, they can fall back in.
         for mid, meta in list(self._meta_facts.items()):
             if meta.gravity_score < _ABSORPTION_THRESHOLD:
-                self._hole.absorb_meta(meta)
+                # Symmetric with the fact-absorption catch above:
+                # absorb_meta rolls back its own state on failure
+                # (original layer restored, no half-state in
+                # singularity), so one bad MetaFact shouldn't abort
+                # the whole sweep and bubble up to session_close.
+                # Body stays live with its original layer, visible
+                # to the next query.
+                try:
+                    self._hole.absorb_meta(meta)
+                except Exception as exc:
+                    _logger.warning(
+                        "_absorb_dead: absorb_meta failed for "
+                        "meta_id=%r; body left live for safety: %s",
+                        mid, exc,
+                    )
+                    continue
                 del self._meta_facts[mid]
                 self._meta_index.remove(mid)
                 # Same engine-unregister symmetry for MetaFacts.
