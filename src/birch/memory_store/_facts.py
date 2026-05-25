@@ -81,20 +81,34 @@ class FactsMixin:
         )
 
     def _auto_link_fact(self, fact_id: str, vec: list[float]) -> None:
-        """Lock must be held. Link new fact to semantically close neighbours."""
+        """Lock must be held. Link new fact to semantically close neighbours.
+
+        Oversample by 1 to absorb the inevitable self-match (the fact
+        was added to ``_index`` before this call). Drop self AND cap
+        the surviving neighbours to ``AUTO_LINK_TOP_K`` — the cap
+        matters in the pathological case where the new fact's vector
+        is identical to several other facts: argpartition's tie-break
+        is undefined, self may not appear in the first ``top_k+1``
+        results, and the call would otherwise wire up ``top_k+1`` real
+        edges instead of ``top_k``. Hard cap closes that gap.
+        """
         if not self._auto_link or len(self._index) < 2:
             return
         neighbours = self._index.search(
             vec, top_k=self.AUTO_LINK_TOP_K + 1, threshold=self.AUTO_LINK_THRESHOLD
         )
+        linked = 0
         for neighbour_id, sim in neighbours:
             if neighbour_id == fact_id:
                 continue
+            if linked >= self.AUTO_LINK_TOP_K:
+                break
             self._engine.link(fact_id, neighbour_id)
             self._engine.link(neighbour_id, fact_id)
             if self._storage:
                 self._storage.save_edge(fact_id, neighbour_id)
                 self._storage.save_edge(neighbour_id, fact_id)
+            linked += 1
 
     def fact_exists(self, subject: str, predicate: str, obj: str) -> bool:
         """Return True if an identical SPO triple is already in the live index."""
@@ -201,11 +215,11 @@ class FactsMixin:
                     sid = self._resolve_sid(session_id)
                     # Preflight dim check BEFORE mutating any state
                     # so a mismatch leaves no half-state behind.
-                    if (vec and self._index._dim is not None
-                            and len(vec) != self._index._dim):
+                    if (vec and self._index.dim is not None
+                            and len(vec) != self._index.dim):
                         raise DimensionMismatchError(
                             f"Embedding dimension mismatch: index has "
-                            f"dim={self._index._dim}, incoming vector "
+                            f"dim={self._index.dim}, incoming vector "
                             f"has dim={len(vec)}. The embedding model "
                             f"probably changed under the store. Pin "
                             f"BIRCH_EMBED_MODEL or rebuild the store "
@@ -406,11 +420,11 @@ class FactsMixin:
                         # New fact — preflight dimension BEFORE we
                         # construct it so a later item's bad dim aborts
                         # the batch cleanly with zero state change.
-                        if (vec and self._index._dim is not None
-                                and len(vec) != self._index._dim):
+                        if (vec and self._index.dim is not None
+                                and len(vec) != self._index.dim):
                             raise DimensionMismatchError(
                                 f"Embedding dimension mismatch in batch: "
-                                f"index has dim={self._index._dim}, "
+                                f"index has dim={self._index.dim}, "
                                 f"incoming vector has dim={len(vec)} for "
                                 f"({s!r}, {p!r}, {o!r}). The embedding "
                                 f"model probably changed under the store."
@@ -1023,11 +1037,11 @@ class FactsMixin:
                         already_existed = True
                     else:
                         # Preflight dim BEFORE any state mutation.
-                        if (vec and self._index._dim is not None
-                                and len(vec) != self._index._dim):
+                        if (vec and self._index.dim is not None
+                                and len(vec) != self._index.dim):
                             raise DimensionMismatchError(
                                 f"Embedding dimension mismatch: "
-                                f"index has dim={self._index._dim}, "
+                                f"index has dim={self._index.dim}, "
                                 f"incoming vector has dim={len(vec)}. "
                                 f"Pin BIRCH_EMBED_MODEL or rebuild "
                                 f"the store before set_fact."

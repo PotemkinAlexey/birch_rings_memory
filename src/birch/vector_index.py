@@ -42,6 +42,21 @@ class VectorIndex:
     def __contains__(self, fact_id: str) -> bool:
         return fact_id in self._id_to_row
 
+    @property
+    def dim(self) -> Optional[int]:
+        """Active embedding dimension, or ``None`` if the index is empty.
+
+        Public read-only view of the internal ``_dim`` so callers (live
+        write paths in ``_facts``, BlackHole.absorb / absorb_meta) can
+        preflight dim compatibility without reaching into a name-
+        mangled private attribute. Keeps the encapsulation contract:
+        renaming the storage field tomorrow does not break every
+        consumer. Returns the active dim of an established index, or
+        ``None`` when the index is empty (a future ``add`` will
+        establish a new dim, see remove() docstring).
+        """
+        return self._dim
+
     @staticmethod
     def _normalise(vec: np.ndarray) -> np.ndarray:
         norm = float(np.linalg.norm(vec))

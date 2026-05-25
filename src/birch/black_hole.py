@@ -80,12 +80,12 @@ class BlackHole:
         # Pre-flight: index.add will raise if dims mismatch — do the
         # raise here BEFORE any state mutation. Empty index accepts
         # any dim (returns no-op), so first absorption always works.
-        if fact.vector and self._index._dim is not None \
-                and len(fact.vector) != self._index._dim:
+        if fact.vector and self._index.dim is not None \
+                and len(fact.vector) != self._index.dim:
             raise DimensionMismatchError(
                 f"BlackHole.absorb: live fact vector dim="
                 f"{len(fact.vector)} cannot join singularity index "
-                f"dim={self._index._dim}. Either run "
+                f"dim={self._index.dim}. Either run "
                 f"singularity collapse to bucket by dim, or rebuild "
                 f"the store."
             )
@@ -120,12 +120,12 @@ class BlackHole:
         mismatch (mixed-dim singularity after model swap) cannot
         leave the meta half-absorbed.
         """
-        if meta.vector and self._meta_index._dim is not None \
-                and len(meta.vector) != self._meta_index._dim:
+        if meta.vector and self._meta_index.dim is not None \
+                and len(meta.vector) != self._meta_index.dim:
             raise DimensionMismatchError(
                 f"BlackHole.absorb_meta: meta vector dim="
                 f"{len(meta.vector)} cannot join meta-singularity "
-                f"index dim={self._meta_index._dim}. Run collapse "
+                f"index dim={self._meta_index.dim}. Run collapse "
                 f"to bucket by dim, or rebuild the store."
             )
         meta.layer = -1
