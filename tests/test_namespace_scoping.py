@@ -202,6 +202,51 @@ def test_add_facts_namespaces_length_mismatch_raises(tmp_path):
         )
 
 
+def test_add_facts_same_spo_across_namespaces_not_in_batch_dupe(tmp_path):
+    """Regression: ``seen_in_batch`` used to key on (s, p, o) only.
+
+    A batch like ``add_facts([("api","uses","PG"), ("api","uses","PG")],
+    namespaces=["WORK/A", "WORK/B"])`` silently aliased the second
+    item to the first occurrence (``duplicate_in_batch=True``) and
+    attributed both to WORK/A — the exact failure mode Step 1's
+    per-namespace dedup is meant to exclude. The fix widened the
+    seen_in_batch key to (namespace, s, p, o); this test pins the
+    runtime contract so a future narrowing regresses loudly instead
+    of quietly.
+    """
+    s = MemoryStore(db_path=str(tmp_path / "ns.db"))
+    statuses = s.add_facts(
+        [("api", "uses", "Postgres"), ("api", "uses", "Postgres")],
+        namespaces=["WORK/A", "WORK/B"],
+        return_status=True,
+    )
+    # Neither item is a duplicate; both are brand-new facts.
+    assert statuses[0]["duplicate_in_batch"] is False
+    assert statuses[1]["duplicate_in_batch"] is False
+    assert statuses[0]["already_existed"] is False
+    assert statuses[1]["already_existed"] is False
+    # The two facts are distinct objects in their respective namespaces.
+    assert statuses[0]["fact"].fact_id != statuses[1]["fact"].fact_id
+    assert statuses[0]["fact"].namespace == "WORK/A"
+    assert statuses[1]["fact"].namespace == "WORK/B"
+
+
+def test_add_facts_same_spo_same_namespace_still_in_batch_dupe(tmp_path):
+    """Companion to the above — within a single namespace, a repeated
+    SPO in the same batch is still correctly flagged as a duplicate.
+    The wider key must not weaken the in-batch dedup it exists for."""
+    s = MemoryStore(db_path=str(tmp_path / "ns.db"))
+    statuses = s.add_facts(
+        [("api", "uses", "Postgres"), ("api", "uses", "Postgres")],
+        namespaces=["WORK/A", "WORK/A"],
+        return_status=True,
+    )
+    assert statuses[0]["duplicate_in_batch"] is False
+    assert statuses[1]["duplicate_in_batch"] is True
+    # Both entries map to the same fact_id.
+    assert statuses[0]["fact"].fact_id == statuses[1]["fact"].fact_id
+
+
 # --- SQLite persistence + migration -------------------------------------
 
 
