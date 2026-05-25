@@ -9,6 +9,17 @@ from .centroid import centroid, dispersion
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
+    # Dim-mismatch reject — zip would silently truncate to the shorter
+    # length, giving a "kinda similar" score that lies. After an
+    # embedding-model swap, old echo centroids on disk have the old
+    # dimension; new query vectors have the new one — a quietly
+    # truncated cosine would trigger ghost echo matches and apply
+    # retroactive penalty to the wrong facts. Treat as no-match so
+    # stale-dim centroids age out via TTL instead of poisoning live
+    # query attribution. Symmetric with VectorIndex which raises
+    # DimensionMismatchError on write paths.
+    if len(a) != len(b):
+        return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(x * x for x in b))
@@ -60,7 +71,18 @@ def bundle(
         ]
         total = sum(distances)
         if total == 0:
-            break
+            # All remaining vectors are identical to existing centers
+            # (a user resending the same message N times to the same
+            # session is the realistic trigger). K-means++ has nothing
+            # more to pick — collapse to single-centroid bundle so the
+            # downstream cluster-assignment loop doesn't index past
+            # the end of `centers` (which would have raised IndexError
+            # on every session_close that hit this path).
+            return ClusterBundle(
+                centroids=[centroid(vectors)],
+                k=1,
+                inertia=0.0,
+            )
         r = rng.random() * total
         cumulative = 0.0
         for i, d in enumerate(distances):

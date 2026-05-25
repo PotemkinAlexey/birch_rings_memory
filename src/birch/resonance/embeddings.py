@@ -41,8 +41,42 @@ _MODEL = os.environ.get("BIRCH_EMBED_MODEL", "nomic-embed-text")
 # NEVER retried — 4xx is a client bug, 5xx is the model failing on the
 # same input, neither benefits from blind resend. Override the
 # attempt count with BIRCH_EMBED_RETRIES (default 2 = one retry).
-_RETRY_ATTEMPTS = max(1, int(os.environ.get("BIRCH_EMBED_RETRIES", "2")))
-_RETRY_BACKOFF_S = float(os.environ.get("BIRCH_EMBED_RETRY_BACKOFF_S", "0.2"))
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    """Tolerant int env parse — same contract as server._env_int.
+    Garbage values MUST NOT crash module import (the MCP server has
+    to come up so it can return structured errors from tool calls).
+    Out-of-range clamps."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    """Tolerant float env parse. NaN / Infinity fall back to default
+    too — they're parseable but poison every downstream arithmetic."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(lo, min(hi, value))
+
+
+_RETRY_ATTEMPTS = _env_int("BIRCH_EMBED_RETRIES", 2, lo=1, hi=10)
+_RETRY_BACKOFF_S = _env_float(
+    "BIRCH_EMBED_RETRY_BACKOFF_S", 0.2, lo=0.0, hi=10.0,
+)
 
 _BATCH_ENDPOINT = f"{_BASE_URL}/api/embed"
 _LEGACY_ENDPOINT = f"{_BASE_URL}/api/embeddings"

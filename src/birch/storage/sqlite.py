@@ -429,7 +429,21 @@ class SQLiteBackend:
                     # Legacy rows stored just the ids — uniform weight 1.0.
                     fact_weights = {fid: 1.0 for fid in parsed}
                 elif isinstance(parsed, dict):
-                    fact_weights = {fid: float(w) for fid, w in parsed.items()}
+                    # Coerce + finite-check each weight. NaN / Infinity
+                    # in a stored weight would poison resonance
+                    # propagation downstream (apply_session_resonance
+                    # does r * weight; recent_utility EWMA same). Drop
+                    # the bad pair rather than entire session.
+                    import math as _math
+                    fact_weights = {}
+                    for fid, w in parsed.items():
+                        try:
+                            wf = float(w)
+                        except (TypeError, ValueError):
+                            continue
+                        if not _math.isfinite(wf):
+                            continue
+                        fact_weights[fid] = max(0.0, min(1.0, wf))
                 else:
                     fact_weights = {}
                 centroids = _safe_loads(r["centroids"], None)
@@ -525,9 +539,20 @@ class SQLiteBackend:
                 # ValueError if any value were non-numeric. Doing it
                 # at the loader gives the row a chance to be dropped
                 # cleanly instead of taking startup down.
+                import math as _math
                 coerced_facts: dict[str, float] = {}
                 for k, v in facts.items():
-                    coerced_facts[str(k)] = float(v)
+                    wf = float(v)
+                    if not _math.isfinite(wf):
+                        # NaN / Infinity in a stored attribution weight
+                        # would poison resonance_sum / recent_utility
+                        # downstream (apply_session_resonance does
+                        # r * weight). Reject the whole row — caller's
+                        # tolerant-load contract drops it.
+                        raise ValueError(
+                            "facts weight contains NaN or Infinity"
+                        )
+                    coerced_facts[str(k)] = max(0.0, min(1.0, wf))
                 # Vectors must be list[list[float]] with consistent dim.
                 # The consumer (compute_resonance → score_repetition →
                 # centroid) takes dim from vectors[0] and indexes every
@@ -716,25 +741,66 @@ class SQLiteBackend:
         self._maybe_commit()
 
     def load_adaptive_weights(self) -> AdaptiveWeights | None:
-        """Return the persisted weights, or None if the store has none yet."""
-        row = self._conn.execute(
-            "SELECT w_freshness, w_access, w_graph, w_utility, w_stability, "
-            "train_count FROM adaptive_weights WHERE id = 1"
-        ).fetchone()
+        """Return the persisted weights, or None if the store has none yet.
+
+        Tolerant: every other loader (facts / metas / open_sessions /
+        echo_sessions) drops corrupt rows and lets startup continue
+        with a degraded view. adaptive_weights used to be the lone
+        loader that crashed init on a malformed row — non-numeric
+        cell, NaN sneaked past sanitize(), corrupt train_count.
+        Now we log and fall back to ``None`` (= compute_gravity
+        gets the hand-tuned prior via AdaptiveWeights.from_prior),
+        symmetric with the rest of the storage philosophy.
+        """
+        import math as _math
+        try:
+            row = self._conn.execute(
+                "SELECT w_freshness, w_access, w_graph, w_utility, "
+                "w_stability, train_count FROM adaptive_weights "
+                "WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            _logger.warning(
+                "load_adaptive_weights: SQLite read failed (%s) — "
+                "falling back to prior weights", exc,
+            )
+            return None
         if row is None:
             return None
-        weights = AdaptiveWeights(
-            w_freshness=row["w_freshness"],
-            w_access=row["w_access"],
-            w_graph=row["w_graph"],
-            w_utility=(
-                row["w_utility"] if row["w_utility"] is not None else 0.10
-            ),
-            w_stability=(
-                row["w_stability"] if row["w_stability"] is not None else 0.05
-            ),
-            train_count=int(row["train_count"]),
-        )
+        try:
+            fields = {
+                "w_freshness": float(row["w_freshness"]),
+                "w_access": float(row["w_access"]),
+                "w_graph": float(row["w_graph"]),
+                "w_utility": float(
+                    row["w_utility"]
+                    if row["w_utility"] is not None else 0.10
+                ),
+                "w_stability": float(
+                    row["w_stability"]
+                    if row["w_stability"] is not None else 0.05
+                ),
+                "train_count": int(row["train_count"]),
+            }
+        except (TypeError, ValueError) as exc:
+            _logger.warning(
+                "load_adaptive_weights: corrupted cell (%s) — "
+                "falling back to prior weights", exc,
+            )
+            return None
+        # Reject NaN / Infinity BEFORE sanitize. sanitize clamps to
+        # [0, BUDGET] but NaN survives min/max in Python and would
+        # poison every gravity computation thereafter.
+        if not all(
+            _math.isfinite(v) for k, v in fields.items()
+            if k != "train_count"
+        ):
+            _logger.warning(
+                "load_adaptive_weights: non-finite weight on disk — "
+                "falling back to prior weights",
+            )
+            return None
+        weights = AdaptiveWeights(**fields)  # type: ignore[arg-type]
         # Sanitise: a row that was corrupted, manually edited, or written
         # by an old version with a different invariant must not be served
         # to compute_gravity as-is. Clamp non-negative and renormalise to

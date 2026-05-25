@@ -72,8 +72,15 @@ def test_load_open_sessions_coerces_int_facts_to_float(tmp_path):
     backend2.close()
     assert len(sessions) == 1
     facts = sessions[0]["facts"]
-    assert facts == {"f1": 1.0, "f2": 2.0}
+    # f1=1 round-trips as 1.0; f2=2 is out-of-range (weights live in
+    # [0, 1] as relevance weights) and gets clamped to 1.0 at the
+    # loader boundary — same clamp the finite-check adds to reject
+    # NaN/Infinity. Loader-side clamp is the right place: consumers
+    # of fact attribution can then trust the invariant without
+    # re-checking.
+    assert facts == {"f1": 1.0, "f2": 1.0}
     assert all(isinstance(v, float) for v in facts.values())
+    assert all(0.0 <= v <= 1.0 for v in facts.values())
 
 
 # --- P1: collapse_singularity bumps mutation -----------------------------
