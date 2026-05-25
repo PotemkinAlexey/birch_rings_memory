@@ -41,6 +41,24 @@ def _validate_text(
             "got_type": type(value).__name__,
             "hint": f"{field_name} must be a non-empty string",
         }
+    # Length cap — defence against DoS / billing. _MAX_FIELD_LEN is
+    # evaluated at module import time AFTER this function is defined
+    # in source order, so the lookup happens at call time via the
+    # module globals (already in scope by the time any MCP tool fires).
+    if len(value) > _MAX_FIELD_LEN:
+        return {
+            "ok": False,
+            "error": "field_too_long",
+            "field": field_name,
+            "got_length": len(value),
+            "limit": _MAX_FIELD_LEN,
+            "hint": (
+                f"{field_name} is capped at {_MAX_FIELD_LEN} chars. "
+                f"Split into multiple atomic facts or raise "
+                f"BIRCH_MAX_FIELD_LEN if your deployment can afford "
+                f"the embedding cost."
+            ),
+        }
     return None
 
 
@@ -153,6 +171,94 @@ _RECORD_FACTS_BATCH_CAP = _env_int(
 )
 
 
+# Per-field character cap for text inputs at the MCP boundary
+# (S/P/O strings, query_memory text, session_message text). Defence
+# against DoS / billing: an agent looping with a 10 MB log dump
+# would otherwise pay full embedding-provider cost on every call,
+# write a multi-megabyte row to SQLite, and return a JSON response
+# the consumer has to parse and feed back into LLM context.
+#
+# 2000 chars is comfortable for atomic SPO triples and conversational
+# message turns; tunable down for stricter deployments or up when
+# the deployment is offline and the operator has audited the cost
+# profile. Lower bound 128 prevents accidental tiny caps that brick
+# legitimate use.
+_MAX_FIELD_LEN = _env_int(
+    "BIRCH_MAX_FIELD_LEN", 2000, lo=128, hi=200_000,
+)
+
+
+# Control characters that are forbidden in any text field flowing
+# through the MCP boundary. C0 control codes (0x00-0x1F except TAB
+# / LF / CR) and DEL (0x7F) make zero semantic sense in user-facing
+# text — their presence almost always signals binary content, a
+# broken decoder, or a deliberate attempt to smuggle invisible
+# bytes past a downstream LLM's tokenizer. Symmetric for zero-width
+# Unicode (ZWSP / ZWNJ / ZWJ / BOM) which is the standard prompt-
+# injection smuggling vector for LLM context.
+_BANNED_CONTROL = {chr(c) for c in range(0x00, 0x20)} \
+    - {"\t", "\n", "\r"}
+_BANNED_CONTROL.add("\x7f")          # DEL
+_BANNED_ZERO_WIDTH = {"​", "‌", "‍", "﻿"}
+_BANNED_CHARS = _BANNED_CONTROL | _BANNED_ZERO_WIDTH
+
+
+def _sanitize_for_llm(text: str) -> str:
+    """Strip dangerous invisible characters from text crossing the MCP
+    boundary into or out of the store.
+
+    This is NOT a prompt-injection silver bullet. The consumer of
+    ``query_memory`` results is still responsible for wrapping
+    retrieved bodies in clear structural delimiters (XML tags, JSON
+    fences, etc.) before feeding them into a downstream LLM context.
+
+    What this DOES do:
+      - Removes ASCII C0 control codes (except TAB / LF / CR which
+        are legitimate in body text).
+      - Removes DEL (0x7F).
+      - Removes zero-width Unicode (ZWSP / ZWNJ / ZWJ / BOM) — the
+        standard smuggling vector for invisible "ignore previous
+        instructions" payloads.
+
+    What this does NOT do:
+      - Rewrite legitimate-looking model-instruction markers (e.g.
+        ``<|im_start|>``, ``[INST]``, ``<<SYS>>``). Aggressively
+        replacing those breaks legitimate discussion of prompts
+        and is itself a security footgun (false positives become
+        a content-filtering bypass surface). The honest answer is
+        "consumer must wrap"; this helper buys defence-in-depth
+        on the easy invisible bytes only.
+    """
+    if not text:
+        return text
+    if not any(c in _BANNED_CHARS for c in text):
+        return text     # fast path: zero alloc for the common case
+    return "".join(c for c in text if c not in _BANNED_CHARS)
+
+
+# Known model-instruction markers. Used for DETECTION only — never
+# rewritten. query_memory / find_similar attach a ``has_instruction
+# _markers=True`` flag to a result when the body contains any of
+# these substrings, so the consumer knows to wrap aggressively
+# before passing it into LLM context. False positives are fine —
+# the flag is advisory, not a block.
+_LLM_INSTRUCTION_MARKERS = (
+    "<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|system|>",
+    "<|user|>", "<|assistant|>",
+    "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>",
+    "<|begin_of_text|>", "<|end_of_text|>",
+    "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+)
+
+
+def _has_instruction_markers(text: str) -> bool:
+    """True if the text contains any known LLM control marker.
+    Detection-only — used to advise the consumer to wrap."""
+    if not text:
+        return False
+    return any(m in text for m in _LLM_INSTRUCTION_MARKERS)
+
+
 def _validate_int(
     value, field_name: str, *, lo: int = 1, hi: int = 500,
 ) -> tuple[Optional[int], Optional[dict]]:
@@ -241,15 +347,40 @@ def _validate_spo_strings(
         if not isinstance(val, str) or not val.strip():
             bad.append(name)
             types[name] = type(val).__name__
-    if not bad:
-        return None
-    return {
-        "ok": False,
-        "error": "invalid_fact_fields",
-        "bad_fields": bad,
-        "got_types": types,
-        "hint": "subject, predicate, object must be non-empty strings.",
-    }
+    if bad:
+        return {
+            "ok": False,
+            "error": "invalid_fact_fields",
+            "bad_fields": bad,
+            "got_types": types,
+            "hint": "subject, predicate, object must be non-empty strings.",
+        }
+    # Length cap — symmetric with _validate_text. SPO triples that
+    # exceed the cap are usually paste accidents (a log dump landing
+    # in `object`) or malicious payload-stuffing. Either way, the
+    # embedding round-trip + the SQLite row would be expensive and
+    # the resulting fact unparseable. Reject with structured detail
+    # so the agent knows which field to split.
+    too_long: list[str] = []
+    lengths: dict[str, int] = {}
+    for name, val in required:
+        if len(val) > _MAX_FIELD_LEN:
+            too_long.append(name)
+            lengths[name] = len(val)
+    if too_long:
+        return {
+            "ok": False,
+            "error": "field_too_long",
+            "bad_fields": too_long,
+            "got_lengths": lengths,
+            "limit": _MAX_FIELD_LEN,
+            "hint": (
+                f"S/P/O fields are each capped at {_MAX_FIELD_LEN} "
+                f"chars. Split the offending field into multiple "
+                f"atomic facts, or raise BIRCH_MAX_FIELD_LEN."
+            ),
+        }
+    return None
 
 
 def _embedding_error_response(exc: EmbeddingError) -> dict:
@@ -394,6 +525,39 @@ def query_memory(
         return _embedding_error_response(exc)
     hits = [r.to_mcp_dict() for r in results]
 
+    # Prompt-injection advisory: scan retrieved bodies for known LLM
+    # control markers and flag the hit so the consumer wraps it
+    # before feeding into downstream LLM context. Detection-only —
+    # we never rewrite the body (false-positive rewrites are
+    # themselves a content-filtering bypass surface). Fields scanned
+    # are everything an LLM consumer is likely to render: subject,
+    # predicate, object for fact hits; summary and source_texts for
+    # meta hits. ``has_instruction_markers`` is a per-hit boolean;
+    # ``injection_warnings`` is the top-level list of body_ids for
+    # the agent's structured handling.
+    injection_warnings: list[str] = []
+    for h in hits:
+        fields_to_scan = (
+            h.get("subject"), h.get("predicate"), h.get("object"),
+            h.get("summary"),
+        )
+        flagged = any(
+            isinstance(v, str) and _has_instruction_markers(v)
+            for v in fields_to_scan
+        )
+        if not flagged:
+            source_texts = h.get("source_texts") or []
+            if isinstance(source_texts, list):
+                flagged = any(
+                    isinstance(t, str) and _has_instruction_markers(t)
+                    for t in source_texts
+                )
+        if flagged:
+            h["has_instruction_markers"] = True
+            bid = h.get("body_id")
+            if bid:
+                injection_warnings.append(bid)
+
     # conflict_hints: same (subject, predicate) with different objects.
     conflicts: list[dict] = []
     by_slot: dict[tuple[str, str], list[dict]] = {}
@@ -442,6 +606,15 @@ def query_memory(
         )
     if conflicts:
         response["conflicts"] = conflicts
+    if injection_warnings:
+        response["injection_warnings"] = injection_warnings
+        response["_injection_hint"] = (
+            "Some retrieved bodies contain known LLM control markers "
+            "(e.g. <|im_start|>, [INST]). Wrap them in explicit "
+            "structural delimiters (XML tags, JSON fences) before "
+            "feeding them into a downstream LLM context — they were "
+            "stored as data but may be parsed as instructions."
+        )
     return response
 
 
@@ -475,6 +648,16 @@ def record_fact(
     err = _validate_optional_id(session_id, "session_id")
     if err is not None:
         return err
+    # Strip invisible control chars + zero-width Unicode at the write
+    # boundary. Stored data is permanent — any smuggled NUL / ZWSP /
+    # BOM would leak into every future query_memory response and into
+    # downstream LLM context. The legitimate-looking instruction
+    # markers (<|im_start|>, [INST], …) are NOT rewritten; the
+    # consumer is responsible for wrapping retrieved bodies. This
+    # closes the easy invisible-bytes smuggling vector.
+    subject = _sanitize_for_llm(subject)
+    predicate = _sanitize_for_llm(predicate)
+    object = _sanitize_for_llm(object)
     # Transaction-honest: add_fact returns created from inside its own
     # write txn, so there's no race window between a fact_exists probe and
     # the insert (same pattern set_fact uses).
@@ -601,6 +784,23 @@ def record_facts(
                 },
             })
             continue
+        # Per-item length cap symmetric with the single-fact path.
+        # A batch with one giant `object` field used to embed the
+        # whole batch and dwarf the rest of the SQLite txn — reject
+        # the offending item with structured detail so the agent
+        # can split or trim that one and resubmit the rest.
+        too_long = [
+            k for k in required if len(f[k]) > _MAX_FIELD_LEN
+        ]
+        if too_long:
+            invalid.append({
+                "index": i,
+                "error": "field_too_long",
+                "bad_fields": too_long,
+                "got_lengths": {k: len(f[k]) for k in too_long},
+                "limit": _MAX_FIELD_LEN,
+            })
+            continue
         # Per-item session_id type check: items can override the
         # top-level session_id, and the override flows straight into
         # _resolve_sid. A non-string (int, list, dict) would silently
@@ -626,8 +826,14 @@ def record_facts(
             "required_fields": list(required),
         }
 
+    # Invisible-char strip per item symmetric with record_fact /
+    # set_fact. Done after all per-item validation passed.
     triples = [
-        (f["subject"], f["predicate"], f["object"])
+        (
+            _sanitize_for_llm(f["subject"]),
+            _sanitize_for_llm(f["predicate"]),
+            _sanitize_for_llm(f["object"]),
+        )
         for f in facts
     ]
     # Per-item session_id overrides the top-level one — honour the contract
@@ -708,6 +914,10 @@ def set_fact(
     err = _validate_optional_id(session_id, "session_id")
     if err is not None:
         return err
+    # Invisible-char strip symmetric with record_fact / record_facts.
+    subject = _sanitize_for_llm(subject)
+    predicate = _sanitize_for_llm(predicate)
+    object = _sanitize_for_llm(object)
     # set_fact -> add_fact -> embed(); wrap so an unreachable embedding
     # provider produces a structured failure instead of raw stacktrace
     # at the MCP boundary (completes the wrap coverage shared with
