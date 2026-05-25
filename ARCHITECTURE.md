@@ -823,6 +823,23 @@ thousand facts). At 100k+ facts the matmul becomes the bottleneck —
 future work is to swap in HNSW (FAISS / LanceDB). Not blocking
 because the personal-context-lakehouse use case rarely exceeds 10k.
 
+### Vector index storage — preallocate-then-grow
+The storage layout is a preallocated `_buffer` of shape `(_capacity,
+_dim)` with `_size` live rows; `_buffer[_size:_capacity]` is headroom.
+`add()` writes into the next free slot in O(d) and the buffer doubles
+geometrically when `_size == _capacity`. `remove()` is O(d) via
+swap-with-last (the public surface — `__len__`, `__contains__`,
+`search`, `all_similarities` — never promised insertion order; search
+returns by score and `all_similarities` returns a dict). After a
+mass-delete with usage below `capacity / 4` the buffer reallocates
+down to the smallest power-of-2 multiple of `_INITIAL_CAPACITY` that
+fits the live size with 2× headroom — long-running stores don't sit
+on peak allocation forever. Net `add` cost: amortised O(d) instead of
+the old O(n·d) `np.vstack` strategy. On 10k facts × 768 dim that's a
+~30 MB matrix copy per insert versus a single 3 KB overwrite. Public
+contract is byte-for-byte unchanged; the 725-test suite pinned every
+caller-visible behaviour through the rewrite.
+
 ### SPO temporal collapse is by design
 ``_spo_index`` keys on ``(subject, predicate, object)`` normalised
 case + whitespace. A second identical triple touches the existing
@@ -853,3 +870,94 @@ vars — pin them to your embedding model's cosine distribution.
 ``memory_stats.thresholds`` echoes what the process actually
 picked up. No more "0.85 is statistically impossible on this model"
 landmines under provider swaps.
+
+### Boundary validator family at the MCP edge
+Every input that an agent can send through the MCP server passes a
+typed validator at the boundary: ``_validate_text`` (non-empty string +
+``BIRCH_MAX_FIELD_LEN`` cap), ``_validate_spo_strings`` (S/P/O shape +
+per-field length), ``_validate_optional_id`` (session_id type),
+``_validate_int`` / ``_validate_float`` / ``_validate_bool`` (numeric +
+enum shapes). Failures return ``{"ok": False, "error": "...",
+"field": "...", "hint": "..."}`` instead of crashing inside core.
+Symmetric coverage across ``record_fact`` / ``record_facts`` (top-level
+and per-item) / ``set_fact`` / ``query_memory`` / ``session_open`` /
+``session_push`` / ``session_close``. The per-field length cap is the
+DoS/billing primitive — a 10 MB paste never reaches the embedding
+provider.
+
+### Tolerant SQLite loaders and write-side allow_nan=False
+Every loader (``load_facts`` / ``load_meta_facts`` /
+``load_open_sessions`` / ``load_echo_sessions`` /
+``load_adaptive_weights``) skips corrupt rows with a warning instead
+of failing startup — drift from manual edits, partial writes, model
+swaps, or schema migrations no longer takes the store down. Scalar
+numeric fields run through ``_finite_float`` / ``_layer`` /
+``_nonnegative_int`` so a NaN / Infinity / non-numeric cell loads as
+the field default. Symmetric on write: ``_fact_row`` /
+``_meta_row`` / ``save_echo_session`` / ``save_open_session`` use
+``json.dumps(..., allow_nan=False)`` on every JSON cell and the same
+sanitiser helpers on every scalar. Radioactive cells never reach disk;
+the surrounding ``_txn()`` rolls back and ``_reload()`` restores the
+pre-write in-memory snapshot.
+
+### Self-defending body methods and final compute_gravity gate
+``FactPassport.apply_resonance`` / ``MetaFact.apply_resonance`` reject
+NaN / Infinity / non-numeric ``r`` (library users can call these
+directly, bypassing engine + MCP gates). ``avg_resonance`` returns 0.0
+when the computed mean is non-finite. ``compute_gravity`` ends with
+``if not math.isfinite(gravity): return 0.0`` before its existing
+``min/max`` clamp — Python's ``min/max`` is NOT NaN-aware
+(``min(1.0, NaN)`` is platform-dependent), so the cascade is
+belt-and-suspenders, not a single point of failure. ``__post_init__``
+on both dataclasses normalises direct-construction values through the
+same contract as the SQLite loader, closing the library-mode bypass.
+
+### Atomic BlackHole.absorb + atomic absorb_meta
+``absorb`` and ``absorb_meta`` are three-phase ops: preflight dim check
+(raises ``DimensionMismatchError`` BEFORE any mutation), then set
+layer + dict entry, then commit to the vector index. Any failure on
+the third step rolls back the dict insert and layer mutation. Previous
+order — set layer, put in dict, then add to index — left bodies
+half-absorbed on dim mismatch: invisible to Hawking but still present
+in singularity dict, while the live ``_facts`` hadn't been deleted
+yet. In-memory mode (``storage=None``) couldn't recover via
+``_reload``. ``_absorb_dead`` catches per-fact so one mismatched body
+doesn't abort the whole sweep — it stays live and visible until the
+operator runs collapse to bucket by dim.
+
+### Closing-session race protection
+``session_close`` snapshots ctx state then releases the lock for the
+heavy ``compute_resonance`` call. A push that lands during that window
+used to silently persist to disk and then get dropped when
+``session_close`` popped the ctx — the agent saw ``push`` succeed but
+the message never influenced R / echo / future sessions. Now the sid
+is marked in ``_closing_sessions`` right after the snapshot;
+``session_message`` rejects pushes to a closing sid with structured
+``RuntimeError("session_closing")``. Flag clears on both success and
+failure paths so the sid is never permanently bricked.
+
+### Rollback-recovery on every write path
+``add_fact`` / ``add_facts`` / ``set_fact`` / ``query`` / ``check_echo``
+/ ``session_message`` / ``session_close`` / ``run_forecast`` /
+``collapse_singularity`` all wrap their writeback in ``try: ...
+except: self._reload(); raise``. SQLite txn rolls back disk truth on
+failure; ``_reload`` re-anchors every in-memory cache to the
+post-rollback disk state. Without this, the live ``_facts`` / ``_hole``
+/ ``_engine`` / ``_echo`` caches would drift ahead of disk truth and a
+restart would silently snap them back — silently corrupting adaptive
+gravity training and layer migration.
+
+### Prompt-injection advisory
+BirchKM stores data; the consumer of ``query_memory`` is responsible
+for wrapping retrieved bodies before feeding them into a downstream
+LLM context. The boundary helps in two ways: ``_sanitize_for_llm``
+strips invisible smuggling bytes (ASCII C0 except TAB/LF/CR, DEL,
+zero-width Unicode) at the write boundary so they never reach storage;
+``_has_instruction_markers`` detects visible markers
+(``<|im_start|>``, ``[INST]``, ``<<SYS>>``, llama header IDs, etc.) at
+the read boundary and attaches per-hit ``has_instruction_markers``
+booleans + a top-level ``injection_warnings`` list to the
+``query_memory`` response. Visible markers are NOT rewritten —
+aggressive replacement is itself a content-filter bypass surface and
+breaks legitimate discussion of prompt templates. Consumer wrapping
+discipline remains non-negotiable; the advisory is the safety net.

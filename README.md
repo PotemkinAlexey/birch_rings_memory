@@ -186,6 +186,56 @@ top-K, so retrieval stays in milliseconds well past tens of thousands
 of facts. MetaFacts have their own pair of indices (live + singularity)
 so polymorphic `query()` does four scans without ID collisions.
 
+Storage layout is a **preallocated buffer that grows geometrically** —
+`add()` is amortised O(d) (write into the next free slot; double the
+buffer when full) instead of O(n·d) per insert. `remove()` is O(d) via
+swap-with-last (the public surface never promised insertion order; search
+returns by score). After a mass-delete, the buffer auto-shrinks when
+usage falls below `capacity / 4` so a long-running store does not sit on
+peak allocation forever. On 10k facts × 768 dim the difference is a
+~30 MB matrix copy per insert versus a single 3 KB overwrite.
+
+### Boundary hardening
+
+Every MCP tool input passes a typed validator family at the boundary:
+`_validate_text` (length cap, non-empty), `_validate_spo_strings` (SPO
+triple shape), `_validate_optional_id` (session_id type), `_validate_int`
+/ `_validate_float` / `_validate_bool` (numeric / enum shapes). Failures
+return structured `{"error": "...", "field": "...", "hint": "..."}`
+responses instead of crashing inside core. Per-field length is capped at
+`BIRCH_MAX_FIELD_LEN` chars (default 2000, tunable 128..200000) — defence
+against an agent looping with a megabyte-scale paste accidentally paying
+full embedding-provider cost and bloating SQLite rows.
+
+Storage writes are symmetric defence-in-depth. `json.dumps(..., allow_nan
+=False)` on every JSON cell (vectors, centroids, session payloads); every
+numeric scalar passes a finite + clamp gate before persistence. NaN /
+Infinity never reaches disk; the surrounding `_txn()` rolls back and
+`_reload()` restores the in-memory snapshot on any write failure.
+
+Public object methods — `apply_resonance`, `avg_resonance`,
+`__post_init__` for `FactPassport` / `MetaFact` — self-defend against
+NaN / Infinity inputs (library users can call them directly, bypassing
+storage / engine gates). `compute_gravity` ends with a final
+`math.isfinite` check before its `min/max` clamp; the cascade is
+belt-and-suspenders, not a single point of failure.
+
+### Indirect prompt-injection advisory
+
+BirchKM stores data, not LLM instructions — but agents read retrieved
+bodies straight into their context. `_sanitize_for_llm` strips ASCII C0
+control codes (except TAB/LF/CR), DEL, and zero-width Unicode (ZWSP /
+ZWNJ / ZWJ / BOM) at the write boundary so an "invisible bytes" payload
+never reaches storage. Visible instruction markers (`<|im_start|>`,
+`[INST]`, `<<SYS>>`, etc.) are NOT rewritten — aggressive replacement is
+itself a content-filter bypass surface. Instead, `query_memory` attaches
+a per-hit `has_instruction_markers` boolean and a top-level
+`injection_warnings` list when retrieved bodies contain known markers,
+so the consumer knows which results to wrap in structural delimiters
+before feeding into downstream LLM context. The honest contract is
+"consumer wrapping discipline is non-negotiable"; the advisory is the
+safety net.
+
 ---
 
 ## Modules
@@ -466,29 +516,46 @@ Gravity engine:
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.11+
 - [Ollama](https://ollama.com) with `nomic-embed-text`
 - `mcp[cli]` and `numpy>=1.21` (installed automatically)
 
 Environment knobs:
 
-- `OLLAMA_URL` — defaults to `http://localhost:11434`
-- `BIRCH_EMBED_MODEL` — defaults to `nomic-embed-text`
-- `BIRCH_DB` — SQLite path consumed by `python -m birch.server`
+| Variable | Default | Purpose |
+|---|---|---|
+| `OLLAMA_URL` | `http://localhost:11434` | Embedding provider endpoint |
+| `BIRCH_EMBED_MODEL` | `nomic-embed-text` | Embedding model name (keys the vector cache) |
+| `BIRCH_EMBED_PROVIDER` | `ollama` | `ollama` or `mock` (offline / CI) |
+| `BIRCH_DB` | unset | SQLite path consumed by `python -m birch.server` |
+| `BIRCH_MAX_FIELD_LEN` | `2000` | Per-field text cap at the MCP boundary (DoS/billing defence) |
+| `BIRCH_RECORD_FACTS_BATCH_CAP` | `500` | Max items per `record_facts` batch |
+| `BIRCH_EMBED_RETRIES` | `2` | Embedding HTTP retry count on transient failures |
+| `BIRCH_EMBED_RETRY_BACKOFF_S` | `0.5` | Initial backoff between embedding retries |
+| `BIRCH_HAWKING_FACT` / `BIRCH_HAWKING_META` / `BIRCH_ABSORPTION` / `BIRCH_AUTO_LINK` / `BIRCH_COLLAPSE` / `BIRCH_ECHO` / `BIRCH_FIND_SIMILAR_DEFAULT` | per-threshold default | Cosine thresholds — pin to your embedding model's distribution. See `birch/thresholds.py` |
+
+`memory_stats.thresholds` echoes every threshold the process actually
+picked up, so a misconfigured env knob is visible at runtime.
 
 ---
 
 ## Status
 
 Working proof of concept. All of the following are functional and covered
-by the test suite: resonance pipeline, **adaptive gravity engine**
-(pre-resonance weights learned from session resonance — no hand-set
-magic numbers), black hole with polymorphic singularity (facts +
-MetaFacts), SQLite persistence, numpy vector index, per-session
-concurrency, **cross-process safety** (WAL + `data_version` cache
-invalidation), auto-linking on `add_fact`, counter-triggered background
-collapse with lineage, EchoStore TTL, the MCP server, and the `galaxy`
-N-body research model. CI runs ruff and mypy on every push.
+by the test suite (741 passing, 20 skipped): resonance pipeline,
+**adaptive gravity engine** (pre-resonance weights learned from session
+resonance — no hand-set magic numbers), black hole with polymorphic
+singularity and atomic absorption (facts + MetaFacts; mixed-dim safe),
+SQLite persistence with tolerant loaders + `allow_nan=False` write
+defence, **preallocated numpy vector index** (amortised O(d) add via
+geometric growth + swap-with-last remove), per-session concurrency with
+closing-session race protection, **cross-process safety** (WAL +
+`data_version` cache invalidation + rollback-recovery on every write
+path), auto-linking on `add_fact`, counter-triggered background collapse
+with lineage, EchoStore TTL, the MCP server with full input-validator
+family + per-field length caps + invisible-character strip + prompt-
+injection advisory on retrieval, and the `galaxy` N-body research
+model. CI runs ruff and mypy on every push.
 
 Next natural steps: a persistent similarity index for very large stores
 (FAISS / hnswlib), an LLM-driven `MetaFact.summary` writer that runs async

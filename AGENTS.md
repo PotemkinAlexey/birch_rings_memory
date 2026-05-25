@@ -128,6 +128,31 @@ nearly the full session R; a fact returned at 0.10 absorbs almost none.
 You can ask for a broad `top_k` without worrying that low-similarity noise
 will significantly tilt the gravity of unrelated facts.
 
+### Prompt-injection advisory on retrieval
+
+BirchKM stores data; it is not an LLM. Retrieved bodies flow back as
+strings — including any control sequences a past write smuggled in. The
+response carries two advisory fields when this happens:
+
+- Per-hit `has_instruction_markers: true` when the body contains a
+  known LLM control sequence (`<|im_start|>`, `[INST]`, `<<SYS>>`,
+  `<|start_header_id|>`, etc.). Detection-only; the stored content is
+  not rewritten because aggressive replacement is itself a content-
+  filter bypass surface.
+- Top-level `injection_warnings: [body_id, ...]` listing every flagged
+  result + `_injection_hint` explaining the contract.
+
+When `injection_warnings` is non-empty, **wrap the flagged bodies in
+explicit structural delimiters** (XML tags, JSON fences, fenced code
+blocks) before feeding them into downstream LLM context — they were
+stored as data but may be parsed as instructions otherwise. This is the
+non-negotiable part of the consumer contract; the advisory exists so
+you do not have to scan every result yourself.
+
+Invisible-bytes payloads (NUL, zero-width Unicode, BOM) are already
+stripped at the write boundary by `_sanitize_for_llm`, so you only see
+the visible-markers case in the wild.
+
 ---
 
 ## Writing facts
@@ -168,6 +193,21 @@ of creating a new record. The returned `gravity_score` reflects the existing
 fact's current value; `access_count` will have incremented by one. That is a
 safety net, not a license — still search before writing, since paraphrases
 (`"runs on" Go` vs `"is written in" Go`) will not be de-duped automatically.
+
+**Field length cap.** Every S/P/O string is capped at
+`BIRCH_MAX_FIELD_LEN` chars (default 2000). Oversized input gets a
+structured `{"error": "field_too_long", "bad_fields": [...], "limit": N}`
+response — split the offending field into multiple atomic facts, or have
+your operator raise the env var if the deployment can afford the embed
+cost. The cap fires before the embedding call, so a 10 MB paste never
+hits the provider.
+
+**Closing-session race protection.** Pushes to a session that is
+mid-close are rejected with `RuntimeError("session_closing")`. This
+fires only if you accidentally call `session_push` / `session_message`
+concurrently with `session_close` on the same `session_id` — wait for
+the close to complete and open a new session if you have more to
+record. Late messages never silently land in the closed bundle.
 
 ### Writing / replacing / retiring — pick by intent
 
