@@ -330,6 +330,15 @@ def query_memory(
     err = _validate_optional_text(subject_prefix, "subject_prefix")
     if err is not None:
         return {"results": [], **err}
+    # Optional-id boundary: a non-None session_id that is not a non-empty
+    # string used to flow straight into core.query(), where the session
+    # lookup would either KeyError or, worse, silently miss a real
+    # session whose id was stringly mis-typed by a poorly-typed client
+    # (e.g. an int id from a JSON encoder that auto-coerces). Reject at
+    # the MCP boundary so the failure shape is structured.
+    err = _validate_optional_id(session_id, "session_id")
+    if err is not None:
+        return {"results": [], **err}
     layer_map = {"surface": 0, "kinetic": 1, "core": 2}
     if layers is not None:
         # Shape check: layers="surface" (string instead of list) used
@@ -459,6 +468,13 @@ def record_fact(
     err = _validate_spo_strings(subject, predicate, object)
     if err is not None:
         return err
+    # Optional-id boundary: a non-None session_id that is not a non-empty
+    # string used to flow into add_fact → _resolve_sid → silent skip of
+    # the attribution path (resonance/gravity bookkeeping never fires).
+    # Reject at the boundary so the agent gets a structured error.
+    err = _validate_optional_id(session_id, "session_id")
+    if err is not None:
+        return err
     # Transaction-honest: add_fact returns created from inside its own
     # write txn, so there's no race window between a fact_exists probe and
     # the insert (same pattern set_fact uses).
@@ -524,6 +540,15 @@ def record_facts(
                 "predicate, object"
             ),
         }
+    # Optional-id boundary: the top-level session_id is the fallback for
+    # items that don't carry their own. A non-None non-string would be
+    # forwarded to add_facts and silently mis-attribute every item in
+    # the batch that relies on the fallback. Per-item session_id is
+    # already validated below; this is the symmetric guard for the
+    # top-level one.
+    err = _validate_optional_id(session_id, "session_id")
+    if err is not None:
+        return err
     # Batch-size cap: an agent that accidentally pastes 50k items would
     # otherwise issue one huge embed batch + one giant SQLite
     # transaction with no progress signal. Return a structured error so
@@ -675,6 +700,12 @@ def set_fact(
     Returns ``{"set": true, "fact_id", "already_existed", "superseded": [...]}``.
     """
     err = _validate_spo_strings(subject, predicate, object)
+    if err is not None:
+        return err
+    # Optional-id boundary: symmetric with record_fact/record_facts.
+    # set_fact's session_id flows into the supersede bookkeeping —
+    # a non-string id would silently drop the attribution.
+    err = _validate_optional_id(session_id, "session_id")
     if err is not None:
         return err
     # set_fact -> add_fact -> embed(); wrap so an unreachable embedding

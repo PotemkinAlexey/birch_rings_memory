@@ -36,6 +36,105 @@ def _safe_loads(value: Any, default: Any) -> Any:
         return default
 
 
+def _finite_float(
+    value: Any, default: float, *, lo: float | None = None,
+    hi: float | None = None,
+) -> float:
+    """Coerce a JSON-loaded cell to a finite float with optional clamp.
+
+    Same robustness contract as ``_safe_vector``: a corrupted cell
+    (``None``, non-numeric, NaN, Infinity) must not poison downstream
+    math. Gravity / utility / stability are bounded in [0, 1] and feed
+    straight into the adaptive_gravity SGD — a NaN here cascades into
+    NaN weights on the next session_close, which would silently freeze
+    learning. Defaulting drops the bad cell back to the field default;
+    optional ``lo``/``hi`` clamp legitimate but out-of-range values.
+    """
+    import math as _math
+
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not _math.isfinite(out):
+        return default
+    if lo is not None:
+        out = max(lo, out)
+    if hi is not None:
+        out = min(hi, out)
+    return out
+
+
+def _nonnegative_int(value: Any, default: int) -> int:
+    """Coerce a JSON-loaded cell to a non-negative int.
+
+    Counters (access_count, resonance_count) live in ints; a non-int
+    cell (string, float-with-fractional-part, None) would raise inside
+    ``int()`` and take the whole loader down. A negative value is
+    operationally meaningless — clamp to zero rather than propagate.
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, out)
+
+
+def _layer(value: Any, default: int = 1) -> int:
+    """Coerce layer field to a known layer id.
+
+    Valid layers: -1 (singularity), 0 (surface), 1 (kinetic), 2 (core).
+    An unknown value (5, "core", None, NaN) used to load as-is and
+    silently break the live-vs-singularity split — a fact at layer=99
+    would slip past every ``layer >= 0`` predicate and out of every
+    ``layer == -1`` singularity scan. Default to kinetic (1, the
+    creation default) when corrupted.
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    if out not in (-1, 0, 1, 2):
+        return default
+    return out
+
+
+def _safe_centroids(value: Any) -> list[list[float]]:
+    """Parse a JSON-encoded list of centroid vectors with shape checks.
+
+    EchoStore.detect_echo cosines a query centroid against every stored
+    centroid — a ragged shape (mixed dims), a non-list item, or a NaN
+    cell would crash the cosine path far from the loader. The contract
+    here is the same as _safe_vector lifted one nesting level: return
+    an empty list on any non-conformant input so the caller's tolerant
+    drop-corrupt-row path takes over. An empty list signals "nothing
+    useful to match against" — the echo loader treats it as corruption
+    and drops the session.
+    """
+    import math as _math
+
+    raw = _safe_loads(value, [])
+    if not isinstance(raw, list) or not raw:
+        return []
+    out: list[list[float]] = []
+    expected_dim: int | None = None
+    for v in raw:
+        if not isinstance(v, list):
+            return []
+        try:
+            coerced = [float(x) for x in v]
+        except (TypeError, ValueError):
+            return []
+        if not all(_math.isfinite(x) for x in coerced):
+            return []
+        if expected_dim is None:
+            expected_dim = len(coerced)
+        elif len(coerced) != expected_dim:
+            return []
+        out.append(coerced)
+    return out
+
+
 def _safe_vector(value: Any) -> list[float]:
     """Parse a JSON-encoded vector tolerantly with shape validation.
 
@@ -310,30 +409,67 @@ class SQLiteBackend:
     def load_facts(self) -> list[FactPassport]:
         rows = self._conn.execute("SELECT * FROM facts").fetchall()
         out: list[FactPassport] = []
+        # Scalar sanitization mirrors _safe_vector's contract: a corrupt
+        # cell (NaN, Infinity, wrong type, junk-typed via SQLite's loose
+        # typing) must not crash the loader or poison adaptive-gravity
+        # SGD downstream. Every numeric scalar goes through the helpers;
+        # vector already had it.
         for r in rows:
             try:
-                out.append(FactPassport(
-                    subject=r["subject"], predicate=r["predicate"], object=r["object"],
-                    fact_id=r["fact_id"],
+                ttl = r["ttl"]
+                if ttl is not None:
+                    ttl = _finite_float(ttl, None)  # type: ignore[arg-type]
+                created_at_raw = r["created_at"]
+                # created_at is positional in the dataclass — None would
+                # accept the field default, but a NaN cell would propagate.
+                if created_at_raw is None:
+                    created_at = None
+                else:
+                    import time as _time
+                    created_at = _finite_float(created_at_raw, _time.time())
+                last_accessed_raw = r["last_accessed"]
+                if last_accessed_raw is None:
+                    last_accessed = None
+                else:
+                    import time as _time
+                    last_accessed = _finite_float(
+                        last_accessed_raw, _time.time(),
+                    )
+                kwargs = dict(
+                    subject=r["subject"], predicate=r["predicate"],
+                    object=r["object"], fact_id=r["fact_id"],
                     vector=_safe_vector(r["vector"]),
-                    gravity_score=r["gravity_score"], layer=r["layer"],
-                    created_at=r["created_at"], ttl=r["ttl"],
-                    source_session=r["source_session"], deprecated_by=r["deprecated_by"],
-                    access_count=r["access_count"], last_accessed=r["last_accessed"],
-                    resonance_sum=r["resonance_sum"],
-                    resonance_count=r["resonance_count"],
-                    recent_utility=(
+                    gravity_score=_finite_float(
+                        r["gravity_score"], 0.5, lo=0.0, hi=1.0,
+                    ),
+                    layer=_layer(r["layer"], 1),
+                    ttl=ttl,
+                    source_session=r["source_session"],
+                    deprecated_by=r["deprecated_by"],
+                    access_count=_nonnegative_int(r["access_count"], 0),
+                    resonance_sum=_finite_float(r["resonance_sum"], 0.0),
+                    resonance_count=_nonnegative_int(
+                        r["resonance_count"], 0,
+                    ),
+                    recent_utility=_finite_float(
                         r["recent_utility"]
-                        if "recent_utility" in r.keys() and r["recent_utility"] is not None
-                        else 0.5
+                        if "recent_utility" in r.keys() else 0.5,
+                        0.5, lo=0.0, hi=1.0,
                     ),
-                    forecast_stability=(
+                    forecast_stability=_finite_float(
                         r["forecast_stability"]
-                        if "forecast_stability" in r.keys()
-                        and r["forecast_stability"] is not None
-                        else 0.5
+                        if "forecast_stability" in r.keys() else 0.5,
+                        0.5, lo=0.0, hi=1.0,
                     ),
-                ))
+                )
+                # Only pass created_at / last_accessed when non-None so
+                # the dataclass default_factory (time.time()) fires for
+                # legacy rows missing the cell.
+                if created_at is not None:
+                    kwargs["created_at"] = created_at
+                if last_accessed is not None:
+                    kwargs["last_accessed"] = last_accessed
+                out.append(FactPassport(**kwargs))
             except Exception as exc:
                 _logger.warning(
                     "SQLite load_facts: skipping corrupted row fact_id=%r: %s",
@@ -446,11 +582,15 @@ class SQLiteBackend:
                         fact_weights[fid] = max(0.0, min(1.0, wf))
                 else:
                     fact_weights = {}
-                centroids = _safe_loads(r["centroids"], None)
-                if not isinstance(centroids, list) or not centroids:
-                    # Empty/None centroids means corruption — the session
-                    # would be useless for echo matching anyway. Drop.
-                    raise ValueError("centroids missing or not a list")
+                centroids = _safe_centroids(r["centroids"])
+                if not centroids:
+                    # Empty/None centroids OR a non-conformant shape
+                    # (ragged dim, non-list inner, NaN cell, non-numeric
+                    # item) means corruption — the session would crash
+                    # echo matching downstream. _safe_centroids
+                    # collapses every bad shape to [], so a single
+                    # check covers all of them.
+                    raise ValueError("centroids missing or malformed")
                 out.append({
                     "session_id": r["session_id"],
                     "centroids": centroids,

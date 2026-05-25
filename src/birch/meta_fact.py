@@ -119,23 +119,96 @@ class MetaFact:
 
     @classmethod
     def from_dict(cls, row: dict[str, Any]) -> "MetaFact":
+        # Scalar sanitisation symmetric with FactPassport's SQLite
+        # loader. ``_load_list`` already gates vector items against
+        # NaN/Infinity; the scalar fields used to skip that gate, so a
+        # gravity_score=NaN or created_at=Infinity stored row would
+        # build a MetaFact whose downstream gravity math returns NaN
+        # (adaptive_gravity SGD then freezes its weights silently).
+        # Apply the same finite + clamp contract here so corrupt
+        # storage rows never reach the live store.
         return cls(
             meta_id=row["meta_id"],
             vector=_load_list(row.get("vector"), float),
-            weight=int(row.get("weight", 1)),
+            weight=_finite_nonneg_int(row.get("weight"), 1),
             source_texts=_load_list(row.get("source_texts"), str),
             source_fact_ids=_load_list(row.get("source_fact_ids"), str),
             summary=row.get("summary", "") or "",
-            gravity_score=float(row.get("gravity_score", 0.30)),
-            created_at=float(row.get("created_at", time.time())),
-            layer=int(row.get("layer", -1)),
-            access_count=int(row.get("access_count", 0)),
-            last_accessed=float(row.get("last_accessed", time.time())),
-            resonance_sum=float(row.get("resonance_sum", 0.0)),
-            resonance_count=int(row.get("resonance_count", 0)),
-            recent_utility=float(row.get("recent_utility", 0.5)),
-            forecast_stability=float(row.get("forecast_stability", 0.5)),
+            gravity_score=_finite(
+                row.get("gravity_score"), 0.30, lo=0.0, hi=1.0,
+            ),
+            created_at=_finite(
+                row.get("created_at"), time.time(),
+            ),
+            layer=_meta_layer(row.get("layer"), -1),
+            access_count=_finite_nonneg_int(row.get("access_count"), 0),
+            last_accessed=_finite(
+                row.get("last_accessed"), time.time(),
+            ),
+            resonance_sum=_finite(row.get("resonance_sum"), 0.0),
+            resonance_count=_finite_nonneg_int(
+                row.get("resonance_count"), 0,
+            ),
+            recent_utility=_finite(
+                row.get("recent_utility"), 0.5, lo=0.0, hi=1.0,
+            ),
+            forecast_stability=_finite(
+                row.get("forecast_stability"), 0.5, lo=0.0, hi=1.0,
+            ),
         )
+
+
+def _finite(
+    value: Any, default: float, *, lo: float | None = None,
+    hi: float | None = None,
+) -> float:
+    """Coerce to a finite float with optional clamp; defaults on failure.
+
+    Same contract as the SQLite backend's ``_finite_float``; lives here
+    too because ``MetaFact.from_dict`` is called both by the SQLite
+    loader and by in-memory test fixtures / migrations. Either path
+    must reject NaN / Infinity / non-numeric cells rather than build a
+    body that poisons every downstream gravity calculation.
+    """
+    import math as _math
+
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not _math.isfinite(out):
+        return default
+    if lo is not None:
+        out = max(lo, out)
+    if hi is not None:
+        out = min(hi, out)
+    return out
+
+
+def _finite_nonneg_int(value: Any, default: int) -> int:
+    """Coerce to a non-negative int; defaults on failure."""
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, out)
+
+
+def _meta_layer(value: Any, default: int = -1) -> int:
+    """Coerce layer to one of the known ids (-1, 0, 1, 2).
+
+    A MetaFact at layer=99 would slip past every ``layer == -1``
+    singularity scan and every ``layer >= 0`` live-layer predicate —
+    silently invisible. Default to singularity (-1, the natural meta
+    home) when the cell is corrupt.
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    if out not in (-1, 0, 1, 2):
+        return default
+    return out
 
 
 def _load_list(value: Any, cast) -> list:
