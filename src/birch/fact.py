@@ -1,6 +1,7 @@
 """FactPassport — atomic unit of knowledge in BirchKM."""
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -59,8 +60,25 @@ class FactPassport:
         self.last_accessed = time.time()
 
     def apply_resonance(self, r: float) -> None:
-        """Record that a session with resonance R used this fact."""
-        self.resonance_sum += r
+        """Record that a session with resonance R used this fact.
+
+        Self-defending: a NaN / Infinity / non-numeric ``r`` would
+        contaminate ``resonance_sum`` forever (every downstream
+        ``avg_resonance``, ``compute_gravity``, sort/filter then
+        returns NaN). External call sites (GravityEngine, MCP
+        boundary) already sanitise, but this is a public object
+        method — library users can call it directly. No-op on bad
+        input, clamp legitimate-but-out-of-range to [-1.0, 1.0]
+        (the contract surface of session resonance).
+        """
+        try:
+            value = float(r)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(value):
+            return
+        value = max(-1.0, min(1.0, value))
+        self.resonance_sum += value
         self.resonance_count += 1
 
     def __repr__(self) -> str:

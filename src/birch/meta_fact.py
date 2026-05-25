@@ -72,8 +72,25 @@ class MetaFact:
         self.last_accessed = time.time()
 
     def apply_resonance(self, r: float) -> None:
-        """Record that a session with resonance R used this MetaFact."""
-        self.resonance_sum += r
+        """Record that a session with resonance R used this MetaFact.
+
+        Self-defending: symmetric with ``FactPassport.apply_resonance``.
+        A NaN / Infinity / non-numeric input would poison
+        ``resonance_sum`` (every downstream ``avg_resonance``,
+        ``compute_gravity``, sort/filter then returns NaN). No-op on
+        bad input, clamp legitimate-but-out-of-range values to
+        [-1.0, 1.0].
+        """
+        import math as _math
+
+        try:
+            value = float(r)
+        except (TypeError, ValueError):
+            return
+        if not _math.isfinite(value):
+            return
+        value = max(-1.0, min(1.0, value))
+        self.resonance_sum += value
         self.resonance_count += 1
 
     # ── Hawking emission helper ─────────────────────────────────────────────
@@ -99,12 +116,22 @@ class MetaFact:
     # dict in tests without having to JSON-dump first.
 
     def to_dict(self) -> dict[str, Any]:
+        # allow_nan=False on every json.dumps so a NaN sneaked into
+        # the runtime vector / lineage raises ValueError here instead
+        # of writing radioactive JSON to disk. The surrounding
+        # storage txn rolls back, _reload restores the pre-write
+        # snapshot, and the loader never has to "heroically" clean
+        # data we never should have written.
         return {
             "meta_id": self.meta_id,
-            "vector": json.dumps(self.vector),
+            "vector": json.dumps(self.vector, allow_nan=False),
             "weight": self.weight,
-            "source_texts": json.dumps(self.source_texts),
-            "source_fact_ids": json.dumps(self.source_fact_ids),
+            "source_texts": json.dumps(
+                self.source_texts, allow_nan=False,
+            ),
+            "source_fact_ids": json.dumps(
+                self.source_fact_ids, allow_nan=False,
+            ),
             "summary": self.summary,
             "gravity_score": self.gravity_score,
             "created_at": self.created_at,

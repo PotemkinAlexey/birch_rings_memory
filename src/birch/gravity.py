@@ -36,6 +36,27 @@ class GravityBody(Protocol):
     def apply_resonance(self, r: float) -> None: ...
 
 
+def _finite_clamped(
+    value, lo: float, hi: float,
+) -> float | None:
+    """Coerce to a finite float clamped to [lo, hi]; ``None`` on failure.
+
+    Engine-boundary helper used by ``apply_session_resonance`` to
+    reject NaN / Infinity / non-numeric inputs before they reach
+    ``apply_resonance`` on a body. The body methods now self-defend
+    too, but rejecting up front lets the engine distinguish
+    "whole-session no-op" (bad ``r``) from "skip this pair" (bad
+    weight) — better debuggability than silent body-level skips.
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return max(lo, min(hi, out))
+
+
 # Layer thresholds — facts migrate when gravity crosses these boundaries.
 _LAYER_UP = 0.70    # gravity > 0.70 → promote
 _LAYER_DOWN = 0.30  # gravity < 0.30 → demote
@@ -235,15 +256,35 @@ class GravityEngine:
         ``facts`` may be either:
           - a list[str] of fact_ids (legacy, uniform weight 1.0)
           - a dict[str, float] of fact_id → relevance weight ∈ [0, 1]
+
+        Engine-boundary sanitisation: a NaN / Infinity in either ``r``
+        or any per-fact weight would call into ``apply_resonance``
+        which now self-defends, but propagating the bad value here
+        means *every* fact in the session gets silently skipped.
+        Cleaner to reject the bad call up front (whole-session no-op
+        on bad ``r``) and per-pair no-op on bad weight, so the agent
+        loop continues with a structured outcome.
         """
+        r_clean = _finite_clamped(r, -1.0, 1.0)
+        if r_clean is None:
+            # Bad session resonance — nothing to propagate. Sessions
+            # with malformed R get skipped entirely rather than
+            # poisoning every touched fact's resonance_sum.
+            return
         if isinstance(facts, dict):
             for fid, weight in facts.items():
-                if fid in self._facts:
-                    self._facts[fid].apply_resonance(r * float(weight))
+                if fid not in self._facts:
+                    continue
+                w_clean = _finite_clamped(weight, 0.0, 1.0)
+                if w_clean is None:
+                    # Bad weight on one fact does not abort the whole
+                    # propagation. Skip the pair, keep going.
+                    continue
+                self._facts[fid].apply_resonance(r_clean * w_clean)
         else:
             for fid in facts:
                 if fid in self._facts:
-                    self._facts[fid].apply_resonance(r)
+                    self._facts[fid].apply_resonance(r_clean)
 
     def tick(self, now: float | None = None) -> list[tuple[str, int]]:
         """Recompute gravity for all facts using the engine's adaptive weights.

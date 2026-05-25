@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -379,15 +380,34 @@ class SQLiteBackend:
 
     @staticmethod
     def _fact_row(fact: FactPassport) -> tuple:
+        # Write-side sanitisation symmetric with load_facts(). A
+        # poisoned in-memory FactPassport (e.g. library user called
+        # ``fact.gravity_score = float("nan")`` directly) used to
+        # write radioactive scalars to disk that the next ``_reload``
+        # would then "heroically" clean — better never to persist
+        # them. ``allow_nan=False`` on the vector dump enforces the
+        # same contract for the JSON cell; a NaN there raises
+        # ValueError, the surrounding ``_txn`` rolls back, and
+        # ``_reload`` restores the pre-write in-memory snapshot.
+        ttl = fact.ttl
+        if ttl is not None:
+            ttl = _finite_float(ttl, None)  # type: ignore[arg-type]
         return (
             fact.fact_id, fact.subject, fact.predicate, fact.object,
-            json.dumps(fact.vector),
-            fact.gravity_score, fact.layer, fact.created_at, fact.ttl,
+            json.dumps(fact.vector, allow_nan=False),
+            _finite_float(fact.gravity_score, 0.5, lo=0.0, hi=1.0),
+            _layer(fact.layer, 1),
+            _finite_float(fact.created_at, time.time()),
+            ttl,
             fact.source_session, fact.deprecated_by,
-            fact.access_count, fact.last_accessed,
-            fact.resonance_sum, fact.resonance_count,
-            fact.recent_utility,
-            fact.forecast_stability,
+            _nonnegative_int(fact.access_count, 0),
+            _finite_float(fact.last_accessed, time.time()),
+            _finite_float(fact.resonance_sum, 0.0),
+            _nonnegative_int(fact.resonance_count, 0),
+            _finite_float(fact.recent_utility, 0.5, lo=0.0, hi=1.0),
+            _finite_float(
+                fact.forecast_stability, 0.5, lo=0.0, hi=1.0,
+            ),
         )
 
     def save_fact(self, fact: FactPassport) -> None:
@@ -533,17 +553,23 @@ class SQLiteBackend:
         # compatibility, but its JSON payload is now a {fact_id: weight}
         # dict. The loader accepts both shapes.
         payload = dict(fact_weights or {})
+        # allow_nan=False on both JSON cells + scalar sanitisation on
+        # the numeric fields. Write-side defence: a poisoned centroid
+        # (NaN, Infinity) raises ValueError on dumps, the surrounding
+        # txn rolls back, _reload restores the pre-write snapshot.
+        # Cleaner than persisting radioactive JSON and having the
+        # loader drop the row on next boot.
         self._conn.execute(
             "INSERT OR REPLACE INTO echo_sessions "
             "(session_id, centroids, r_score, recorded_at, fact_ids, echo_penalty) "
             "VALUES (?,?,?,?,?,?)",
             (
                 session_id,
-                json.dumps(centroids),
-                r_score,
-                recorded_at,
-                json.dumps(payload),
-                echo_penalty,
+                json.dumps(centroids, allow_nan=False),
+                _finite_float(r_score, 0.0, lo=-1.0, hi=1.0),
+                _finite_float(recorded_at, time.time()),
+                json.dumps(payload, allow_nan=False),
+                _finite_float(echo_penalty, 0.0, lo=0.0, hi=1.0),
             ),
         )
         self._maybe_commit()
@@ -626,14 +652,22 @@ class SQLiteBackend:
         facts: dict[str, float],
         started_at: float,
     ) -> None:
+        # allow_nan=False on every JSON cell. A NaN sneaked into
+        # vectors (mid-session embed model swap, mock-vs-real flip)
+        # would otherwise persist to disk as the literal token
+        # ``NaN`` — Python's json.loads accepts it on read, then the
+        # loader's _safe_loads drops the row. Catch at write so the
+        # session never leaves a poisoned trail on disk; the
+        # surrounding session_message try/except + _reload restores
+        # the in-memory snapshot.
         self._conn.execute(
             "INSERT OR REPLACE INTO open_sessions VALUES (?,?,?,?,?)",
             (
                 session_id,
-                json.dumps(messages),
-                json.dumps(vectors),
-                json.dumps(facts),
-                started_at,
+                json.dumps(messages, allow_nan=False),
+                json.dumps(vectors, allow_nan=False),
+                json.dumps(facts, allow_nan=False),
+                _finite_float(started_at, time.time()),
             ),
         )
         self._maybe_commit()
@@ -757,15 +791,30 @@ class SQLiteBackend:
 
     @staticmethod
     def _meta_row(meta: MetaFact) -> tuple:
+        # to_dict() now uses allow_nan=False on every JSON cell so a
+        # poisoned vector / lineage raises at the boundary. Scalar
+        # fields are clamped through the same helpers as load — a
+        # MetaFact whose runtime gravity_score got NaN'd via direct
+        # attribute mutation is sanitised before persistence rather
+        # than being heroically cleaned by the next load.
         d = meta.to_dict()
         return (
-            d["meta_id"], d["vector"], d["weight"],
+            d["meta_id"], d["vector"],
+            _nonnegative_int(d["weight"], 1),
             d["source_texts"], d["source_fact_ids"], d["summary"],
-            d["gravity_score"], d["created_at"], d["layer"],
-            d["access_count"], d["last_accessed"],
-            d["resonance_sum"], d["resonance_count"],
-            d["recent_utility"],
-            d["forecast_stability"],
+            _finite_float(d["gravity_score"], 0.30, lo=0.0, hi=1.0),
+            _finite_float(d["created_at"], time.time()),
+            _layer(d["layer"], -1),
+            _nonnegative_int(d["access_count"], 0),
+            _finite_float(d["last_accessed"], time.time()),
+            _finite_float(d["resonance_sum"], 0.0),
+            _nonnegative_int(d["resonance_count"], 0),
+            _finite_float(
+                d["recent_utility"], 0.5, lo=0.0, hi=1.0,
+            ),
+            _finite_float(
+                d["forecast_stability"], 0.5, lo=0.0, hi=1.0,
+            ),
         )
 
     def save_meta_fact(self, meta: MetaFact) -> None:

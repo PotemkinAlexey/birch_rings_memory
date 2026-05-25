@@ -90,8 +90,30 @@ class SessionsMixin:
         return session_id if session_id is not None else self._current_session_id
 
     @staticmethod
-    def _attribute_to(ctx: SessionContext, fact_id: str, weight: float) -> None:
-        clipped = max(0.0, min(1.0, float(weight)))
+    def _attribute_to(
+        ctx: SessionContext, fact_id: str, weight: float,
+    ) -> None:
+        """Last-line attribution gate.
+
+        ``max/min`` are not finite-aware: ``min(1.0, float("nan"))``
+        returns ``1.0`` on some Python builds and ``nan`` on others
+        depending on argument order — relying on clamp semantics for
+        NaN is a quiet bug factory. Reject NaN / Infinity / non-
+        numeric weights here so the attribution dict (which is
+        persisted to ``open_sessions.facts`` and then drives
+        ``apply_session_resonance``) can never carry a poisoned
+        value, regardless of which call site wired up the weight.
+        Legitimate-but-out-of-range values clamp to [0.0, 1.0].
+        """
+        import math as _math
+
+        try:
+            raw = float(weight)
+        except (TypeError, ValueError):
+            return
+        if not _math.isfinite(raw):
+            return
+        clipped = max(0.0, min(1.0, raw))
         if clipped > ctx.facts.get(fact_id, 0.0):
             ctx.facts[fact_id] = clipped
 
