@@ -48,88 +48,121 @@ from birch.black_hole import BlackHole
 from birch.fact import FactPassport
 from birch.memory_store import MemoryStore
 from birch.meta_fact import MetaFact
-from birch.vector_index import DimensionMismatchError
 
-# --- I1: BlackHole.absorb atomic ---------------------------------------
+# DimensionMismatchError no longer raised by BlackHole.absorb after
+# per-dim refactor — import kept for any future cross-dim guard tests.
+from birch.vector_index import DimensionMismatchError  # noqa: F401
+
+# --- I1: BlackHole.absorb is per-dim partitioned (succeeded round 4) ---
+# Round 4 shipped atomic-three-phase absorb to defend against mixed-dim
+# singularity. The follow-up architectural refactor went one level
+# deeper and partitioned the indices by dim — the mismatch hazard is
+# now eliminated by construction. These tests pin the new semantics:
+# absorbs of different dims both succeed and live in separate buckets;
+# Hawking emission scans only the bucket matching the query dim.
 
 
-def test_blackhole_absorb_rejects_dim_mismatch_atomically():
-    """Pre-flight check raises BEFORE any mutation. After the raise,
-    fact.layer is unchanged AND fact is NOT in _singularity dict."""
+def test_blackhole_absorb_routes_to_dim_bucket():
+    """Different-dim absorbs both succeed; each lives in its own
+    dim-bucket. No DimensionMismatchError, no rollback — the
+    architectural change closed the hazard at the source."""
     hole = BlackHole()
-    # First absorb sets the dim.
     f1 = FactPassport(
         subject="a", predicate="b", object="c", fact_id="f1",
         vector=[0.1, 0.2, 0.3],
     )
     hole.absorb(f1)
-    assert hole._index._dim == 3
-    # Second absorb with different dim must raise atomically.
+    assert hole.fact_dims == [3]
+    # Different dim — used to raise; now creates a new bucket.
     f2 = FactPassport(
         subject="x", predicate="y", object="z", fact_id="f2",
-        vector=[0.5] * 5,   # different dim
-        layer=1,            # live layer before absorption
+        vector=[0.5] * 5,
+        layer=1,
     )
-    with pytest.raises(DimensionMismatchError):
-        hole.absorb(f2)
-    # Atomic rollback: f2 not in singularity, layer not flipped.
-    assert "f2" not in hole._singularity
-    assert f2.layer == 1
+    hole.absorb(f2)   # no raise
+    # Both bodies in singularity, each in its own bucket.
+    assert "f1" in hole._singularity
+    assert "f2" in hole._singularity
+    assert sorted(hole.fact_dims) == [3, 5]
+    assert len(hole._indices[3]) == 1
+    assert len(hole._indices[5]) == 1
+    # Layer flipped to -1 for both — successful absorption.
+    assert f1.layer == -1
+    assert f2.layer == -1
 
 
-def test_blackhole_absorb_meta_atomic_dim_check():
+def test_blackhole_absorb_meta_routes_to_dim_bucket():
     hole = BlackHole()
     m1 = MetaFact(meta_id="m1", vector=[0.1, 0.2, 0.3], layer=0)
     hole.absorb_meta(m1)
-    assert hole._meta_index._dim == 3
+    assert hole.meta_dims == [3]
     m2 = MetaFact(meta_id="m2", vector=[0.5] * 5, layer=0)
-    with pytest.raises(DimensionMismatchError):
-        hole.absorb_meta(m2)
-    assert "m2" not in hole._meta_singularity
-    # Rolled back to live layer (we hard-coded 0 above).
-    assert m2.layer == 0
+    hole.absorb_meta(m2)   # no raise
+    assert "m1" in hole._meta_singularity
+    assert "m2" in hole._meta_singularity
+    assert sorted(hole.meta_dims) == [3, 5]
+    assert m1.layer == -1
+    assert m2.layer == -1
 
 
-def test_absorb_dead_in_memory_mode_skips_mismatched_dim_body(tmp_path):
-    """In-memory store (storage=None) + mixed-dim singularity: a live
-    fact whose gravity falls below the absorption floor must NOT
-    leave the store in a half-state. Either it lands cleanly in
-    the singularity, or it stays live and visible — never both,
-    never neither.
-    """
-    # Use a file-backed store but verify the in-memory consistency
-    # property directly. We force the dim mismatch by seeding the
-    # singularity with a body of one dim, then trying to absorb
-    # a live body of a different dim.
+def test_hawking_emit_only_scans_matching_dim_bucket():
+    """A query vector of dim=3 must not resurrect a dim=5 body
+    (cross-dim cosine is undefined). Per-dim scan enforces this
+    by construction."""
+    hole = BlackHole()
+    # Seed: a dim=3 body that would clearly match a dim=3 query,
+    # and a dim=5 body that's similarly "close" to its query.
+    f3 = FactPassport(
+        subject="three", predicate="dim", object="body", fact_id="f3",
+        vector=[1.0, 0.0, 0.0],
+    )
+    f5 = FactPassport(
+        subject="five", predicate="dim", object="body", fact_id="f5",
+        vector=[1.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    hole.absorb(f3)
+    hole.absorb(f5)
+    # Query at dim=3: returns only f3.
+    emitted = hole.hawking_emit([1.0, 0.0, 0.0])
+    emitted_ids = [f.fact_id for f in emitted]
+    assert "f3" in emitted_ids
+    assert "f5" not in emitted_ids
+    # f5 is still in the singularity — it was not scanned.
+    assert "f5" in hole._singularity
+
+
+def test_absorb_dead_succeeds_on_all_dims_after_refactor(tmp_path):
+    """With per-dim buckets, a body whose vector dim differs from
+    existing singularity bodies is no longer skipped — it absorbs
+    cleanly into its own bucket. Previous "skip mismatched" defensive
+    behaviour is obsolete (the hazard is gone)."""
     mem = MemoryStore(db_path=str(tmp_path / "m.db"))
     # Seed singularity with a dim=3 body via direct hole API.
     seed = FactPassport(
         subject="seed", predicate="lives", object="here",
         fact_id="seed",
         vector=[0.1, 0.2, 0.3],
-        gravity_score=0.05,    # below absorption threshold
+        gravity_score=0.05,
     )
     mem._hole.absorb(seed)
-    # Add a live fact with a different vector dim (mock embed to a
-    # different size) and drop its gravity below threshold.
+    # Add a live fact with dim=5 and drop its gravity below threshold.
     import birch.memory_store as pkg
     orig_embed = pkg.embed
-    pkg.embed = lambda text: [0.5] * 5   # dim=5 — mismatch with singularity
+    pkg.embed = lambda text: [0.5] * 5
     try:
         f = mem.add_fact("api", "uses", "redis")
-        f.gravity_score = 0.05   # below threshold to trigger absorb
+        f.gravity_score = 0.05
     finally:
         pkg.embed = orig_embed
-    # Run absorb sweep — body cannot enter singularity (dim mismatch).
-    # Contract: must NOT leave the body half-absorbed.
     absorbed = mem._absorb_dead()
-    # The mismatched body should be SKIPPED, not absorbed.
-    assert f.fact_id not in absorbed
-    # And it must still be live (not deleted) AND not in singularity.
-    assert f.fact_id in mem._facts
-    assert f.fact_id not in mem._hole._singularity
-    # Layer untouched (no half-absorption to -1).
-    assert mem._facts[f.fact_id].layer != -1
+    # The different-dim body now absorbs cleanly into its own bucket
+    # — it is in the absorbed list AND removed from live facts AND
+    # present in the singularity dict.
+    assert f.fact_id in absorbed
+    assert f.fact_id not in mem._facts
+    assert f.fact_id in mem._hole._singularity
+    # And the singularity now has two dim buckets coexisting.
+    assert sorted(mem._hole.fact_dims) == [3, 5]
     mem.close()
 
 

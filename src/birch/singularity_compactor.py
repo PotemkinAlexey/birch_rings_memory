@@ -197,10 +197,12 @@ def collapse_singularity(
             source_fact_ids=source_fact_ids,
         )
 
-        # Drop the originals from the singularity and its vector index.
+        # Drop the originals from the singularity and its dim-bucket
+        # index. hole.forget_fact() handles the bucket lifecycle
+        # (lazy prune when empty) so the compactor no longer needs to
+        # know how indices are partitioned.
         for mid in members:
-            hole._singularity.pop(mid, None)
-            hole._index.remove(mid)
+            hole.forget_fact(mid)
             absorbed += 1
 
         hole.absorb_meta(meta)

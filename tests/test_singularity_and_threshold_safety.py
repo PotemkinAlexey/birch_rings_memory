@@ -67,11 +67,17 @@ def test_singularity_load_tolerates_mixed_dim_fact(tmp_path, caplog):
     }
     assert seed_fact.fact_id in in_hole
     assert rogue.fact_id in in_hole
-    # Rogue's vector was cleared because the index couldn't accept it.
+    # Per-dim refactor: rogue's vector is RETAINED and lives in its
+    # own dim bucket — no clear, no warning. Cross-dim singularity is
+    # now the supported case, not a tolerated corruption.
     rogue_rehydrated = again._hole._singularity[rogue.fact_id].fact
-    assert rogue_rehydrated.vector == []
+    assert rogue_rehydrated.vector == [0.2] * 12
+    # Two dim buckets coexist in the singularity.
+    assert sorted(again._hole.fact_dims) == [8, 12]
     again.close()
-    assert any(
+    # No "singularity dim mismatch" warning — the per-dim refactor
+    # eliminated the warning's cause.
+    assert not any(
         "singularity dim mismatch" in rec.message
         for rec in caplog.records
     )

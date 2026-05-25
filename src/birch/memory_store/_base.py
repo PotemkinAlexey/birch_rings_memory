@@ -319,29 +319,14 @@ class MemoryStore(
                 # Absorbed body — restore into the singularity so Hawking
                 # emission and singularity collapse still see it after a
                 # process restart. Symmetric with MetaFacts at layer=-1.
-                # BlackHole's singularity is one VectorIndex per body
-                # type, so a mixed-dim singularity (post-model-swap)
-                # would crash here too. Same defence as live facts:
-                # log + clear vector, body keeps its record but stays
-                # out of the index until reindex. Singularity collapse
-                # already partitions by dim independently, so this is
-                # only the rehydrate path that needed the same wrap.
-                try:
-                    self._hole.restore_fact(fact)
-                except DimensionMismatchError:
-                    # restore_fact set the singularity record BEFORE
-                    # calling _index.add, so the body is already in
-                    # _singularity — it just isn't in the vector
-                    # index. Clear the vector so downstream code can't
-                    # try to use it; record remains visible for stats
-                    # and for collapse-by-dim partitioning, just
-                    # invisible to Hawking emission until reindex.
-                    _logger.warning(
-                        "absorbed fact %r rehydrated without index "
-                        "entry (singularity dim mismatch)",
-                        fact.fact_id,
-                    )
-                    fact.vector = []
+                # BlackHole's singularity is now per-dim partitioned
+                # (each dim gets its own VectorIndex bucket), so a
+                # mixed-dim singularity post-model-swap routes cleanly:
+                # the old-dim bodies live in one bucket, the new-dim
+                # bodies in another, and Hawking emission scans only
+                # the matching dim. The try/except wrap that the
+                # earlier rounds needed here is gone with the cause.
+                self._hole.restore_fact(fact)
                 continue
             self._facts[fact.fact_id] = fact
             self._engine.register(fact)
@@ -370,19 +355,10 @@ class MemoryStore(
         if hasattr(self._storage, "load_meta_facts"):
             for meta in self._storage.load_meta_facts(cleanup=prune):
                 if meta.layer == -1:
-                    try:
-                        self._hole.restore_meta(meta)
-                    except DimensionMismatchError:
-                        # Same defence as restore_fact: record was
-                        # set in _meta_singularity before _meta_index.add
-                        # raised, so the body lives but lacks an index
-                        # entry until reindex.
-                        _logger.warning(
-                            "absorbed metafact %r rehydrated "
-                            "without index entry (singularity meta "
-                            "dim mismatch)", meta.meta_id,
-                        )
-                        meta.vector = []
+                    # Per-dim singularity routes by dim — no
+                    # mismatch possible on restore. The previous
+                    # try/except wrap is obsolete.
+                    self._hole.restore_meta(meta)
                 else:
                     self._meta_facts[meta.meta_id] = meta
                     try:

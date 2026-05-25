@@ -45,62 +45,102 @@ class BlackHole:
       - MetaFacts created by the SingularityCompactor (a dense bundle of
         many absorbed facts collapsed into one centroid)
 
-    They are kept in separate indices so Hawking emission can return each
-    type with the right typed payload — a FactPassport plugs back into the
-    live SPO store, while a MetaFact returns as a polymorphic context bundle.
+    Per-dimension vector indices
+    ----------------------------
+    Both kinds keep their flat `_singularity` / `_meta_singularity` dicts
+    (body_id → record) for O(1) lookup by id, but the cosine search
+    matrix is **partitioned by embedding dimension** in two dicts:
+    `_indices: dict[int, VectorIndex]` for facts and
+    `_meta_indices: dict[int, VectorIndex]` for metas. Each bucket is
+    dim-pure by construction — a fact with dim=384 lands in
+    `_indices[384]`, a fact with dim=768 lands in `_indices[768]`, and
+    the dim mismatch error that earlier rounds had to defend against
+    (with atomic three-phase absorb + rollback) can no longer arise
+    in the first place: there is no shared matrix to mismatch with.
+
+    Hawking emission scans only the bucket matching the query
+    vector's dim — a query with dim=384 cannot resurrect a dim=768
+    body and vice versa. This is the right semantics: vectors from
+    different embedding spaces are not comparable, so a "similarity"
+    cross-space would be undefined anyway.
+
+    Buckets are lazy: `_indices[dim]` is created on first absorb with
+    that dim and removed when its last body emits or is forgotten.
     """
 
     def __init__(self, hawking_threshold: float = _HAWKING_THRESHOLD) -> None:
         self._singularity: dict[str, SingularityRecord] = {}
         self._meta_singularity: dict[str, MetaSingularityRecord] = {}
-        # Separate indices: keeps hawking_emit() typed and avoids collisions
-        # if a fact_id ever shared bytes with a meta_id.
-        self._index = VectorIndex()              # FactPassport vectors
-        self._meta_index = VectorIndex()         # MetaFact vectors
+        # dim → VectorIndex. Each bucket is dim-pure; a fact with a
+        # never-before-seen dim creates a new bucket on absorb.
+        self._indices: dict[int, VectorIndex] = {}
+        self._meta_indices: dict[int, VectorIndex] = {}
         self._hawking_threshold = hawking_threshold
         self._total_emissions = 0   # cumulative, survives record removal
+
+    # ── Internal index lookup ───────────────────────────────────────────────
+
+    def _index_for(self, dim: int) -> VectorIndex:
+        """Get or create the fact-bucket for ``dim``."""
+        idx = self._indices.get(dim)
+        if idx is None:
+            idx = VectorIndex()
+            self._indices[dim] = idx
+        return idx
+
+    def _meta_index_for(self, dim: int) -> VectorIndex:
+        """Get or create the meta-bucket for ``dim``."""
+        idx = self._meta_indices.get(dim)
+        if idx is None:
+            idx = VectorIndex()
+            self._meta_indices[dim] = idx
+        return idx
+
+    def _prune_empty_fact_bucket(self, dim: int) -> None:
+        """Drop a fact bucket whose VectorIndex went empty so the
+        bucket dict doesn't accumulate stale zero-size entries."""
+        idx = self._indices.get(dim)
+        if idx is not None and len(idx) == 0:
+            del self._indices[dim]
+
+    def _prune_empty_meta_bucket(self, dim: int) -> None:
+        """Meta counterpart of ``_prune_empty_fact_bucket``."""
+        idx = self._meta_indices.get(dim)
+        if idx is not None and len(idx) == 0:
+            del self._meta_indices[dim]
 
     # ── Absorption ──────────────────────────────────────────────────────────
 
     def absorb(self, fact: "FactPassport") -> None:
         """Pull a FactPassport across the event horizon. Irreversible.
 
-        Atomic: index.add can raise DimensionMismatchError if the
-        live fact's vector dim differs from existing singularity
-        vectors (e.g. embedding model swap mid-process, before
-        loader-level cleanup runs). Previous order — set layer, put
-        in dict, then add to index — left the body half-absorbed on
-        failure: ``layer == -1`` and present in ``_singularity``
-        but invisible to Hawking, while ``_absorb_dead``'s caller
-        had not yet deleted it from live ``_facts``. With ``storage
-        == None`` (test / in-memory mode) ``_reload`` cannot
-        recover. Three-phase: pre-flight the index add via a
-        dry-run, then mutate, then commit the index.
+        With per-dim buckets the cross-dim mismatch hazard is removed
+        at the source: a fact with vector dim D lands in
+        ``_indices[D]``, which is dim-pure by construction. The
+        previous round's atomic three-phase contract + rollback still
+        applies as belt-and-suspenders against unexpected index
+        failures (numpy / OOM), but DimensionMismatchError can no
+        longer originate here.
         """
-        # Pre-flight: index.add will raise if dims mismatch — do the
-        # raise here BEFORE any state mutation. Empty index accepts
-        # any dim (returns no-op), so first absorption always works.
-        if fact.vector and self._index.dim is not None \
-                and len(fact.vector) != self._index.dim:
-            raise DimensionMismatchError(
-                f"BlackHole.absorb: live fact vector dim="
-                f"{len(fact.vector)} cannot join singularity index "
-                f"dim={self._index.dim}. Either run "
-                f"singularity collapse to bucket by dim, or rebuild "
-                f"the store."
-            )
         fact.layer = -1     # sentinel: beyond core
         self._singularity[fact.fact_id] = SingularityRecord(fact=fact)
+        if not fact.vector:
+            # Vectorless bodies still live in the dict — they're
+            # searchable by id but never returned from Hawking.
+            return
+        dim = len(fact.vector)
+        idx = self._index_for(dim)
         try:
-            self._index.add(fact.fact_id, fact.vector)
+            idx.add(fact.fact_id, fact.vector)
         except Exception:
-            # Belt: pre-flight covers DimensionMismatchError, but
-            # any other index failure (numpy, OOM) rolls back the
-            # dict insert + layer mutation so the live store stays
-            # consistent. Raise so the caller sees the failure and
-            # can abort the absorption sweep.
+            # Defensive: per-dim buckets remove the dim-mismatch
+            # cause, but any other failure (numpy alloc, OOM) still
+            # rolls back the dict insert + layer mutation so the live
+            # store stays consistent.
             self._singularity.pop(fact.fact_id, None)
             fact.layer = 2   # rollback to "core" — closest live layer
+            # Prune the bucket if we just created an empty one.
+            self._prune_empty_fact_bucket(dim)
             raise
 
     def restore_fact(self, fact: "FactPassport") -> None:
@@ -109,38 +149,74 @@ class BlackHole:
         ``MemoryStore._load_from_storage`` to re-hydrate the black hole from
         SQLite rows whose ``layer == -1`` so absorbed facts survive a
         process restart and remain eligible for Hawking emission.
+
+        Per-dim routing applies — bodies whose vectors survived the
+        loader's _safe_vector gate land in their dim bucket; bodies
+        with empty vectors live in the dict only.
         """
         self._singularity[fact.fact_id] = SingularityRecord(fact=fact)
-        self._index.add(fact.fact_id, fact.vector)
+        if fact.vector:
+            self._index_for(len(fact.vector)).add(fact.fact_id, fact.vector)
 
     def absorb_meta(self, meta: "MetaFact") -> None:
         """Place a MetaFact in the singularity (typical: just after collapse).
 
-        Atomic — same three-phase contract as ``absorb`` so a dim
-        mismatch (mixed-dim singularity after model swap) cannot
-        leave the meta half-absorbed.
+        Per-dim bucketed symmetrically with ``absorb``.
         """
-        if meta.vector and self._meta_index.dim is not None \
-                and len(meta.vector) != self._meta_index.dim:
-            raise DimensionMismatchError(
-                f"BlackHole.absorb_meta: meta vector dim="
-                f"{len(meta.vector)} cannot join meta-singularity "
-                f"index dim={self._meta_index.dim}. Run collapse "
-                f"to bucket by dim, or rebuild the store."
-            )
         meta.layer = -1
         self._meta_singularity[meta.meta_id] = MetaSingularityRecord(meta=meta)
+        if not meta.vector:
+            return
+        dim = len(meta.vector)
+        idx = self._meta_index_for(dim)
         try:
-            self._meta_index.add(meta.meta_id, meta.vector)
+            idx.add(meta.meta_id, meta.vector)
         except Exception:
             self._meta_singularity.pop(meta.meta_id, None)
             meta.layer = 0   # rollback to live; caller decides next step
+            self._prune_empty_meta_bucket(dim)
             raise
 
     def restore_meta(self, meta: "MetaFact") -> None:
         """Rehydrate a MetaFact loaded from storage without touching its layer."""
         self._meta_singularity[meta.meta_id] = MetaSingularityRecord(meta=meta)
-        self._meta_index.add(meta.meta_id, meta.vector)
+        if meta.vector:
+            self._meta_index_for(len(meta.vector)).add(meta.meta_id, meta.vector)
+
+    # ── Removal helpers (replace direct _index.remove() consumer code) ──────
+
+    def forget_fact(self, fact_id: str) -> bool:
+        """Remove a fact from the singularity AND its dim-index atomically.
+
+        Returns True if removed, False if not present. Consumers
+        (singularity compactor, MemoryStore.delete_body) should call
+        this instead of doing ``_singularity.pop`` + per-dim index
+        cleanup by hand — keeps the bucket lifecycle (lazy create,
+        auto-prune when empty) entirely inside BlackHole.
+        """
+        rec = self._singularity.pop(fact_id, None)
+        if rec is None:
+            return False
+        if rec.fact.vector:
+            dim = len(rec.fact.vector)
+            idx = self._indices.get(dim)
+            if idx is not None:
+                idx.remove(fact_id)
+                self._prune_empty_fact_bucket(dim)
+        return True
+
+    def forget_meta(self, meta_id: str) -> bool:
+        """MetaFact counterpart of ``forget_fact``."""
+        rec = self._meta_singularity.pop(meta_id, None)
+        if rec is None:
+            return False
+        if rec.meta.vector:
+            dim = len(rec.meta.vector)
+            idx = self._meta_indices.get(dim)
+            if idx is not None:
+                idx.remove(meta_id)
+                self._prune_empty_meta_bucket(dim)
+        return True
 
     # ── Hawking emission ────────────────────────────────────────────────────
 
@@ -159,8 +235,18 @@ class BlackHole:
         Avoids the contract violation where a body was resurrected
         (state mutation, persistence) but the caller never received it
         because it was below top_k.
+
+        Per-dim scan: only the bucket matching ``len(query_vector)``
+        is searched — cross-dim cosine is undefined, so bodies in
+        other dim buckets are correctly invisible to this query.
         """
-        sims = self._index.all_similarities(query_vector)
+        if not query_vector:
+            return []
+        dim = len(query_vector)
+        idx = self._indices.get(dim)
+        if idx is None:
+            return []
+        sims = idx.all_similarities(query_vector)
         out: list[tuple["FactPassport", float]] = []
         for fid, score in sims.items():
             if score < self._hawking_threshold:
@@ -180,8 +266,14 @@ class BlackHole:
         predicate=None,
     ) -> list[tuple["MetaFact", float]]:
         """MetaFact counterpart of ``peek_hawking_candidates``."""
+        if not query_vector:
+            return []
+        dim = len(query_vector)
+        idx = self._meta_indices.get(dim)
+        if idx is None:
+            return []
         thr = self._hawking_threshold if threshold is None else threshold
-        sims = self._meta_index.all_similarities(query_vector)
+        sims = idx.all_similarities(query_vector)
         out: list[tuple["MetaFact", float]] = []
         for mid, score in sims.items():
             if score < thr:
@@ -214,8 +306,16 @@ class BlackHole:
 
         MetaFact emission lives behind ``hawking_emit_metas`` so the typed
         return value stays narrow for the legacy call site.
+
+        Per-dim scan: see ``peek_hawking_candidates``.
         """
-        sims = self._index.all_similarities(query_vector)
+        if not query_vector:
+            return []
+        dim = len(query_vector)
+        idx = self._indices.get(dim)
+        if idx is None:
+            return []
+        sims = idx.all_similarities(query_vector)
         # Filter BEFORE pop — so a rejected body stays in the singularity
         # entirely, with no mutation.
         emitted: list["FactPassport"] = []
@@ -229,13 +329,16 @@ class BlackHole:
                 continue
             if predicate is not None and not predicate(rec.fact):
                 continue
-            # Now commit: pop from singularity, reset gravity, return.
+            # Now commit: pop from singularity, remove from bucket,
+            # reset gravity, return. forget_fact handles bucket
+            # lifecycle (lazy prune when empty).
             self._singularity.pop(fid)
-            self._index.remove(fid)
+            idx.remove(fid)
             rec.fact.gravity_score = _HAWKING_GRAVITY
             rec.fact.layer = 1
             self._total_emissions += 1
             emitted.append(rec.fact)
+        self._prune_empty_fact_bucket(dim)
         return emitted
 
     def hawking_emit_metas(
@@ -258,8 +361,14 @@ class BlackHole:
         gates which bodies actually emerge — see ``hawking_emit`` for the
         scope-respecting motivation.
         """
+        if not query_vector:
+            return []
+        dim = len(query_vector)
+        idx = self._meta_indices.get(dim)
+        if idx is None:
+            return []
         thr = self._hawking_threshold if threshold is None else threshold
-        sims = self._meta_index.all_similarities(query_vector)
+        sims = idx.all_similarities(query_vector)
         emitted: list["MetaFact"] = []
         for mid, score in sims.items():
             if score < thr:
@@ -272,11 +381,12 @@ class BlackHole:
             if predicate is not None and not predicate(rec.meta):
                 continue
             self._meta_singularity.pop(mid)
-            self._meta_index.remove(mid)
+            idx.remove(mid)
             rec.meta.gravity_score = rec.meta.gravity_on_emission(_HAWKING_GRAVITY)
             rec.meta.layer = 1
             self._total_emissions += 1
             emitted.append(rec.meta)
+        self._prune_empty_meta_bucket(dim)
         return emitted
 
     # ── Status ──────────────────────────────────────────────────────────────
@@ -295,8 +405,30 @@ class BlackHole:
         return len(self._meta_singularity)
 
     @property
+    def fact_dims(self) -> list[int]:
+        """List of active fact dim buckets (sorted). Empty when the
+        fact singularity holds nothing."""
+        return sorted(self._indices.keys())
+
+    @property
+    def meta_dims(self) -> list[int]:
+        """List of active meta dim buckets (sorted). Empty when the
+        meta singularity holds nothing."""
+        return sorted(self._meta_indices.keys())
+
+    @property
     def total_emissions(self) -> int:
+        """Cumulative Hawking emissions across the process lifetime."""
         return self._total_emissions
 
     def __contains__(self, body_id: str) -> bool:
         return body_id in self._singularity or body_id in self._meta_singularity
+
+
+# DimensionMismatchError is re-exported for backward-compat with
+# callers that imported it from this module before the per-dim
+# refactor removed its direct usage in absorb / absorb_meta. Per-dim
+# buckets eliminate the originating cause, but a downstream caller
+# can still legitimately raise it through other vector_index paths.
+__all__ = ["BlackHole", "DimensionMismatchError",
+           "SingularityRecord", "MetaSingularityRecord"]

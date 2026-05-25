@@ -723,8 +723,10 @@ class FactsMixin:
                                 "body_id": body_id}
                     # 3. Singularity FactPassport.
                     if body_id in self._hole._singularity:
-                        self._hole._singularity.pop(body_id)
-                        self._hole._index.remove(body_id)
+                        # forget_fact pops the singularity dict AND
+                        # removes from the right dim-bucket, pruning
+                        # the bucket if it becomes empty.
+                        self._hole.forget_fact(body_id)
                         if self._storage:
                             self._storage.delete_fact(body_id)
                             # Same edge cleanup as the live-fact branch
@@ -739,8 +741,7 @@ class FactsMixin:
                                 "body_id": body_id}
                     # 4. Singularity MetaFact.
                     if body_id in self._hole._meta_singularity:
-                        self._hole._meta_singularity.pop(body_id)
-                        self._hole._meta_index.remove(body_id)
+                        self._hole.forget_meta(body_id)
                         if (self._storage
                                 and hasattr(self._storage, "delete_meta_fact")):
                             self._storage.delete_meta_fact(body_id)
