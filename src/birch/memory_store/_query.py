@@ -232,7 +232,7 @@ class QueryMixin:
                     continue
                 results.append(QueryResult(
                     fact=fact,
-                    similarity=round(sim, 4),
+                    similarity=sim,
                     source=layer_labels.get(fact.layer, "kinetic"),
                 ))
 
@@ -264,7 +264,7 @@ class QueryMixin:
                     continue
                 results.append(QueryResult(
                     meta=meta,
-                    similarity=round(sim, 4),
+                    similarity=sim,
                     source=layer_labels.get(meta.layer, "kinetic"),
                 ))
 
@@ -438,7 +438,7 @@ class QueryMixin:
                                 continue
                             backfill_candidates.append(QueryResult(
                                 fact=fact,
-                                similarity=round(sim, 4),
+                                similarity=sim,
                                 source=layer_labels.get(fact.layer, "kinetic"),
                             ))
                         fresh_meta_sims = self._meta_index.all_similarities(vec)
@@ -463,7 +463,7 @@ class QueryMixin:
                                 continue
                             backfill_candidates.append(QueryResult(
                                 meta=meta,
-                                similarity=round(sim, 4),
+                                similarity=sim,
                                 source=layer_labels.get(meta.layer, "kinetic"),
                             ))
                         backfill_candidates.sort(
@@ -516,7 +516,7 @@ class QueryMixin:
                                 continue
                             top.append(QueryResult(
                                 fact=fact,
-                                similarity=round(sim, 4),
+                                similarity=sim,
                                 source="hawking",
                             ))
                         for meta, sim in meta_candidates:
@@ -524,7 +524,7 @@ class QueryMixin:
                                 continue
                             top.append(QueryResult(
                                 meta=meta,
-                                similarity=round(sim, 4),
+                                similarity=sim,
                                 source="hawking_meta",
                             ))
 

@@ -20,6 +20,13 @@ class QueryResult:
     Exactly one of ``fact`` and ``meta`` is non-None. Legacy callers that
     read ``r.fact.fact_id`` keep working for fact hits; new callers branch
     on ``r.kind`` (``"fact"`` or ``"meta"``) and read the right field.
+
+    ``similarity`` holds the **raw** cosine score, not rounded. Internal
+    consumers (session attribution, gravity weighting, ranking) use the
+    full-precision value; only ``to_mcp_dict`` rounds to 4 decimals for
+    display. Earlier code rounded at construction, which silently fed a
+    truncated weight into the resonance feedback loop — fine for display
+    but technically dishonest for "round only on output".
     """
     similarity: float
     source: str     # "surface" | "kinetic" | "core" | "hawking" | "hawking_meta"
