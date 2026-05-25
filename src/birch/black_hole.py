@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .vector_index import VectorIndex
+from .vector_index import DimensionMismatchError, VectorIndex
 
 if TYPE_CHECKING:
     from .fact import FactPassport
@@ -63,10 +63,45 @@ class BlackHole:
     # ── Absorption ──────────────────────────────────────────────────────────
 
     def absorb(self, fact: "FactPassport") -> None:
-        """Pull a FactPassport across the event horizon. Irreversible."""
+        """Pull a FactPassport across the event horizon. Irreversible.
+
+        Atomic: index.add can raise DimensionMismatchError if the
+        live fact's vector dim differs from existing singularity
+        vectors (e.g. embedding model swap mid-process, before
+        loader-level cleanup runs). Previous order — set layer, put
+        in dict, then add to index — left the body half-absorbed on
+        failure: ``layer == -1`` and present in ``_singularity``
+        but invisible to Hawking, while ``_absorb_dead``'s caller
+        had not yet deleted it from live ``_facts``. With ``storage
+        == None`` (test / in-memory mode) ``_reload`` cannot
+        recover. Three-phase: pre-flight the index add via a
+        dry-run, then mutate, then commit the index.
+        """
+        # Pre-flight: index.add will raise if dims mismatch — do the
+        # raise here BEFORE any state mutation. Empty index accepts
+        # any dim (returns no-op), so first absorption always works.
+        if fact.vector and self._index._dim is not None \
+                and len(fact.vector) != self._index._dim:
+            raise DimensionMismatchError(
+                f"BlackHole.absorb: live fact vector dim="
+                f"{len(fact.vector)} cannot join singularity index "
+                f"dim={self._index._dim}. Either run "
+                f"singularity collapse to bucket by dim, or rebuild "
+                f"the store."
+            )
         fact.layer = -1     # sentinel: beyond core
         self._singularity[fact.fact_id] = SingularityRecord(fact=fact)
-        self._index.add(fact.fact_id, fact.vector)
+        try:
+            self._index.add(fact.fact_id, fact.vector)
+        except Exception:
+            # Belt: pre-flight covers DimensionMismatchError, but
+            # any other index failure (numpy, OOM) rolls back the
+            # dict insert + layer mutation so the live store stays
+            # consistent. Raise so the caller sees the failure and
+            # can abort the absorption sweep.
+            self._singularity.pop(fact.fact_id, None)
+            fact.layer = 2   # rollback to "core" — closest live layer
+            raise
 
     def restore_fact(self, fact: "FactPassport") -> None:
         """Place a fact directly into the singularity without touching its
@@ -79,10 +114,28 @@ class BlackHole:
         self._index.add(fact.fact_id, fact.vector)
 
     def absorb_meta(self, meta: "MetaFact") -> None:
-        """Place a MetaFact in the singularity (typical: just after collapse)."""
+        """Place a MetaFact in the singularity (typical: just after collapse).
+
+        Atomic — same three-phase contract as ``absorb`` so a dim
+        mismatch (mixed-dim singularity after model swap) cannot
+        leave the meta half-absorbed.
+        """
+        if meta.vector and self._meta_index._dim is not None \
+                and len(meta.vector) != self._meta_index._dim:
+            raise DimensionMismatchError(
+                f"BlackHole.absorb_meta: meta vector dim="
+                f"{len(meta.vector)} cannot join meta-singularity "
+                f"index dim={self._meta_index._dim}. Run collapse "
+                f"to bucket by dim, or rebuild the store."
+            )
         meta.layer = -1
         self._meta_singularity[meta.meta_id] = MetaSingularityRecord(meta=meta)
-        self._meta_index.add(meta.meta_id, meta.vector)
+        try:
+            self._meta_index.add(meta.meta_id, meta.vector)
+        except Exception:
+            self._meta_singularity.pop(meta.meta_id, None)
+            meta.layer = 0   # rollback to live; caller decides next step
+            raise
 
     def restore_meta(self, meta: "MetaFact") -> None:
         """Rehydrate a MetaFact loaded from storage without touching its layer."""

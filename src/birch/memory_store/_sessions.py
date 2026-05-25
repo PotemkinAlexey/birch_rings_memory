@@ -32,6 +32,7 @@ class SessionsMixin:
     _echo: "EchoStore"
     _sessions: "dict[str, SessionContext]"
     _current_session_id: "Optional[str]"
+    _closing_sessions: "set[str]"
     _mutation_version: int
 
     if TYPE_CHECKING:
@@ -238,6 +239,26 @@ class SessionsMixin:
                     sid = self._resolve_sid(session_id)
                     if sid is None or sid not in self._sessions:
                         raise KeyError(f"unknown session: {sid!r}")
+                    # Closing-session gate. session_close snapshots
+                    # ctx state and then releases the lock for the
+                    # heavy compute_resonance call. A push that
+                    # lands during that window used to:
+                    #   1. append to ctx.messages (in-memory)
+                    #   2. persist to disk via save_open_session
+                    #   3. get silently dropped when session_close
+                    #      pops the ctx after writeback — R was
+                    #      computed over the pre-push snapshot.
+                    # Agent saw push succeed but the message never
+                    # influenced R / echo bundle / future sessions.
+                    # Reject explicitly so the caller can retry on
+                    # a fresh session_open instead.
+                    if sid in self._closing_sessions:
+                        raise RuntimeError(
+                            f"session_closing: session {sid!r} is "
+                            f"mid-close — push would be silently "
+                            f"dropped. Wait for close to complete or "
+                            f"open a new session."
+                        )
                     ctx = self._sessions[sid]
                     # Dim preflight BEFORE mutation. Embedding provider
                     # silently returning a different dim (model swap
@@ -338,6 +359,13 @@ class SessionsMixin:
             messages_snapshot = list(ctx.messages)
             vectors_snapshot = list(ctx.vectors)
             facts_snapshot = dict(ctx.facts)
+            # Mark closing — under the lock, after snapshot, before
+            # we release for compute_resonance. session_message will
+            # now reject pushes to this sid until close completes
+            # or fails. try/finally below ensures the flag clears
+            # on every exit path so a partial failure doesn't
+            # permanently brick the session id.
+            self._closing_sessions.add(sid)
 
         # Resolve the resonance score. Override paths skip the
         # behavioural / semantic / repetition computation entirely.
@@ -578,7 +606,18 @@ class SessionsMixin:
                 # truth before propagating — symmetric with add_fact /
                 # add_facts / query / collapse_singularity.
                 self._reload()
+                # Clear closing flag even on failure so the sid can
+                # be retried on a future session_close (after _reload
+                # restored the live ctx). Without this discard, a
+                # write-side crash would permanently brick the sid
+                # for any future session_message.
+                self._closing_sessions.discard(sid)
                 raise
+            # Successful close: drop the flag now that the ctx is
+            # popped and the writeback committed. session_message
+            # for this sid will now raise "unknown session" (the
+            # honest result) rather than "session closing".
+            self._closing_sessions.discard(sid)
         return summary
 
     def _pop_session_locked(self, sid: str) -> None:

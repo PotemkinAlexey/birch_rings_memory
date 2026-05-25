@@ -1,6 +1,7 @@
 """SingularityMixin — black-hole absorption, collapse, forecast."""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -13,6 +14,8 @@ from ..singularity_compactor import (
     collapse_singularity,
 )
 from ..thresholds import Thresholds
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..black_hole import BlackHole
@@ -77,8 +80,23 @@ class SingularityMixin:
             )
             if not falls_to_hole:
                 continue
-            fact.layer = -1
-            self._hole.absorb(fact)
+            # BlackHole.absorb is now atomic — pre-flights dim
+            # compatibility and rolls back on any index failure
+            # (raises with the fact restored to layer=2 and not
+            # in the singularity dict). Catch here so one
+            # mismatched-dim body doesn't abort the whole sweep;
+            # the fact stays live and visible, just not absorbed
+            # this pass. Operator can run collapse to bucket by
+            # dim, then absorption will succeed.
+            try:
+                self._hole.absorb(fact)
+            except Exception as exc:
+                _logger.warning(
+                    "_absorb_dead: skipping fact_id=%r — absorb "
+                    "failed (likely mixed-dim singularity): %s",
+                    fid, exc,
+                )
+                continue
             del self._facts[fid]
             self._index.remove(fid)
             self._drop_from_spo_index(fact)
@@ -286,126 +304,142 @@ class SingularityMixin:
         scores = forecast_stability(bodies_snapshot, horizon_ticks=horizon_ticks)
 
         with self._lock:
-            with self._txn():
-                self._sync()
-                # Snapshot revalidation: the heavy N² simulation above
-                # ran OUTSIDE the lock so concurrent agents could keep
-                # querying. While we were away, another thread could
-                # have called set_fact / session_close / add_fact /
-                # delete_body and bumped _mutation_version. Writing
-                # stale scores into the surviving subset of bodies
-                # would silently feed the next tick's adaptive gravity
-                # with values computed from a phantom past. Recompute
-                # the same key under the lock and abort cleanly if
-                # the universe moved. Agent retries; the next call
-                # picks up the post-mutation state.
-                live_count = len(self._facts) + len(self._meta_facts)
-                writeback_key = (
-                    self._data_version_now(),
-                    self._mutation_version,
-                    live_count,
-                    horizon_ticks,
-                )
-                if writeback_key != cache_key:
-                    return {
-                        "ok": False,
-                        "error": "forecast_snapshot_stale",
+            try:
+                with self._txn():
+                    self._sync()
+                        # Snapshot revalidation: the heavy N² simulation above
+                    # ran OUTSIDE the lock so concurrent agents could keep
+                    # querying. While we were away, another thread could
+                    # have called set_fact / session_close / add_fact /
+                    # delete_body and bumped _mutation_version. Writing
+                    # stale scores into the surviving subset of bodies
+                    # would silently feed the next tick's adaptive gravity
+                    # with values computed from a phantom past. Recompute
+                    # the same key under the lock and abort cleanly if
+                    # the universe moved. Agent retries; the next call
+                    # picks up the post-mutation state.
+                    live_count = len(self._facts) + len(self._meta_facts)
+                    writeback_key = (
+                        self._data_version_now(),
+                        self._mutation_version,
+                        live_count,
+                        horizon_ticks,
+                    )
+                    if writeback_key != cache_key:
+                        return {
+                            "ok": False,
+                            "error": "forecast_snapshot_stale",
+                            "horizon_ticks": horizon_ticks,
+                            "snapshot_body_count": len(bodies_snapshot),
+                            "writeback_body_count": live_count,
+                            "hint": (
+                                "Memory mutated between snapshot and "
+                                "writeback. Retry forecast_memory; the "
+                                "next call sees the post-mutation state."
+                            ),
+                        }
+                    updated_facts: list = []
+                    updated_metas: list = []
+                    for bid, score in scores.items():
+                        fact = self._facts.get(bid)
+                        if fact is not None:
+                            fact.forecast_stability = float(score)
+                            updated_facts.append(fact)
+                            continue
+                        meta = self._meta_facts.get(bid)
+                        if meta is not None:
+                            meta.forecast_stability = float(score)
+                            updated_metas.append(meta)
+                    if self._storage:
+                        if updated_facts:
+                            self._storage.save_facts(updated_facts)
+                        if (updated_metas
+                                and hasattr(self._storage, "save_meta_facts")):
+                            self._storage.save_meta_facts(updated_metas)
+                    facts_updated_n = len(updated_facts)
+                    metas_updated_n = len(updated_metas)
+                    updated = facts_updated_n + metas_updated_n
+                    # Distribution snapshot + payload construction +
+                    # cache-slot write all happen under the writeback
+                    # lock — _forecast_cache is shared mutable state and
+                    # two concurrent forecasts racing into the slot
+                    # could tear the assignment. The lock that already
+                    # guards _facts / _meta_facts / _mutation_version
+                    # also owns the cache slot.
+                    ranges = {
+                        "safe": 0, "kinetic": 0,
+                        "near_horizon": 0, "predicted_fall": 0,
+                    }
+                    for score in scores.values():
+                        if score >= 0.7:
+                            ranges["safe"] += 1
+                        elif score >= 0.3:
+                            ranges["kinetic"] += 1
+                        elif score > 0.0:
+                            ranges["near_horizon"] += 1
+                        else:
+                            ranges["predicted_fall"] += 1
+                    result_payload = {
                         "horizon_ticks": horizon_ticks,
-                        "snapshot_body_count": len(bodies_snapshot),
-                        "writeback_body_count": live_count,
-                        "hint": (
-                            "Memory mutated between snapshot and "
-                            "writeback. Retry forecast_memory; the "
-                            "next call sees the post-mutation state."
+                        "cached": False,
+                        # Kept for wire-format stability; aliases of the
+                        # new keys.
+                        "facts_forecasted": len(scores),
+                        "facts_updated": updated,
+                        # Clearer keys: forecast now covers both
+                        # FactPassports and MetaFacts (both carry
+                        # forecast_stability), so the operator can see
+                        # how the update split across body types.
+                        "bodies_forecasted": len(scores),
+                        "bodies_updated": updated,
+                        "facts_updated_count": facts_updated_n,
+                        "metas_updated_count": metas_updated_n,
+                        "distribution": ranges,
+                        "_hint": (
+                            "facts_forecasted / facts_updated are legacy "
+                            "aliases — they actually count BODIES "
+                            "(FactPassport + MetaFact). Prefer "
+                            "bodies_forecasted / bodies_updated, or read "
+                            "the per-type split via facts_updated_count "
+                            "and metas_updated_count."
                         ),
                     }
-                updated_facts: list = []
-                updated_metas: list = []
-                for bid, score in scores.items():
-                    fact = self._facts.get(bid)
-                    if fact is not None:
-                        fact.forecast_stability = float(score)
-                        updated_facts.append(fact)
-                        continue
-                    meta = self._meta_facts.get(bid)
-                    if meta is not None:
-                        meta.forecast_stability = float(score)
-                        updated_metas.append(meta)
-                if self._storage:
-                    if updated_facts:
-                        self._storage.save_facts(updated_facts)
-                    if (updated_metas
-                            and hasattr(self._storage, "save_meta_facts")):
-                        self._storage.save_meta_facts(updated_metas)
-                facts_updated_n = len(updated_facts)
-                metas_updated_n = len(updated_metas)
-                updated = facts_updated_n + metas_updated_n
-                # Distribution snapshot + payload construction +
-                # cache-slot write all happen under the writeback
-                # lock — _forecast_cache is shared mutable state and
-                # two concurrent forecasts racing into the slot
-                # could tear the assignment. The lock that already
-                # guards _facts / _meta_facts / _mutation_version
-                # also owns the cache slot.
-                ranges = {
-                    "safe": 0, "kinetic": 0,
-                    "near_horizon": 0, "predicted_fall": 0,
-                }
-                for score in scores.values():
-                    if score >= 0.7:
-                        ranges["safe"] += 1
-                    elif score >= 0.3:
-                        ranges["kinetic"] += 1
-                    elif score > 0.0:
-                        ranges["near_horizon"] += 1
-                    else:
-                        ranges["predicted_fall"] += 1
-                result_payload = {
-                    "horizon_ticks": horizon_ticks,
-                    "cached": False,
-                    # Kept for wire-format stability; aliases of the
-                    # new keys.
-                    "facts_forecasted": len(scores),
-                    "facts_updated": updated,
-                    # Clearer keys: forecast now covers both
-                    # FactPassports and MetaFacts (both carry
-                    # forecast_stability), so the operator can see
-                    # how the update split across body types.
-                    "bodies_forecasted": len(scores),
-                    "bodies_updated": updated,
-                    "facts_updated_count": facts_updated_n,
-                    "metas_updated_count": metas_updated_n,
-                    "distribution": ranges,
-                    "_hint": (
-                        "facts_forecasted / facts_updated are legacy "
-                        "aliases — they actually count BODIES "
-                        "(FactPassport + MetaFact). Prefer "
-                        "bodies_forecasted / bodies_updated, or read "
-                        "the per-type split via facts_updated_count "
-                        "and metas_updated_count."
-                    ),
-                }
-                # Cache the response keyed by the snapshot we
-                # forecasted against. Subsequent calls with no
-                # intervening writes hit the cache.
-                #
-                # INTENTIONAL non-bump: run_forecast writes
-                # forecast_stability into bodies but does NOT call
-                # _bump_mutation_locked(). Reason: this write is a
-                # *projection* of the (data_version, mutation_version)
-                # snapshot we just forecasted against — re-running on
-                # the same snapshot must hit the cache, so bumping
-                # would force a needless N² recompute on every
-                # consecutive call. The downstream consumers of
-                # forecast_stability (pre_resonance_features in
-                # gravity, SGD in session_close) read the new values
-                # on their next access; they don't subscribe to
-                # mutation_version for forecast specifically.
-                # If a future caller needs "tell me when forecast
-                # values changed" granularity, add a dedicated
-                # _forecast_version counter rather than coupling
-                # forecast writes to the general mutation bump.
-                self._forecast_cache = (
-                    cache_key, dict(result_payload),
-                )
+                    # Cache the response keyed by the snapshot we
+                    # forecasted against. Subsequent calls with no
+                    # intervening writes hit the cache.
+                    #
+                    # INTENTIONAL non-bump: run_forecast writes
+                    # forecast_stability into bodies but does NOT call
+                    # _bump_mutation_locked(). Reason: this write is a
+                    # *projection* of the (data_version, mutation_version)
+                    # snapshot we just forecasted against — re-running on
+                    # the same snapshot must hit the cache, so bumping
+                    # would force a needless N² recompute on every
+                    # consecutive call. The downstream consumers of
+                    # forecast_stability (pre_resonance_features in
+                    # gravity, SGD in session_close) read the new values
+                    # on their next access; they don't subscribe to
+                    # mutation_version for forecast specifically.
+                    # If a future caller needs "tell me when forecast
+                    # values changed" granularity, add a dedicated
+                    # _forecast_version counter rather than coupling
+                    # forecast writes to the general mutation bump.
+                    self._forecast_cache = (
+                        cache_key, dict(result_payload),
+                    )
+            except Exception:
+                # Standard rollback-recovery pattern, symmetric with
+                # add_fact / add_facts / query / collapse_singularity
+                # / session_close. The storage txn rolls back the
+                # disk truth, but in-memory fact.forecast_stability
+                # / meta.forecast_stability writes above are not in
+                # the txn — they mutate live objects. Without
+                # _reload(), disk truth and RAM truth diverge:
+                # next session_close trains adaptive_gravity with
+                # phantom forecast scores, and a restart silently
+                # snaps them back. forecast_stability feeds gravity
+                # directly via pre_resonance_features, so the drift
+                # propagates into layer migration decisions.
+                self._reload()
+                raise
         return result_payload

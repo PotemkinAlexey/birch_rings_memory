@@ -221,6 +221,15 @@ class QueryMixin:
                     continue
                 if prefix and not fact.subject.lower().startswith(prefix):
                     continue
+                # Apply min_similarity to the RAW cosine, not the
+                # 4-decimal display value. Asymmetric otherwise:
+                # Hawking-candidate filter (line ~420) already uses
+                # raw sim, so a live hit at sim=0.95004 (rounds to
+                # 0.9500) would fail min_similarity=0.95005 while
+                # a Hawking hit at the same raw score would pass.
+                # Round only on output, never on decision.
+                if sim < min_similarity:
+                    continue
                 results.append(QueryResult(
                     fact=fact,
                     similarity=round(sim, 4),
@@ -250,6 +259,9 @@ class QueryMixin:
                     if not any((st or "").lower().startswith(prefix)
                                for st in meta.source_texts):
                         continue
+                # Raw-sim filter symmetric with the live-fact branch.
+                if sim < min_similarity:
+                    continue
                 results.append(QueryResult(
                     meta=meta,
                     similarity=round(sim, 4),
@@ -260,8 +272,13 @@ class QueryMixin:
             # the live snapshot; mutation (touch / attribute / Hawking pop /
             # persist) happens together under the write transaction below.
             results.sort(key=lambda r: r.similarity, reverse=True)
-            if min_similarity > 0.0:
-                results = [r for r in results if r.similarity >= min_similarity]
+            # NB: no post-loop min_similarity filter. Both append
+            # sites (live facts, live metas) already filter on the
+            # raw cosine — adding a second pass over r.similarity
+            # would re-introduce the rounded-vs-raw asymmetry
+            # versus the Hawking branch (which also filters on
+            # raw at peek time). Decision on raw, round only on
+            # serialisation.
             top = results[:top_k]
             sid = self._resolve_sid(session_id)
 

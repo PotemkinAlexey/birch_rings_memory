@@ -133,6 +133,15 @@ class MemoryStore(
         # only safe under single-user / sequential use.
         self._sessions: dict[str, SessionContext] = {}
         self._current_session_id: Optional[str] = None
+        # Sessions currently inside session_close after the snapshot
+        # phase. session_message must reject pushes to a closing
+        # session — otherwise a late message lands in ctx.messages,
+        # gets persisted to disk, and is then silently dropped when
+        # session_close pops the ctx (it computed R over the snapshot
+        # taken BEFORE the late push). The agent saw push succeed
+        # but the message never influenced R / echo / future
+        # sessions. Set membership is the cheapest possible gate.
+        self._closing_sessions: set[str] = set()
         # Re-entrant lock guards _facts, _index, _spo_index, _sessions and
         # gravity/echo internals. Embed() calls are kept OUT of the lock
         # so concurrent agents don't serialize on a slow HTTP roundtrip.
