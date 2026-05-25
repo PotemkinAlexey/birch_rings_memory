@@ -13,6 +13,15 @@ class SemanticScore:
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
+    # Dim-mismatch reject — zip would silently truncate to the shorter
+    # length, giving a "kinda similar" score that lies. Same contract
+    # as cluster._cosine and VectorIndex. Session-level dim consistency
+    # is preflighted at session_message time, but a model swap between
+    # session_open and the start_vector/end_vector compute would still
+    # leave start and end vectors at different dims — return 0 so the
+    # caller sees "no semantic shift" rather than truncated nonsense.
+    if len(a) != len(b):
+        return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))

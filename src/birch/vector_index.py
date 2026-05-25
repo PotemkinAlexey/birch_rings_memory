@@ -85,6 +85,18 @@ class VectorIndex:
         # Rebuild id→row for everything after the deleted row.
         for i in range(row, len(self._ids)):
             self._id_to_row[self._ids[i]] = i
+        # If the index just became empty, reset _dim so a future add
+        # is free to set a new dimension. Without this reset, after
+        # all vectors are removed the matrix is shape (0, old_dim)
+        # and _dim still equals old_dim — a subsequent add() with a
+        # new model's dim would raise DimensionMismatchError despite
+        # the index being empty. The intent of the dim guard is
+        # "don't mix dims in a populated index", not "freeze the
+        # first dim ever seen for the lifetime of the object".
+        if not self._ids:
+            self._matrix = None
+            self._dim = None
+            self._id_to_row = {}
 
     def search(
         self,

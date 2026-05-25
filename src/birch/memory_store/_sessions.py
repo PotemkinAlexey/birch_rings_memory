@@ -217,6 +217,21 @@ class SessionsMixin:
                     if sid is None or sid not in self._sessions:
                         raise KeyError(f"unknown session: {sid!r}")
                     ctx = self._sessions[sid]
+                    # Dim preflight BEFORE mutation. Embedding provider
+                    # silently returning a different dim (model swap
+                    # mid-session, mock-vs-real flip, partial response)
+                    # used to produce ragged ctx.vectors that crashed
+                    # the repetition detector later. Loader already
+                    # validates dim consistency on read; the live
+                    # write path was the missing symmetric guard.
+                    if ctx.vectors and len(vec) != len(ctx.vectors[0]):
+                        from ..vector_index import DimensionMismatchError
+                        raise DimensionMismatchError(
+                            f"session_message: vector dim {len(vec)} "
+                            f"does not match session's existing dim "
+                            f"{len(ctx.vectors[0])}. Embedding model "
+                            f"likely changed mid-session."
+                        )
                     ctx.messages.append(text)
                     ctx.vectors.append(vec)
                     if self._storage and hasattr(self._storage, "save_open_session"):
@@ -283,7 +298,20 @@ class SessionsMixin:
                 return {}
             ctx = self._sessions[sid]
             if not ctx.messages:
-                self._pop_session_locked(sid)
+                # Empty session has no R / EWMA / echo work to do —
+                # just drop it. But _pop_session_locked mutates
+                # self._sessions BEFORE calling storage.delete_open_session,
+                # so a storage failure used to leave in-memory pop
+                # diverged from disk. Wrap in the standard rollback
+                # guard symmetric with abort_session.
+                try:
+                    with self._txn():
+                        self._sync()
+                        if sid in self._sessions:
+                            self._pop_session_locked(sid)
+                except Exception:
+                    self._reload()
+                    raise
                 return {}
             messages_snapshot = list(ctx.messages)
             vectors_snapshot = list(ctx.vectors)

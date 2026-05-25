@@ -1462,6 +1462,19 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
         except Exception:
             pass
         return _embedding_error_response(exc)
+    except Exception:
+        # Any OTHER failure (storage, dim mismatch, ValueError from
+        # core validators, etc.) also needs the same orphan-session
+        # cleanup. Previously only EmbeddingError triggered abort;
+        # a sqlite error mid-session_message would leak the open
+        # session into disk until TTL eviction. Best-effort cleanup
+        # then re-raise so the agent sees the original error
+        # (caller decides how to react).
+        try:
+            _store.abort_session(session_id)
+        except Exception:
+            pass
+        raise
     response = {
         "session_id": session_id,
         "label": summary.get("label"),

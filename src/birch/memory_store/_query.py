@@ -296,6 +296,20 @@ class QueryMixin:
                 return top
 
             # ---- Write path: one transaction, _sync inside, then mutate.
+            # Layer check helper that knows about Hawking emission:
+            # singularity bodies (layer == -1) check against their
+            # POST-EMIT layer (1 / kinetic) because that's the layer
+            # they'll have if the predicate lets them through. Live
+            # bodies check against their current layer.
+            def _layer_ok(layer: int) -> bool:
+                effective = 1 if layer == -1 else layer
+                if not (min_layer <= effective <= max_layer):
+                    return False
+                if (allowed_layers is not None
+                        and effective not in allowed_layers):
+                    return False
+                return True
+
             def _fact_predicate(f) -> bool:
                 # Lifecycle: a fact that was superseded by set_fact /
                 # supersede_fact, or expired via retire_fact, must NOT
@@ -303,6 +317,12 @@ class QueryMixin:
                 # current. The agent thinks it's reading live truth;
                 # the body knows it has been retired.
                 if f.is_deprecated or f.is_expired:
+                    return False
+                # Layer must match the caller's scope. Singularity
+                # bodies pass when caller's allowed_layers includes
+                # 1 (kinetic), since that's where Hawking emission
+                # lands them.
+                if not _layer_ok(f.layer):
                     return False
                 if f.gravity_score < min_gravity:
                     return False
@@ -314,6 +334,8 @@ class QueryMixin:
                 if getattr(m, "is_deprecated", False):
                     return False
                 if getattr(m, "is_expired", False):
+                    return False
+                if not _layer_ok(m.layer):
                     return False
                 if m.gravity_score < min_gravity:
                     return False
