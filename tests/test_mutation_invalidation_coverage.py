@@ -112,10 +112,12 @@ def test_prior_shipped_items_still_in_place(tmp_path):
     ).read_text()
     assert "_embedding_error_response" in server_src
     # set_fact does wrap.
+    # MemoryBricks Step 1: set_fact gained an optional `namespace`
+    # kwarg; the wrap-with-_embedding_error_response contract is
+    # what we're pinning here, so verify both the call and the
+    # except branch — without locking in the exact argument list.
+    assert "return _store.set_fact(" in server_src
     assert (
-        "return _store.set_fact(\n"
-        "            subject, predicate, object, session_id=session_id,\n"
-        "        )\n"
         "    except EmbeddingError as exc:\n"
         "        return _embedding_error_response(exc)"
     ) in server_src

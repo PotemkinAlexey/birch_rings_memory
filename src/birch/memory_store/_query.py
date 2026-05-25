@@ -33,7 +33,7 @@ class QueryMixin:
     _storage: "Optional[StorageBackend]"
     _facts: "dict[str, FactPassport]"
     _meta_facts: "dict[str, MetaFact]"
-    _spo_index: "dict[tuple[str, str, str], str]"
+    _spo_index: "dict[tuple[str, str, str, str], str]"
     _index: "VectorIndex"
     _meta_index: "VectorIndex"
     _engine: "GravityEngine"
@@ -48,7 +48,10 @@ class QueryMixin:
         _txn: Callable[[], Any]
         _reload: Callable[[], None]
         _resolve_sid: Callable[[Optional[str]], Optional[str]]
-        _normalize_spo: Callable[[str, str, str], tuple[str, str, str]]
+        _normalize_spo: Callable[..., tuple[str, str, str, str]]
+        # MemoryBricks Step 1: borrowed from FactsMixin for the
+        # namespace_prefix filter on query / find_similar.
+        _namespace_matches_prefix: Callable[[str, str], bool]
         _attribute_to: Callable[["SessionContext", str, float], None]
         _apply_recent_utility_locked: Callable[[dict[str, float], float], None]
         _bump_mutation_locked: Callable[[], None]
@@ -60,6 +63,8 @@ class QueryMixin:
         min_similarity: float = 0.85,
         subject_prefix: Optional[str] = None,
         exclude_ids: Optional[set[str]] = None,
+        *,
+        namespace_prefix: Optional[str] = None,
     ) -> list[dict]:
         """Read-only semantic search — surface paraphrase candidates.
 
@@ -72,6 +77,8 @@ class QueryMixin:
         ``subject_prefix`` is a case-insensitive ``startswith`` filter on the
         fact's subject; useful for scoping a search to one project.
         ``exclude_ids`` skips known facts (e.g., the one you just wrote).
+        ``namespace_prefix`` (MemoryBricks Step 1) restricts results to
+        facts in this namespace and its descendants (VB-style match).
         """
         # Library-API hardening: MCP validates this at the boundary,
         # but find_similar is also a public Python entry point. A
@@ -90,6 +97,7 @@ class QueryMixin:
             min_similarity=min_similarity,
             subject_prefix=subject_prefix,
             exclude_ids=exclude_ids,
+            namespace_prefix=namespace_prefix,
         )
 
     # Backward-compat alias — previous name was leading-underscore
@@ -106,12 +114,19 @@ class QueryMixin:
         min_similarity: float = 0.85,
         subject_prefix: Optional[str] = None,
         exclude_ids: Optional[set[str]] = None,
+        *,
+        namespace_prefix: Optional[str] = None,
     ) -> list[dict]:
         """Caller-provided embedding variant — used by record_fact's
         similar_existing hint to avoid embedding the same text twice.
+
+        ``namespace_prefix`` (MemoryBricks Step 1) restricts results to
+        facts in this namespace and its descendants.
         """
         prefix = subject_prefix.lower() if subject_prefix else None
         skip = exclude_ids or set()
+        # Delegated import to avoid a cycle between _query and _facts.
+        ns_match = self._namespace_matches_prefix  # type: ignore[attr-defined]
         # Keep the lock for the whole scan: reading self._facts after
         # releasing the lock previously allowed another thread to
         # delete / supersede / retire a fact between `_sync` and
@@ -133,6 +148,10 @@ class QueryMixin:
                         or fact.is_expired):
                     continue
                 if prefix and not fact.subject.lower().startswith(prefix):
+                    continue
+                if namespace_prefix is not None and not ns_match(
+                    fact.namespace or "", namespace_prefix,
+                ):
                     continue
                 hits.append({
                     "fact_id": fid,
@@ -158,6 +177,8 @@ class QueryMixin:
         subject_prefix: Optional[str] = None,
         min_gravity: float = 0.0,
         allowed_layers: Optional[set[int]] = None,
+        *,
+        namespace_prefix: Optional[str] = None,
     ) -> list[QueryResult]:
         """
         Retrieve relevant facts by cosine similarity.
@@ -195,6 +216,12 @@ class QueryMixin:
         # Embed outside the lock.
         vec = embed(text)
         prefix = subject_prefix.lower() if subject_prefix else None
+        # MemoryBricks Step 1: namespace_prefix is a hierarchical
+        # filter applied symmetrically across live facts, live metas,
+        # and the Hawking emission predicates below. Borrows
+        # ``_namespace_matches_prefix`` from FactsMixin (cycle-safe
+        # because both mixins compose into the same MemoryStore).
+        ns_match = self._namespace_matches_prefix  # type: ignore[attr-defined]
 
         with self._lock:
             self._sync()
@@ -220,6 +247,10 @@ class QueryMixin:
                 if fact.gravity_score < min_gravity:
                     continue
                 if prefix and not fact.subject.lower().startswith(prefix):
+                    continue
+                if namespace_prefix is not None and not ns_match(
+                    fact.namespace or "", namespace_prefix,
+                ):
                     continue
                 # Apply min_similarity to the RAW cosine, not the
                 # 4-decimal display value. Asymmetric otherwise:
@@ -259,6 +290,10 @@ class QueryMixin:
                     if not any((st or "").lower().startswith(prefix)
                                for st in meta.source_texts):
                         continue
+                if namespace_prefix is not None and not ns_match(
+                    meta.namespace or "", namespace_prefix,
+                ):
+                    continue
                 # Raw-sim filter symmetric with the live-fact branch.
                 if sim < min_similarity:
                     continue
@@ -345,6 +380,10 @@ class QueryMixin:
                     return False
                 if prefix and not f.subject.lower().startswith(prefix):
                     return False
+                if namespace_prefix is not None and not ns_match(
+                    f.namespace or "", namespace_prefix,
+                ):
+                    return False
                 return True
 
             def _meta_predicate(m) -> bool:
@@ -360,6 +399,10 @@ class QueryMixin:
                     if not any((st or "").lower().startswith(prefix)
                                for st in m.source_texts):
                         return False
+                if namespace_prefix is not None and not ns_match(
+                    m.namespace or "", namespace_prefix,
+                ):
+                    return False
                 return True
 
             # query() does heavy mutation under the txn (Hawking
@@ -561,8 +604,14 @@ class QueryMixin:
                             self._engine.register(fact)
                             self._index.add(fact.fact_id, fact.vector)
                             if not fact.is_deprecated:
+                                # MemoryBricks Step 1: Hawking-emitted
+                                # facts re-enter the live SPO bucket
+                                # under their own namespace, not the
+                                # global root.
                                 key = self._normalize_spo(
-                                    fact.subject, fact.predicate, fact.object)
+                                    fact.subject, fact.predicate, fact.object,
+                                    fact.namespace,
+                                )
                                 self._spo_index.setdefault(key, fact.fact_id)
                             if self._storage:
                                 self._storage.save_fact(fact)

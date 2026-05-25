@@ -35,7 +35,11 @@ class FactsMixin:
     _storage: "Optional[StorageBackend]"
     _facts: "dict[str, FactPassport]"
     _meta_facts: "dict[str, MetaFact]"
-    _spo_index: "dict[tuple[str, str, str], str]"
+    # MemoryBricks Step 1: SPO dedup is namespace-scoped. The key is
+    # (namespace, subject_norm, predicate_norm, object_norm); two facts
+    # with the same SPO under different namespaces are independent live
+    # rows. Namespace is stored case-sensitive (matches VB) but trimmed.
+    _spo_index: "dict[tuple[str, str, str, str], str]"
     _index: "VectorIndex"
     _meta_index: "VectorIndex"
     _engine: "GravityEngine"
@@ -73,8 +77,43 @@ class FactsMixin:
         _absorb_dead: Callable[[], list[str]]
 
     @staticmethod
-    def _normalize_spo(subject: str, predicate: str, obj: str) -> tuple[str, str, str]:
+    def _namespace_matches_prefix(namespace: str, prefix: str) -> bool:
+        """Hierarchical path match: ``prefix`` covers itself + descendants.
+
+        MemoryBricks Step 1. VB-style path semantics: ``"WORK"`` matches
+        ``"WORK"`` and ``"WORK/anything"``, but NOT ``"WORKSPACE"``. An
+        empty prefix matches everything (no filter). A trailing slash
+        on the prefix is tolerated and stripped — callers typing
+        ``"WORK/"`` get the same result as ``"WORK"``. Case-sensitive,
+        symmetric with VB.
+        """
+        if prefix == "":
+            return True
+        prefix = prefix.rstrip("/")
+        if namespace == prefix:
+            return True
+        return namespace.startswith(prefix + "/")
+
+    @staticmethod
+    def _normalize_spo(
+        subject: str,
+        predicate: str,
+        obj: str,
+        namespace: str = "",
+    ) -> tuple[str, str, str, str]:
+        """Compose the SPO dedup key.
+
+        MemoryBricks Step 1: namespace is the first element so a
+        prefix-walk through ``_spo_index.keys()`` for a given namespace
+        is a stable filter (and a ``namespace == ""`` global root stays
+        backward-compatible — every legacy call site that omits the
+        argument lands in the same bucket the pre-namespace store used).
+        Subject/predicate/object are case-folded and whitespace-collapsed
+        like before; namespace is case-sensitive and trimmed only,
+        symmetric with VB paths (``WORK/DataArt`` ≠ ``work/dataart``).
+        """
         return (
+            (namespace or "").strip(),
             " ".join(subject.lower().split()),
             " ".join(predicate.lower().split()),
             " ".join(obj.lower().split()),
@@ -110,9 +149,20 @@ class FactsMixin:
                 self._storage.save_edge(neighbour_id, fact_id)
             linked += 1
 
-    def fact_exists(self, subject: str, predicate: str, obj: str) -> bool:
-        """Return True if an identical SPO triple is already in the live index."""
-        key = self._normalize_spo(subject, predicate, obj)
+    def fact_exists(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        namespace: str = "",
+    ) -> bool:
+        """Return True if an identical SPO triple is already live in ``namespace``.
+
+        MemoryBricks Step 1: dedup is namespace-scoped. ``namespace=""``
+        (default) checks the global / unscoped root, preserving the
+        pre-Step-1 contract for every caller that does not opt in.
+        """
+        key = self._normalize_spo(subject, predicate, obj, namespace)
         with self._lock:
             self._sync()
             existing_id = self._spo_index.get(key)
@@ -127,6 +177,7 @@ class FactsMixin:
         layer: int = ...,
         session_id: Optional[str] = ...,
         *,
+        namespace: str = ...,
         return_status: Literal[False] = False,
     ) -> FactPassport: ...
 
@@ -139,6 +190,7 @@ class FactsMixin:
         layer: int = ...,
         session_id: Optional[str] = ...,
         *,
+        namespace: str = ...,
         return_status: Literal[True],
     ) -> tuple[FactPassport, bool]: ...
 
@@ -149,6 +201,8 @@ class FactsMixin:
         obj: str,
         layer: int = 1,
         session_id: Optional[str] = None,
+        *,
+        namespace: str = "",
         return_status: bool = False,
     ) -> Union[FactPassport, tuple[FactPassport, bool]]:
         """
@@ -169,8 +223,14 @@ class FactsMixin:
 
         Embedding happens outside the lock so concurrent agents don't
         serialize on the slow HTTP roundtrip to Ollama.
+
+        ``namespace`` (MemoryBricks Step 1) scopes the SPO dedup: the
+        same (subject, predicate, object) triple in ``"WORK"`` and
+        ``"PERSONAL"`` are independent live rows. Empty string is the
+        global / unscoped root and preserves the pre-Step-1 contract
+        for callers that do not opt in.
         """
-        key = self._normalize_spo(subject, predicate, obj)
+        key = self._normalize_spo(subject, predicate, obj, namespace)
 
         # Fast path: SPO already present — skip the embed entirely.
         # Wrapped in try/except + _reload so a storage failure inside
@@ -231,6 +291,7 @@ class FactsMixin:
                         object=obj,
                         layer=layer,
                         source_session=sid,
+                        namespace=namespace,
                     )
                     fact.vector = vec
                     self._facts[fact.fact_id] = fact
@@ -311,6 +372,9 @@ class FactsMixin:
         session_id: Optional[str] = None,
         session_ids: Optional[list[Optional[str]]] = None,
         return_status: bool = False,
+        *,
+        namespace: str = "",
+        namespaces: Optional[list[Optional[str]]] = None,
     ) -> list:
         """
         Batch-insert a list of (subject, predicate, object) triples.
@@ -339,6 +403,14 @@ class FactsMixin:
         if session_ids is not None and len(session_ids) != len(triples):
             raise ValueError(
                 f"session_ids length ({len(session_ids)}) must match triples "
+                f"length ({len(triples)})"
+            )
+        # MemoryBricks Step 1: per-item namespace overrides the batch
+        # default exactly like per-item session_id. Length mismatch is
+        # a typed ValueError so MCP boundary can surface it cleanly.
+        if namespaces is not None and len(namespaces) != len(triples):
+            raise ValueError(
+                f"namespaces length ({len(namespaces)}) must match triples "
                 f"length ({len(triples)})"
             )
 
@@ -395,7 +467,15 @@ class FactsMixin:
                             else None
                         )
                         sid = self._resolve_sid(raw_sid or session_id)
-                        key = self._normalize_spo(s, p, o)
+                        # MemoryBricks Step 1: pick the per-item namespace
+                        # (falls back to the batch default, then "").
+                        per_ns = (
+                            namespaces[idx]
+                            if namespaces is not None else None
+                        )
+                        ns = per_ns if per_ns is not None else namespace
+                        ns = ns or ""
+                        key = self._normalize_spo(s, p, o, ns)
 
                         # In-batch duplicate (resolves to the first
                         # occurrence after apply pass).
@@ -435,6 +515,7 @@ class FactsMixin:
                             object=o,
                             layer=layer,
                             source_session=sid,
+                            namespace=ns,
                         )
                         fact.vector = vec
                         plans.append(("new", idx, fact, key, vec, sid))
@@ -764,12 +845,20 @@ class FactsMixin:
         subject: Optional[str] = None,
         predicate: Optional[str] = None,
         limit: int = 50,
+        *,
+        namespace_prefix: Optional[str] = None,
     ) -> list[FactPassport]:
         """
         Return live facts, optionally filtered by subject and/or predicate.
 
         Matching is case-insensitive substring. Results are sorted by
         gravity_score descending so the most relevant facts come first.
+
+        ``namespace_prefix`` (MemoryBricks Step 1) restricts results to
+        facts whose namespace is the prefix or a descendant of it
+        (VB-style hierarchical match — see ``_namespace_matches_prefix``).
+        ``None`` (default) means no scope filter; the unscoped global
+        root plus every named namespace is returned.
         """
         with self._lock:
             self._sync()
@@ -780,6 +869,13 @@ class FactsMixin:
         if predicate is not None:
             needle = predicate.lower()
             facts = [f for f in facts if needle in f.predicate.lower()]
+        if namespace_prefix is not None:
+            facts = [
+                f for f in facts
+                if self._namespace_matches_prefix(
+                    f.namespace or "", namespace_prefix,
+                )
+            ]
         facts.sort(key=lambda f: f.gravity_score, reverse=True)
         return facts[:limit]
 
@@ -894,7 +990,12 @@ class FactsMixin:
             )
         old = self._facts[old_id]
         old.deprecated_by = new_id
-        key = self._normalize_spo(old.subject, old.predicate, old.object)
+        # MemoryBricks Step 1: namespace-aware dedup. Same SPO under
+        # a different namespace points to a different slot — read the
+        # body's namespace so we free the correct bucket.
+        key = self._normalize_spo(
+            old.subject, old.predicate, old.object, old.namespace,
+        )
         if self._spo_index.get(key) == old_id:
             del self._spo_index[key]
         if self._storage:
@@ -970,18 +1071,30 @@ class FactsMixin:
         resp["reason"] = "id does not match any known body"
         return resp
 
-    def _live_slot_occupants(self, subject: str, predicate: str) -> list[str]:
+    def _live_slot_occupants(
+        self,
+        subject: str,
+        predicate: str,
+        namespace: str = "",
+    ) -> list[str]:
         """Caller must hold self._lock. Live fact_ids with this (s, p) slot.
 
         A "slot" is the (case-insensitive, whitespace-normalised) subject and
         predicate pair — the unit ``set_fact`` enforces uniqueness on. Only
         non-deprecated, non-expired facts count as occupants.
+
+        MemoryBricks Step 1: the slot is scoped to ``namespace``. The
+        same (s, p) under WORK and PERSONAL are independent slots —
+        a WORK ``set_fact`` must not supersede a PERSONAL occupant.
         """
         s_norm = " ".join(subject.lower().split())
         p_norm = " ".join(predicate.lower().split())
+        ns_norm = (namespace or "").strip()
         out: list[str] = []
         for f in self._facts.values():
             if f.is_deprecated or f.is_expired:
+                continue
+            if (f.namespace or "") != ns_norm:
                 continue
             if (" ".join(f.subject.lower().split()) == s_norm
                     and " ".join(f.predicate.lower().split()) == p_norm):
@@ -994,6 +1107,8 @@ class FactsMixin:
         predicate: str,
         obj: str,
         session_id: Optional[str] = None,
+        *,
+        namespace: str = "",
     ) -> dict:
         """Slot-based upsert: ``(subject, predicate)`` becomes a unique slot.
 
@@ -1016,7 +1131,12 @@ class FactsMixin:
         # old occupants, breaking slot uniqueness. Now: embed outside
         # the lock (slow HTTP call), then do add + supersede in one
         # atomic _txn(), wrapped in the standard rollback guard.
-        key = self._normalize_spo(subject, predicate, obj)
+        # MemoryBricks Step 1: slot uniqueness is scoped per namespace —
+        # the same (subject, predicate) in WORK and PERSONAL are
+        # independent slots. ``_live_slot_occupants`` below also filters
+        # by namespace so a WORK set_fact does not supersede a PERSONAL
+        # fact with the same (s, p).
+        key = self._normalize_spo(subject, predicate, obj, namespace)
         # Embed outside the lock — slow HTTP call, must not serialize.
         vec = embed(f"{subject} {predicate} {obj}")
         superseded: list[str] = []
@@ -1054,6 +1174,7 @@ class FactsMixin:
                             object=obj,
                             layer=1,
                             source_session=sid,
+                            namespace=namespace,
                         )
                         new_fact.vector = vec
                         self._facts[new_fact.fact_id] = new_fact
@@ -1077,7 +1198,7 @@ class FactsMixin:
                     # so either both halves succeed or both roll back
                     # via the outer try/except + _reload below.
                     occupants = self._live_slot_occupants(
-                        subject, predicate,
+                        subject, predicate, namespace,
                     )
                     for old_id in occupants:
                         if old_id == new_fact.fact_id:
@@ -1165,6 +1286,13 @@ class FactsMixin:
         }
 
     def _drop_from_spo_index(self, fact: FactPassport) -> None:
-        key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
+        # MemoryBricks Step 1: dedup key is (namespace, s, p, o). The
+        # FactPassport carries its own namespace, so pull it through
+        # — passing "" here would orphan the index entry under the
+        # wrong bucket on supersede / delete and let a re-add silently
+        # double-write.
+        key = self._normalize_spo(
+            fact.subject, fact.predicate, fact.object, fact.namespace,
+        )
         if self._spo_index.get(key) == fact.fact_id:
             del self._spo_index[key]

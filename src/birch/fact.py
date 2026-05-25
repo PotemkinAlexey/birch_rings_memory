@@ -37,6 +37,25 @@ def _sanitize_nonneg_int(value, default: int) -> int:
     return max(0, out)
 
 
+def _sanitize_namespace(value) -> str:
+    """Coerce namespace to a stripped str.
+
+    MemoryBricks Step 1: the namespace field is a path-style scope
+    identifier (e.g. ``"WORK/DataArt/Databricks"``) borrowed from VB.
+    Case-sensitive like VB paths, but trimmed of surrounding whitespace
+    so ``" WORK "`` and ``"WORK"`` collapse to the same slot. None,
+    non-string, or coercion failure all reduce to ``""`` (the
+    global/unscoped root) so the field is never typed loosely.
+    """
+    if value is None:
+        return ""
+    try:
+        out = str(value)
+    except Exception:
+        return ""
+    return out.strip()
+
+
 def _sanitize_layer(value, default: int = 1) -> int:
     """Layer must be one of (-1, 0, 1, 2). Unknown values revert to
     the default — same contract as the SQLite backend's ``_layer``."""
@@ -60,6 +79,15 @@ class FactPassport:
 
     gravity_score: float = 0.5      # starts neutral, drifts with usage
     layer: int = 1                  # 0=surface, 1=kinetic, 2=core
+    # MemoryBricks Step 1: scope identifier. Hierarchical path-style
+    # string (e.g. "WORK/DataArt/Databricks") matching VB's namespace
+    # convention; empty string means the global / unscoped root.
+    # Reputation lives per-namespace per the "Reputation is scoped,
+    # not global" invariant (see MemoryBricks
+    # docs/STRUCTURED_LIVING_MEMORY.md). SPO dedup uses
+    # (namespace, subject, predicate, object) — two facts with same
+    # SPO under different namespaces are independent rows.
+    namespace: str = ""
 
     created_at: float = field(default_factory=time.time)
     ttl: Optional[float] = None     # None = no expiry
@@ -120,6 +148,7 @@ class FactPassport:
         self.forecast_stability = _sanitize_float(
             self.forecast_stability, 0.5, lo=0.0, hi=1.0,
         )
+        self.namespace = _sanitize_namespace(self.namespace)
 
     @property
     def is_deprecated(self) -> bool:

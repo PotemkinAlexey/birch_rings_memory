@@ -179,7 +179,12 @@ CREATE TABLE IF NOT EXISTS facts (
     resonance_sum   REAL DEFAULT 0.0,
     resonance_count INTEGER DEFAULT 0,
     recent_utility  REAL DEFAULT 0.5,
-    forecast_stability REAL DEFAULT 0.5
+    forecast_stability REAL DEFAULT 0.5,
+    -- MemoryBricks Step 1: namespace scope (VB path-style). Empty
+    -- string is the global / unscoped root. NOT NULL DEFAULT '' so
+    -- legacy rows migrated by _migrate_namespace get '' instead of
+    -- NULL — keeps the SPO dedup tuple total.
+    namespace       TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -220,7 +225,9 @@ CREATE TABLE IF NOT EXISTS meta_facts (
     resonance_sum   REAL DEFAULT 0.0,
     resonance_count INTEGER DEFAULT 0,
     recent_utility  REAL DEFAULT 0.5,
-    forecast_stability REAL DEFAULT 0.5
+    forecast_stability REAL DEFAULT 0.5,
+    -- MemoryBricks Step 1: symmetric with facts.namespace.
+    namespace       TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS adaptive_weights (
@@ -259,6 +266,7 @@ class SQLiteBackend:
         self._migrate_echo_sessions()
         self._migrate_recent_utility()
         self._migrate_forecast_stability()
+        self._migrate_namespace()
         self._conn.commit()
 
     # ── Cross-process coordination ───────────────────────────────────────────
@@ -367,6 +375,34 @@ class SQLiteBackend:
                 "ADD COLUMN w_stability REAL NOT NULL DEFAULT 0.05"
             )
 
+    def _migrate_namespace(self) -> None:
+        """Add facts.namespace / meta_facts.namespace to legacy DBs.
+
+        MemoryBricks Step 1. SQLite ``ALTER TABLE ADD COLUMN`` does not
+        accept ``NOT NULL`` without a default that can be applied to
+        existing rows — ``DEFAULT ''`` satisfies that and gives every
+        legacy row the global / unscoped root, matching the
+        ``namespace=""`` dataclass default. New databases get the
+        column directly from ``_SCHEMA``; this hook only fires on DBs
+        created before Step 1.
+        """
+        fact_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(facts)")
+        }
+        if "namespace" not in fact_cols:
+            self._conn.execute(
+                "ALTER TABLE facts "
+                "ADD COLUMN namespace TEXT NOT NULL DEFAULT ''"
+            )
+        meta_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(meta_facts)")
+        }
+        if "namespace" not in meta_cols:
+            self._conn.execute(
+                "ALTER TABLE meta_facts "
+                "ADD COLUMN namespace TEXT NOT NULL DEFAULT ''"
+            )
+
     # ── Facts ────────────────────────────────────────────────────────────────
 
     _FACT_INSERT = (
@@ -374,8 +410,8 @@ class SQLiteBackend:
         "(fact_id, subject, predicate, object, vector, gravity_score, layer, "
         " created_at, ttl, source_session, deprecated_by, access_count, "
         " last_accessed, resonance_sum, resonance_count, recent_utility, "
-        " forecast_stability) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " forecast_stability, namespace) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -408,6 +444,12 @@ class SQLiteBackend:
             _finite_float(
                 fact.forecast_stability, 0.5, lo=0.0, hi=1.0,
             ),
+            # MemoryBricks Step 1: namespace is a stripped string. The
+            # dataclass __post_init__ already coerced None / non-str /
+            # whitespace; write whatever survived. NOT NULL DEFAULT ''
+            # on the column keeps the read side total even if a buggy
+            # caller managed to inject NULL.
+            str(fact.namespace or ""),
         )
 
     def save_fact(self, fact: FactPassport) -> None:
@@ -480,6 +522,15 @@ class SQLiteBackend:
                         r["forecast_stability"]
                         if "forecast_stability" in r.keys() else 0.5,
                         0.5, lo=0.0, hi=1.0,
+                    ),
+                    # MemoryBricks Step 1: tolerate legacy rows missing
+                    # the column (migration adds it, but a sqlite_master
+                    # mismatch between PRAGMA-introspected schema and an
+                    # in-flight ALTER could in theory hand us a row
+                    # without it). Defaults to "" — the unscoped root.
+                    namespace=(
+                        str(r["namespace"] or "")
+                        if "namespace" in r.keys() else ""
                     ),
                 )
                 # Only pass created_at / last_accessed when non-None so
@@ -800,8 +851,8 @@ class SQLiteBackend:
         "(meta_id, vector, weight, source_texts, source_fact_ids, summary, "
         " gravity_score, created_at, layer, access_count, last_accessed, "
         " resonance_sum, resonance_count, recent_utility, "
-        " forecast_stability) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " forecast_stability, namespace) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -830,6 +881,12 @@ class SQLiteBackend:
             _finite_float(
                 d["forecast_stability"], 0.5, lo=0.0, hi=1.0,
             ),
+            # MemoryBricks Step 1: namespace round-trip. to_dict()
+            # already emits the post-init-sanitised string; coerce
+            # defensively so a future to_dict variant that drops the
+            # key (or a manual dict construction in tests) writes
+            # '' instead of crashing on KeyError.
+            str(d.get("namespace") or ""),
         )
 
     def save_meta_fact(self, meta: MetaFact) -> None:

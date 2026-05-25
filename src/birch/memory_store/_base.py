@@ -112,7 +112,11 @@ class MemoryStore(
         self._echo = EchoStore(default_k=echo_k)
         self._facts: dict[str, FactPassport] = {}
         # Normalised SPO → fact_id, for cheap duplicate detection in add_fact.
-        self._spo_index: dict[tuple[str, str, str], str] = {}
+        # MemoryBricks Step 1: key is (namespace, s, p, o) — see
+        # ``FactsMixin._normalize_spo``. The first element scopes
+        # dedup so two facts with the same SPO under different
+        # namespaces coexist as independent live rows.
+        self._spo_index: dict[tuple[str, str, str, str], str] = {}
         # Numpy-backed cosine index, kept in sync with live facts.
         self._index = VectorIndex()
         # MetaFacts that have re-entered the live layers via Hawking emission.
@@ -348,7 +352,14 @@ class MemoryStore(
                 )
                 fact.vector = []
             if not fact.is_deprecated:
-                key = self._normalize_spo(fact.subject, fact.predicate, fact.object)
+                # MemoryBricks Step 1: read the body's namespace so
+                # rebuild matches what _drop_from_spo_index will later
+                # look up. Symmetric with the same line in the Hawking
+                # emission path in _query.py.
+                key = self._normalize_spo(
+                    fact.subject, fact.predicate, fact.object,
+                    fact.namespace,
+                )
                 self._spo_index.setdefault(key, fact.fact_id)
         # MetaFacts: layer -1 live in the singularity; promoted ones (after
         # Hawking emission) live in the live meta store with the engine.

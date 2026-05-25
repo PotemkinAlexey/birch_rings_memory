@@ -445,6 +445,7 @@ def query_memory(
     layers: Optional[list[str]] = None,
     subject_prefix: Optional[str] = None,
     min_gravity: float = 0.0,
+    namespace_prefix: Optional[str] = None,
 ) -> dict:
     """USE WHEN: looking up facts relevant to a user's first message or to a
     sub-question mid-session. Pass ``session_id`` so retrieved facts are
@@ -492,6 +493,11 @@ def query_memory(
         return {"results": [], **err}
     min_gravity = min_grav_validated  # type: ignore[assignment]
     err = _validate_optional_text(subject_prefix, "subject_prefix")
+    if err is not None:
+        return {"results": [], **err}
+    # MemoryBricks Step 1: namespace_prefix is a hierarchical scope
+    # filter (VB-style path match). Same shape as subject_prefix.
+    err = _validate_optional_text(namespace_prefix, "namespace_prefix")
     if err is not None:
         return {"results": [], **err}
     # Optional-id boundary: a non-None session_id that is not a non-empty
@@ -553,6 +559,7 @@ def query_memory(
             subject_prefix=subject_prefix,
             min_gravity=min_gravity,
             allowed_layers=allowed,
+            namespace_prefix=namespace_prefix,
         )
     except EmbeddingError as exc:
         return _embedding_error_response(exc)
@@ -657,6 +664,7 @@ def record_fact(
     predicate: str,
     object: str,
     session_id: Optional[str] = None,
+    namespace: Optional[str] = None,
 ) -> dict:
     """USE WHEN: storing a new atomic SPO triple where the (subject, predicate)
     can legitimately carry several objects (e.g. "api uses Postgres" AND
@@ -665,6 +673,12 @@ def record_fact(
 
     Identical triples (case-insensitive, whitespace-normalised) are deduplicated:
     the existing fact is touched and returned with ``already_existed=true``.
+    Dedup is scoped by ``namespace`` — the same SPO under different
+    namespaces are independent live rows.
+
+    ``namespace`` (MemoryBricks Step 1) is a VB-style hierarchical path
+    (e.g. ``"WORK/DataArt/Databricks"``). Empty / omitted means the
+    global / unscoped root and preserves the pre-Step-1 contract.
 
     The response includes ``similar_existing`` — paraphrase candidates already
     in the store at cosine ≥ 0.85 (excluding this fact). Treat them as
@@ -679,6 +693,11 @@ def record_fact(
     # the attribution path (resonance/gravity bookkeeping never fires).
     # Reject at the boundary so the agent gets a structured error.
     err = _validate_optional_id(session_id, "session_id")
+    if err is not None:
+        return err
+    # MemoryBricks Step 1: namespace is optional text — same shape as
+    # subject_prefix. ``None`` means "global root" downstream.
+    err = _validate_optional_text(namespace, "namespace")
     if err is not None:
         return err
     # Strip invisible control chars + zero-width Unicode at the write
@@ -708,6 +727,7 @@ def record_fact(
         fact, created = _store.add_fact(
             subject, predicate, object,
             session_id=session_id, return_status=True,
+            namespace=(namespace or ""),
         )
     except EmbeddingError as exc:
         return _embedding_error_response(exc)
@@ -741,6 +761,7 @@ def record_fact(
 def record_facts(
     facts: list[dict],
     session_id: Optional[str] = None,
+    namespace: Optional[str] = None,
 ) -> dict:
     """USE WHEN: storing several SPO triples at once — one Ollama round-trip
     and one SQLite transaction beats N ``record_fact`` calls. Same semantics
@@ -749,7 +770,9 @@ def record_facts(
     ``set_fact`` per item instead.
 
     Each item must have ``subject``, ``predicate``, ``object``; per-item
-    ``session_id`` overrides the top-level one.
+    ``session_id`` overrides the top-level one. Per-item ``namespace``
+    overrides the top-level ``namespace`` the same way. Dedup is scoped
+    per namespace (MemoryBricks Step 1).
     """
     # Top-level type check: if the caller passes a string (would iterate
     # by character) or a dict (would iterate by key) instead of a list,
@@ -773,6 +796,11 @@ def record_facts(
     # already validated below; this is the symmetric guard for the
     # top-level one.
     err = _validate_optional_id(session_id, "session_id")
+    if err is not None:
+        return err
+    # MemoryBricks Step 1: top-level namespace, symmetric with the
+    # top-level session_id. Per-item override is validated in the loop.
+    err = _validate_optional_text(namespace, "namespace")
     if err is not None:
         return err
     # Batch-size cap: an agent that accidentally pastes 50k items would
@@ -861,6 +889,15 @@ def record_facts(
                     "error": "invalid_session_id",
                     "got_type": type(f["session_id"]).__name__,
                 })
+        # MemoryBricks Step 1: per-item namespace type check. None or
+        # missing falls back to top-level; non-string is rejected.
+        if "namespace" in f and f["namespace"] is not None:
+            if not isinstance(f["namespace"], str):
+                invalid.append({
+                    "index": i,
+                    "error": "invalid_namespace",
+                    "got_type": type(f["namespace"]).__name__,
+                })
     if invalid:
         return {
             "ok": False,
@@ -912,12 +949,15 @@ def record_facts(
     # spelled out in the docstring. Items without their own session_id fall
     # back to the top-level argument.
     per_item_sids = [f.get("session_id") for f in facts]
+    per_item_ns = [f.get("namespace") for f in facts]
     try:
         statuses = _store.add_facts(
             triples,
             session_id=session_id,
             session_ids=per_item_sids,
             return_status=True,
+            namespace=(namespace or ""),
+            namespaces=per_item_ns,
         )
     except EmbeddingError as exc:
         return _embedding_error_response(exc)
@@ -962,6 +1002,7 @@ def set_fact(
     predicate: str,
     object: str,
     session_id: Optional[str] = None,
+    namespace: Optional[str] = None,
 ) -> dict:
     """USE WHEN: a (subject, predicate) slot has one canonical value that
     *replaces* whatever was there before — HEADs, version strings, current
@@ -986,6 +1027,11 @@ def set_fact(
     err = _validate_optional_id(session_id, "session_id")
     if err is not None:
         return err
+    # MemoryBricks Step 1: namespace is optional text — same shape as
+    # in record_fact. ``None`` flows as "" downstream.
+    err = _validate_optional_text(namespace, "namespace")
+    if err is not None:
+        return err
     # Invisible-char strip symmetric with record_fact / record_facts.
     subject = _sanitize_for_llm(subject)
     predicate = _sanitize_for_llm(predicate)
@@ -1005,6 +1051,7 @@ def set_fact(
     try:
         return _store.set_fact(
             subject, predicate, object, session_id=session_id,
+            namespace=(namespace or ""),
         )
     except EmbeddingError as exc:
         return _embedding_error_response(exc)
@@ -1231,6 +1278,7 @@ def list_facts(
     min_gravity: float = 0.0,
     layer: Optional[str] = None,
     exclude_deprecated: bool = True,
+    namespace_prefix: Optional[str] = None,
 ) -> list[dict]:
     """USE WHEN: auditing what the store actually holds about a topic, no
     semantic query needed. Sorted by gravity descending; ``exclude_deprecated``
@@ -1272,6 +1320,8 @@ def list_facts(
         ("subject", subject),
         ("predicate", predicate),
         ("subject_prefix", subject_prefix),
+        # MemoryBricks Step 1: hierarchical scope filter (VB-style).
+        ("namespace_prefix", namespace_prefix),
     ):
         err = _validate_optional_text(opt_val, opt_name)
         if err is not None:
@@ -1288,7 +1338,10 @@ def list_facts(
             "allowed": list(layer_map),
         }]
     target_layer = layer_map.get(layer) if layer else None
-    facts = _store.list_facts(subject=subject, predicate=predicate, limit=10_000)
+    facts = _store.list_facts(
+        subject=subject, predicate=predicate, limit=10_000,
+        namespace_prefix=namespace_prefix,
+    )
     prefix = subject_prefix.lower() if subject_prefix else None
     out: list[dict] = []
     for f in facts:
@@ -1308,6 +1361,9 @@ def list_facts(
             "layer": f.layer,
             "gravity_score": round(f.gravity_score, 3),
             "source": {0: "surface", 1: "kinetic", 2: "core"}.get(f.layer, "kinetic"),
+            # MemoryBricks Step 1: surface namespace so agents can
+            # disambiguate same-SPO facts across scopes.
+            "namespace": f.namespace or "",
         })
         if len(out) >= limit:
             break
@@ -1320,6 +1376,7 @@ def find_similar(
     top_k: int = 5,
     min_similarity: float = 0.85,
     subject_prefix: Optional[str] = None,
+    namespace_prefix: Optional[str] = None,
 ) -> dict:
     """USE WHEN: hunting for paraphrase candidates before writing or to plan a
     ``set_fact`` / ``supersede_fact`` cleanup. Read-only; never mutates.
@@ -1351,12 +1408,17 @@ def find_similar(
     err = _validate_optional_text(subject_prefix, "subject_prefix")
     if err is not None:
         return {"query": text, "hits": [], **err}
+    # MemoryBricks Step 1: hierarchical scope filter.
+    err = _validate_optional_text(namespace_prefix, "namespace_prefix")
+    if err is not None:
+        return {"query": text, "hits": [], **err}
     try:
         hits = _store.find_similar(
             text=text,
             top_k=top_k,
             min_similarity=min_similarity,
             subject_prefix=subject_prefix,
+            namespace_prefix=namespace_prefix,
         )
     except EmbeddingError as exc:
         return _embedding_error_response(exc)

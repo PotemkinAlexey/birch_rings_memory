@@ -43,6 +43,8 @@ class MetaFact:
     resonance_count: int = 0
     recent_utility: float = 0.5
     forecast_stability: float = 0.5
+    # MemoryBricks Step 1: see FactPassport.namespace.
+    namespace: str = ""
 
     def __post_init__(self) -> None:
         """Sanitise direct-construction values.
@@ -99,6 +101,19 @@ class MetaFact:
         self.forecast_stability = _f(
             self.forecast_stability, 0.5, lo=0.0, hi=1.0,
         )
+        # MemoryBricks Step 1: namespace is a path-style scope
+        # identifier shared with FactPassport / VB. Coerce loose
+        # constructor values (None, non-str, surrounding whitespace)
+        # to the canonical stripped string so SPO dedup and prefix
+        # filters key on a single normalised form. Case-sensitive
+        # like VB paths.
+        if self.namespace is None:
+            self.namespace = ""
+        else:
+            try:
+                self.namespace = str(self.namespace).strip()
+            except Exception:
+                self.namespace = ""
 
     # ── Polymorphism shims for code that ducks on FactPassport ──────────────
     # FactPassport carries optional ttl/deprecated_by fields; MetaFacts cannot
@@ -210,6 +225,7 @@ class MetaFact:
             "resonance_count": self.resonance_count,
             "recent_utility": self.recent_utility,
             "forecast_stability": self.forecast_stability,
+            "namespace": self.namespace,
         }
 
     @classmethod
@@ -250,6 +266,7 @@ class MetaFact:
             forecast_stability=_finite(
                 row.get("forecast_stability"), 0.5, lo=0.0, hi=1.0,
             ),
+            namespace=str(row.get("namespace") or ""),
         )
 
 
