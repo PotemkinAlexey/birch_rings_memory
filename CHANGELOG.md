@@ -1,0 +1,249 @@
+# Changelog
+
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html);
+sub-1.0 minors can include behavioural changes.
+
+## [0.3.0] — 2026-05-25
+
+First tagged release. The project predates this tag — 118 commits of
+development collapsed into one release note grouped by theme rather than
+chronologically. Future releases will be incremental from this baseline.
+
+### Added
+
+#### Core memory model
+- `FactPassport` — atomic subject/predicate/object triple with gravity,
+  layer, deprecation lineage, EWMA-tracked recent_utility, and forecast
+  stability fields.
+- `MetaFact` — dense centroid bundle representing a cluster of dead
+  facts; carries source lineage (`source_fact_ids`, `source_texts`), its
+  own gravity surface, and participates in the live feedback loop after
+  Hawking emission.
+- Three live layers (surface / kinetic / core) plus a singularity at
+  layer `-1`; bodies migrate per `session_close()` tick based on gravity.
+
+#### Resonance pipeline
+- Behavioural detector — pattern match on closing user messages
+  ("works", "got it" vs "still broken").
+- Semantic detector — cosine shift + specificity delta between session
+  start and end vectors.
+- Repetition detector — centroid dispersion of message vectors.
+- Combined R score in `[-1, +1]`; thresholds: resonant > 0.35, toxic
+  < -0.15.
+- `record_session` and `session_close` accept explicit `sentiment` or
+  `r_override` when heuristics would misclassify (e.g. grumpy-sounding
+  technical summaries).
+- Per-fact attribution weighted by query-time cosine similarity — broad
+  `top_k` no longer significantly tilts unrelated facts.
+
+#### Adaptive gravity engine
+- Five learned pre-resonance weights (`w_freshness`, `w_access`,
+  `w_graph`, `w_utility`, `w_stability`) trained one regularised SGD
+  step per closed session, target `(R+1)/2`.
+- Budget renormalisation keeps the five learned weights summing to
+  `0.65` so the formula stays in `[0, 1]` (resonance weight is fixed
+  at `0.35`).
+- Cross-process safety: weights reload from disk under the writeback
+  lock before applying SGD — concurrent processes compose, last writer
+  no longer silently overwrites.
+
+#### Echo validation (cross-session retroactive penalty)
+- Closed sessions stored as K-means++ bundle of centroids per session
+  topic, not a single vector.
+- New session opens trigger automatic echo check at `similarity ≥ 0.68`
+  to past unresolved problems; matched session's R drops into toxic
+  territory and the penalty propagates to gravity of every fact that
+  session touched.
+- Three-tier TTL sweep on every close (penalty / resolved / default).
+- One-shot idempotency — second echo on the same matched session does
+  not stack penalties.
+
+#### Black hole + Hawking emission
+- `BlackHole.absorb` / `absorb_meta` are atomic three-phase ops:
+  preflight dim check (raises `DimensionMismatchError` before any
+  mutation), then dict entry + layer mutation, then commit to vector
+  index. Failure rolls everything back. `_absorb_dead` catches per-fact
+  so one mismatched body doesn't abort the whole sweep.
+- Hawking emission with peek-then-commit two-phase: facts are
+  resurrected (state mutation + persistence) only after the live
+  ranking confirms they made the returned set.
+- Hawking emit thresholds: `0.95` for single FactPassports, `0.85` for
+  MetaFacts (looser because centroids drift between sources).
+- Emitted MetaFact gravity scales as `0.30 + 0.10 · log10(weight)`
+  capped at `0.70` — bundles re-enter weighted by collapse density.
+
+#### Singularity compactor
+- Union-Find collapse with path compression; groups dead facts above
+  `0.92` cosine threshold (configurable).
+- Per-dimension partitioning so a model swap leaves old-dim and new-dim
+  bodies compacting independently rather than crashing on ragged numpy.
+- Counter-triggered background collapse via single-worker
+  ThreadPoolExecutor; `collapse_async=False` for predictable tests.
+- Background collapse errors surface via `memory_stats.last_collapse_
+  error` instead of staying buried in the Future.
+
+#### Galaxy — N-body research model + feature producer
+- `birch/galaxy/` simulates facts as bodies in orbit around the black
+  hole; emergent dynamics include orbital decay (`dynamical_friction`),
+  session kicks, Jeans collapse for cold clumps, and attention-mass
+  bending of the disk.
+- `Galaxy.forecast_stability` runs forward `horizon_ticks` steps and
+  reads per-body proximity to the event horizon back into the live
+  store via the `forecast_memory` MCP tool. Feeds adaptive gravity
+  through `w_stability` — the only feature derived from the future.
+- `forecast_memory` response data-version-cached so subsequent calls
+  with no intervening writes hit the cache.
+- Snapshot revalidation: heavy N² simulation runs lock-free; writeback
+  re-checks `(data_version, mutation_version)` and aborts cleanly with
+  `forecast_snapshot_stale` if the universe moved.
+
+#### Persistence
+- Default `SQLiteBackend` with WAL mode, `BEGIN IMMEDIATE` for writers,
+  `busy_timeout`, `check_same_thread=False`.
+- `data_version` cache invalidation across processes — every operation
+  reloads from disk when another process has written; a lone process
+  never reloads and stays hot.
+- `_mutation_version` counter so single-process query cache invalidates
+  across local writes (collapse, absorb, supersede).
+- Schema migration handled at first connect: legacy DBs without
+  `recent_utility`, `forecast_stability`, `w_utility`, `w_stability`,
+  `layer = -1` columns auto-upgrade.
+- Tolerant loaders — every loader (`load_facts`, `load_meta_facts`,
+  `load_open_sessions`, `load_echo_sessions`, `load_adaptive_weights`)
+  skips corrupt rows with a warning instead of failing startup. Scalar
+  numeric fields run through finite + clamp gates so a NaN cell loads
+  as the field default.
+- Write-side `allow_nan=False` on every JSON cell + same scalar
+  sanitisation on every write so radioactive data never reaches disk.
+- Pluggable `StorageBackend` Protocol — Redis / Postgres / in-memory
+  custom backends supported without inheritance.
+
+#### Numpy vector index
+- L2-normalised `(n, d)` matrix with single matmul cosine search.
+- Preallocated buffer with geometric growth (×2) — `add()` is
+  amortised O(d) instead of the old O(n·d) `np.vstack` strategy. On
+  10k facts × 768 dim that's a ~30 MB matrix copy per insert versus a
+  single 3 KB overwrite.
+- `remove()` uses swap-with-last (O(d)) plus auto-shrink when usage
+  falls below `capacity / 4` so long-running stores don't sit on peak
+  allocation.
+- `VectorIndex.dim` public read-only property — replaces 8 callsites
+  that reached into private `_dim`; encapsulation contract preserved
+  for future internal evolution.
+- `DimensionMismatchError` raised loudly on dim mismatch in a populated
+  index; index resets dim on full-empty so a new model can establish
+  a new dim without rebuilding the store.
+- `top_k <= 0` guard against argpartition's undefined behaviour on
+  edge inputs.
+
+#### Concurrency safety
+- All write paths (`add_fact`, `add_facts`, `set_fact`, `query`,
+  `check_echo`, `session_message`, `session_close`, `run_forecast`,
+  `collapse_singularity`) wrap their writeback in `try: ... except:
+  self._reload(); raise`. SQLite txn rolls back disk truth on failure;
+  `_reload` re-anchors every in-memory cache to the post-rollback
+  disk state.
+- Closing-session race protection — `session_close` marks sid in
+  `_closing_sessions` right after snapshot; `session_message` rejects
+  pushes to a closing sid with structured
+  `RuntimeError("session_closing")`. Late messages never silently land
+  in the closed bundle.
+
+#### MCP server surface — 19 tools
+- Lifecycle: `session_open`, `session_push`, `session_close`,
+  `record_session`, `check_echo`.
+- Writes: `record_fact`, `record_facts`, `set_fact`.
+- Reads: `query_memory`, `find_similar`, `list_facts`, `explain_fact`,
+  `explain_body`.
+- Lifecycle ops: `supersede_fact`, `retire_fact`, `delete_fact`,
+  `delete_body`.
+- Operational: `forecast_memory`, `memory_stats`.
+- Full typed input-validator family — `_validate_text`,
+  `_validate_spo_strings`, `_validate_optional_id`, `_validate_int`,
+  `_validate_float`, `_validate_bool`, `_validate_optional_text`.
+  Boundary failures return structured `{"error": "...", "field": "...",
+  "hint": "..."}` instead of crashing inside core.
+- `EmbeddingError` wrapped at every MCP tool that touches `embed()`.
+- `DimensionMismatchError` / `ValueError` / `TypeError` wrapped at
+  forecast_memory.
+
+#### Security / robustness boundaries
+- `BIRCH_MAX_FIELD_LEN` env var (default 2000, tunable 128..200000)
+  caps every S/P/O / query text / session message length. Defence
+  against DoS / embedding-provider billing — a 10 MB paste never
+  reaches the embedding call.
+- `_sanitize_for_llm` strips ASCII C0 control codes (except TAB/LF/CR),
+  DEL, and zero-width Unicode (ZWSP/ZWNJ/ZWJ/BOM) at the write
+  boundary. Invisible-bytes smuggling vector closed.
+- `_has_instruction_markers` detects visible LLM control sequences
+  (`<|im_start|>`, `[INST]`, `<<SYS>>`, llama header IDs) on retrieval.
+  `query_memory` attaches per-hit `has_instruction_markers` boolean +
+  top-level `injection_warnings` list + `_injection_hint` so consumers
+  wrap flagged bodies before LLM context. Detection-only — never
+  rewrites stored data (aggressive rewriting is itself a content-filter
+  bypass surface).
+- Self-defending public methods: `FactPassport.apply_resonance` /
+  `MetaFact.apply_resonance` reject NaN / Infinity / non-numeric;
+  `avg_resonance` returns 0.0 on non-finite mean; `compute_gravity`
+  ends with `math.isfinite` check before its `min/max` clamp
+  (Python's `min/max` is NOT NaN-aware).
+- `__post_init__` on both dataclasses normalises direct-construction
+  values through the same contract as the loader — closes library-mode
+  bypass.
+
+#### Adaptive weight sanitisation
+- `AdaptiveWeights.load` tolerates corrupt rows (non-numeric, NaN
+  sneaked past sanitise); falls back to hand-tuned prior with a warning
+  instead of crashing init.
+- `record_facts` batch-size cap via `BIRCH_RECORD_FACTS_BATCH_CAP`
+  (default 500).
+- Embedding HTTP retries via `BIRCH_EMBED_RETRIES` (default 2) and
+  `BIRCH_EMBED_RETRY_BACKOFF_S` (default 0.5).
+- All cosine thresholds centralised in `birch/thresholds.py`, every
+  one overridable via `BIRCH_*` env var. `memory_stats.thresholds`
+  echoes what the process actually picked up.
+
+#### Observability
+- `memory_stats` exposes layer distribution, black-hole fact/meta mass,
+  Hawking emission count, total live bodies, active sessions, collapse
+  counter / total / last error, adaptive weight values + train_count,
+  echo counters (detected / applied / ignored), every threshold value
+  with `thresholds_are_import_time` flag.
+- `explain_fact` / `explain_body` decompose a body's gravity into
+  per-feature contributions (freshness / access / graph / utility /
+  stability / resonance). Polymorphic — handles live FactPassports,
+  live MetaFacts, singularity FactPassports, and singularity MetaFacts.
+
+#### Test suite
+- 741 tests pass, 20 skipped (sentinel-skipped slow paths).
+- Multi-process chaos suite behind `@pytest.mark.chaos` marker; not
+  in the default `pytest` run, opt-in via `pytest -m chaos`.
+- Property-based invariants via `hypothesis` (gravity bounds, layer
+  migration monotonicity).
+- Source-level audit tests pin contracts that span modules
+  (`._dim` direct-access ban, MCP wiring of validators).
+- CI runs `ruff` + `mypy` on every push.
+
+### Removed
+
+- `deprecate(fact_id)` is now an alias for `supersede_fact` — the
+  semantic difference disappeared once supersede became the canonical
+  "we now know better" path; `delete_fact` remains the only true
+  destructive primitive.
+- Hand-tuned gravity weights — five pre-resonance weights are now
+  learned, no magic numbers in the formula.
+
+### Notes for downstream
+
+- Public API stability target is "additive only for v0.x minors".
+  Breaking changes (e.g. removed MCP tools, renamed result fields)
+  will bump to v1.0 with a migration note.
+- `VectorIndex` internal storage (`_buffer`, `_size`, `_capacity`)
+  was rewritten for amortised O(d) `add` — public surface
+  (`__len__`, `__contains__`, `dim`, `add`, `remove`, `search`,
+  `similarity`, `all_similarities`) is unchanged.
+- Two-brain trial pattern with vertical-brain remains: birch-km for
+  atomic SPO + gravity ranking; vertical-brain for paragraph-scale
+  narrative + curated Silver/Gold layers. See AGENTS.md boundary
+  table.
