@@ -121,7 +121,17 @@ class BlackHole:
         applies as belt-and-suspenders against unexpected index
         failures (numpy / OOM), but DimensionMismatchError can no
         longer originate here.
+
+        Rollback restores ``fact.layer`` to the value it had on
+        entry — NOT a hardcoded constant. The earlier defensive code
+        restored to ``2`` (core) on failure, which was wrong: a fact
+        that entered at ``layer=0`` (surface) would silently land in
+        core after a transient index error, perturbing the
+        caller-visible state in a way the caller had no way to
+        detect or undo. True atomic rollback returns the body to
+        the exact state it was in before absorb was called.
         """
+        old_layer = fact.layer
         fact.layer = -1     # sentinel: beyond core
         self._singularity[fact.fact_id] = SingularityRecord(fact=fact)
         if not fact.vector:
@@ -138,7 +148,7 @@ class BlackHole:
             # rolls back the dict insert + layer mutation so the live
             # store stays consistent.
             self._singularity.pop(fact.fact_id, None)
-            fact.layer = 2   # rollback to "core" — closest live layer
+            fact.layer = old_layer
             # Prune the bucket if we just created an empty one.
             self._prune_empty_fact_bucket(dim)
             raise
@@ -161,8 +171,13 @@ class BlackHole:
     def absorb_meta(self, meta: "MetaFact") -> None:
         """Place a MetaFact in the singularity (typical: just after collapse).
 
-        Per-dim bucketed symmetrically with ``absorb``.
+        Per-dim bucketed symmetrically with ``absorb``. Rollback
+        restores ``meta.layer`` to its on-entry value (NOT a
+        hardcoded constant): a MetaFact promoted to ``layer=1``
+        via prior Hawking emission shouldn't silently land in
+        ``layer=0`` after a transient index error.
         """
+        old_layer = meta.layer
         meta.layer = -1
         self._meta_singularity[meta.meta_id] = MetaSingularityRecord(meta=meta)
         if not meta.vector:
@@ -173,7 +188,7 @@ class BlackHole:
             idx.add(meta.meta_id, meta.vector)
         except Exception:
             self._meta_singularity.pop(meta.meta_id, None)
-            meta.layer = 0   # rollback to live; caller decides next step
+            meta.layer = old_layer
             self._prune_empty_meta_bucket(dim)
             raise
 

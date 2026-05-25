@@ -80,20 +80,20 @@ class SingularityMixin:
             )
             if not falls_to_hole:
                 continue
-            # BlackHole.absorb is now atomic — pre-flights dim
-            # compatibility and rolls back on any index failure
-            # (raises with the fact restored to layer=2 and not
-            # in the singularity dict). Catch here so one
-            # mismatched-dim body doesn't abort the whole sweep;
-            # the fact stays live and visible, just not absorbed
-            # this pass. Operator can run collapse to bucket by
-            # dim, then absorption will succeed.
+            # BlackHole.absorb is atomic and rolls back the fact's
+            # layer / dict insert on failure. The per-dim singularity
+            # refactor closed the mixed-dim cause; remaining failure
+            # modes are unrelated (numpy alloc, OOM, corrupted vector
+            # shape, monkeypatched index in tests). Catch here so one
+            # bad body doesn't abort the whole sweep — body stays
+            # live with its original layer restored, visible to the
+            # next query.
             try:
                 self._hole.absorb(fact)
             except Exception as exc:
                 _logger.warning(
-                    "_absorb_dead: skipping fact_id=%r — absorb "
-                    "failed (likely mixed-dim singularity): %s",
+                    "_absorb_dead: absorb failed for fact_id=%r; "
+                    "body left live for safety: %s",
                     fid, exc,
                 )
                 continue
