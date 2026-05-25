@@ -334,41 +334,14 @@ class SessionsMixin:
         Response carries ``scoring_source`` (``"heuristic"`` /
         ``"sentiment"`` / ``"r_override"``) for transparency.
         """
-        with self._lock:
-            self._sync()
-            sid = self._resolve_sid(session_id)
-            if sid is None or sid not in self._sessions:
-                return {}
-            ctx = self._sessions[sid]
-            if not ctx.messages:
-                # Empty session has no R / EWMA / echo work to do —
-                # just drop it. But _pop_session_locked mutates
-                # self._sessions BEFORE calling storage.delete_open_session,
-                # so a storage failure used to leave in-memory pop
-                # diverged from disk. Wrap in the standard rollback
-                # guard symmetric with abort_session.
-                try:
-                    with self._txn():
-                        self._sync()
-                        if sid in self._sessions:
-                            self._pop_session_locked(sid)
-                except Exception:
-                    self._reload()
-                    raise
-                return {}
-            messages_snapshot = list(ctx.messages)
-            vectors_snapshot = list(ctx.vectors)
-            facts_snapshot = dict(ctx.facts)
-            # Mark closing — under the lock, after snapshot, before
-            # we release for compute_resonance. session_message will
-            # now reject pushes to this sid until close completes
-            # or fails. try/finally below ensures the flag clears
-            # on every exit path so a partial failure doesn't
-            # permanently brick the session id.
-            self._closing_sessions.add(sid)
-
-        # Resolve the resonance score. Override paths skip the
-        # behavioural / semantic / repetition computation entirely.
+        # Validate r_override / sentiment BEFORE marking the session
+        # as closing. If validation raises, the closing flag was
+        # never set and session_message can still target this sid
+        # (which is the correct behaviour — close didn't really
+        # start). Resolving the inputs here also means the rest of
+        # the function only deals with a pre-computed ResonanceResult,
+        # not the three branches.
+        precomputed: Optional["ResonanceResult"] = None
         scoring_source = "heuristic"
         if r_override is not None:
             # NaN / Infinity / non-numeric reject at the core
@@ -395,7 +368,7 @@ class SessionsMixin:
                 "resonant" if r_value > 0.35
                 else ("toxic" if r_value < -0.20 else "neutral")
             )
-            result = ResonanceResult(
+            precomputed = ResonanceResult(
                 behavioral_score=0.0, semantic_score=0.0,
                 repetition_score=0.0, r=r_value, label=label,
             )
@@ -411,214 +384,274 @@ class SessionsMixin:
                 "resonant" if r_value > 0.35
                 else ("toxic" if r_value < -0.20 else "neutral")
             )
-            result = ResonanceResult(
+            precomputed = ResonanceResult(
                 behavioral_score=0.0, semantic_score=0.0,
                 repetition_score=0.0, r=r_value, label=label,
             )
             scoring_source = "sentiment"
-        else:
-            # Heuristic path — pure computation on the snapshot, run
-            # outside the lock so other agents can keep querying.
-            result = compute_resonance(
-                messages_snapshot,
-                start_vector=vectors_snapshot[0],
-                end_vector=vectors_snapshot[-1],
-                all_vectors=vectors_snapshot,
-            )
 
         with self._lock:
-            try:
-                with self._txn():
-                    # Reload under the write lock — tick recomputes gravity for
-                    # every fact, so it must run on the authoritative state.
-                    self._sync()
+            self._sync()
+            sid = self._resolve_sid(session_id)
+            if sid is None or sid not in self._sessions:
+                return {}
+            ctx = self._sessions[sid]
+            if not ctx.messages:
+                # Empty session has no R / EWMA / echo work to do —
+                # just drop it. But _pop_session_locked mutates
+                # self._sessions BEFORE calling storage.delete_open_session,
+                # so a storage failure used to leave in-memory pop
+                # diverged from disk. Wrap in the standard rollback
+                # guard symmetric with abort_session.
+                try:
+                    with self._txn():
+                        self._sync()
+                        if sid in self._sessions:
+                            self._pop_session_locked(sid)
+                except Exception:
+                    self._reload()
+                    raise
+                return {}
+            messages_snapshot = list(ctx.messages)
+            vectors_snapshot = list(ctx.vectors)
+            facts_snapshot = dict(ctx.facts)
+            # Trajectory invariant check BEFORE marking closing:
+            # messages_snapshot is non-empty here (the empty case
+            # returned above), so vectors_snapshot[0] / [-1] will
+            # be dereferenced by compute_resonance. A corrupted
+            # ctx where len(messages) != len(vectors) (e.g. an
+            # open_sessions row that survived an older loader gap)
+            # would IndexError into the closing flag and brick the
+            # sid. Raise BEFORE setting the flag so the sid stays
+            # usable; caller can abort_session() to clean up.
+            if len(messages_snapshot) != len(vectors_snapshot):
+                raise ValueError(
+                    f"session trajectory corrupted: "
+                    f"len(messages)={len(messages_snapshot)} != "
+                    f"len(vectors)={len(vectors_snapshot)}; "
+                    f"abort_session({sid!r}) to clean up"
+                )
+            # Mark closing — under the lock, after snapshot, before
+            # we release for compute_resonance. session_message will
+            # now reject pushes to this sid until close completes
+            # or fails. The try/finally below guarantees the flag
+            # clears on every exit path — including ValueError from
+            # an invariant check above, or storage failure mid-write
+            # — so a partial failure never permanently bricks the
+            # session id.
+            self._closing_sessions.add(sid)
 
-                    # Snapshot-drift detection. compute_resonance ran lock-free
-                    # above so other agents could keep querying — but in that
-                    # window another thread could session_push() new messages
-                    # OR query() with this same session_id (which attributes
-                    # new fact_ids to ctx.facts). Without revalidation those
-                    # post-snapshot attributions would be silently dropped:
-                    # facts_snapshot is a frozen copy, and below we propagate
-                    # R only to its keys. After session_close pops the ctx
-                    # the new attributions vanish along with it.
-                    #
-                    # Fix: merge the current ctx.facts state into the
-                    # snapshot — giving new fact attributions the same R
-                    # as the snapshot's, because they're part of the same
-                    # session. Same-session writes during close are rare
-                    # but always "still part of this conversation".
-                    #
-                    # Scope of merge — facts ONLY. messages_snapshot and
-                    # vectors_snapshot are intentionally NOT updated:
-                    # result.r was already computed lock-free over the
-                    # snapshot trajectory and re-running compute_resonance
-                    # under the writeback lock would (a) hold the lock
-                    # for the heavy compute and (b) potentially churn R
-                    # if new messages just barely tip the heuristic.
-                    # Late messages therefore don't influence R or the
-                    # echo bundle this round; they remain available as
-                    # the agent's open ctx — but session_close pops it,
-                    # so they're effectively dropped from THIS round.
-                    # That's the documented contract; if you need late
-                    # messages to count, push them BEFORE session_close.
-                    live_ctx = self._sessions.get(sid)
-                    if live_ctx is not None:
-                        drift_facts = {
-                            fid: w
-                            for fid, w in live_ctx.facts.items()
-                            if fid not in facts_snapshot
-                        }
-                        if drift_facts:
-                            # Track in the snapshot dict so all downstream
-                            # propagation (gravity, EWMA, echo bundle) sees
-                            # the union without separate code paths.
-                            facts_snapshot.update(drift_facts)
+        try:
+            # Heuristic path runs lock-free so other agents can keep
+            # querying. r_override / sentiment paths were precomputed
+            # at function entry (before the closing flag was set, so
+            # bad inputs there don't leak into _closing_sessions).
+            if precomputed is not None:
+                result = precomputed
+            else:
+                result = compute_resonance(
+                    messages_snapshot,
+                    start_vector=vectors_snapshot[0],
+                    end_vector=vectors_snapshot[-1],
+                    all_vectors=vectors_snapshot,
+                )
 
-                    # Snapshot pre-resonance features for facts about to receive
-                    # their first ever resonance — these are the training events
-                    # for the adaptive weights. Resonance is the teacher; the
-                    # weights learn what predicted realised value *before* it.
-                    now_ts = time.time()
-                    max_deg = max(self._engine._degrees.values(), default=1)
-                    training_features: list[
-                        tuple[float, float, float, float, float]
-                    ] = []
-                    for fid in facts_snapshot:
-                        # Body may be a live FactPassport or a live MetaFact
-                        # (Hawking-emitted); both share the same gravity surface
-                        # and must train the formula symmetrically.
-                        body = (self._facts.get(fid)
-                                or self._meta_facts.get(fid))
-                        if body is not None and body.resonance_count == 0:
-                            training_features.append(pre_resonance_features(
-                                body,
-                                graph_degree=self._engine._degrees.get(fid, 0),
-                                max_degree=max_deg,
-                                now=now_ts,
-                            ))
+            with self._lock:
+                try:
+                    with self._txn():
+                        # Reload under the write lock — tick recomputes gravity for
+                        # every fact, so it must run on the authoritative state.
+                        self._sync()
 
-                    # Propagate R to facts used in this session, weighted by how
-                    # relevant each fact was to the session's queries.
-                    self._engine.apply_session_resonance(facts_snapshot, result.r)
+                        # Snapshot-drift detection. compute_resonance ran lock-free
+                        # above so other agents could keep querying — but in that
+                        # window another thread could session_push() new messages
+                        # OR query() with this same session_id (which attributes
+                        # new fact_ids to ctx.facts). Without revalidation those
+                        # post-snapshot attributions would be silently dropped:
+                        # facts_snapshot is a frozen copy, and below we propagate
+                        # R only to its keys. After session_close pops the ctx
+                        # the new attributions vanish along with it.
+                        #
+                        # Fix: merge the current ctx.facts state into the
+                        # snapshot — giving new fact attributions the same R
+                        # as the snapshot's, because they're part of the same
+                        # session. Same-session writes during close are rare
+                        # but always "still part of this conversation".
+                        #
+                        # Scope of merge — facts ONLY. messages_snapshot and
+                        # vectors_snapshot are intentionally NOT updated:
+                        # result.r was already computed lock-free over the
+                        # snapshot trajectory and re-running compute_resonance
+                        # under the writeback lock would (a) hold the lock
+                        # for the heavy compute and (b) potentially churn R
+                        # if new messages just barely tip the heuristic.
+                        # Late messages are REJECTED entirely by the
+                        # _closing_sessions gate in session_message (set
+                        # right after the snapshot above) — they never
+                        # make it to ctx.messages, so there is nothing
+                        # to "drop". Only late fact attribution (from a
+                        # concurrent query() on this sid) still merges
+                        # via the drift_facts union below, because the
+                        # gate is set per-method (session_message rejects;
+                        # query() does not).
+                        live_ctx = self._sessions.get(sid)
+                        if live_ctx is not None:
+                            drift_facts = {
+                                fid: w
+                                for fid, w in live_ctx.facts.items()
+                                if fid not in facts_snapshot
+                            }
+                            if drift_facts:
+                                # Track in the snapshot dict so all downstream
+                                # propagation (gravity, EWMA, echo bundle) sees
+                                # the union without separate code paths.
+                                facts_snapshot.update(drift_facts)
 
-                    # Touch every body the session actually consulted (so
-                    # access_count / last_accessed reflect the read), then
-                    # update recent_utility EWMA via the shared helper —
-                    # symmetric with check_echo which now applies the same
-                    # EWMA update on retroactive negative penalty.
-                    for fid in facts_snapshot:
-                        body = (self._facts.get(fid)
-                                or self._meta_facts.get(fid))
-                        if body is not None:
-                            body.touch()
-                    self._apply_recent_utility_locked(facts_snapshot, result.r)
+                        # Snapshot pre-resonance features for facts about to receive
+                        # their first ever resonance — these are the training events
+                        # for the adaptive weights. Resonance is the teacher; the
+                        # weights learn what predicted realised value *before* it.
+                        now_ts = time.time()
+                        max_deg = max(self._engine._degrees.values(), default=1)
+                        training_features: list[
+                            tuple[float, float, float, float, float]
+                        ] = []
+                        for fid in facts_snapshot:
+                            # Body may be a live FactPassport or a live MetaFact
+                            # (Hawking-emitted); both share the same gravity surface
+                            # and must train the formula symmetrically.
+                            body = (self._facts.get(fid)
+                                    or self._meta_facts.get(fid))
+                            if body is not None and body.resonance_count == 0:
+                                training_features.append(pre_resonance_features(
+                                    body,
+                                    graph_degree=self._engine._degrees.get(fid, 0),
+                                    max_degree=max_deg,
+                                    now=now_ts,
+                                ))
 
-                    self._echo.record(
-                        sid,
-                        vectors_snapshot,
-                        result.r,
-                        fact_weights=facts_snapshot,
-                    )
-                    # Opportunistic TTL sweep on session close. Drops stale resolved
-                    # and already-penalised echo sessions so the store stays bounded
-                    # without a separate cron job.
-                    expired = self._echo.expire()
-                    if self._storage:
-                        session_obj = self._echo.get(sid)
-                        if session_obj:
-                            self._storage.save_echo_session(
-                                sid,
-                                session_obj.bundle.centroids,
-                                session_obj.r_score,
-                                time.time(),
-                                fact_weights=session_obj.fact_weights,
-                                echo_penalty=session_obj.echo_penalty,
-                            )
-                        if expired and hasattr(self._storage, "delete_echo_session"):
-                            for stale_sid in expired:
-                                self._storage.delete_echo_session(stale_sid)
+                        # Propagate R to facts used in this session, weighted by how
+                        # relevant each fact was to the session's queries.
+                        self._engine.apply_session_resonance(facts_snapshot, result.r)
 
-                    migrations = self._engine.tick()
-                    absorbed = self._absorb_dead()
+                        # Touch every body the session actually consulted (so
+                        # access_count / last_accessed reflect the read), then
+                        # update recent_utility EWMA via the shared helper —
+                        # symmetric with check_echo which now applies the same
+                        # EWMA update on retroactive negative penalty.
+                        for fid in facts_snapshot:
+                            body = (self._facts.get(fid)
+                                    or self._meta_facts.get(fid))
+                            if body is not None:
+                                body.touch()
+                        self._apply_recent_utility_locked(facts_snapshot, result.r)
 
-                    if self._storage:
-                        self._storage.save_facts(list(self._facts.values()))
-                        if self._meta_facts and hasattr(self._storage, "save_meta_facts"):
-                            self._storage.save_meta_facts(list(self._meta_facts.values()))
-
-                    # Train the adaptive weights: one regularised SGD step per
-                    # session toward (R + 1) / 2, using the mean of first-resonance
-                    # features as the predictor. One signal in, one step out — the
-                    # weights drift slowly toward what predicts value FOR YOU.
-                    if training_features:
-                        n = len(training_features)
-                        mean_f = sum(f[0] for f in training_features) / n
-                        mean_a = sum(f[1] for f in training_features) / n
-                        mean_g = sum(f[2] for f in training_features) / n
-                        mean_u = sum(f[3] for f in training_features) / n
-                        mean_s = sum(f[4] for f in training_features) / n
-                        target = max(0.0, min(1.0, (result.r + 1.0) / 2.0))
-                        # Multi-process safety: another process may have stepped
-                        # the weights between our boot and this commit. Reload
-                        # the authoritative row UNDER the write txn so our SGD
-                        # step composes on top of their learning, not on top of
-                        # our stale in-memory copy. Without this, the last
-                        # writer silently overwrites every concurrent process's
-                        # train_count.
-                        if (self._storage
-                                and hasattr(self._storage, "load_adaptive_weights")):
-                            fresh = self._storage.load_adaptive_weights()
-                            if (fresh is not None
-                                    and fresh.train_count
-                                        >= self._engine.weights.train_count):
-                                self._engine.weights = fresh
-                        self._engine.weights.update(
-                            mean_f, mean_a, mean_g, mean_u, mean_s, target=target,
+                        self._echo.record(
+                            sid,
+                            vectors_snapshot,
+                            result.r,
+                            fact_weights=facts_snapshot,
                         )
-                        if self._storage and hasattr(self._storage, "save_adaptive_weights"):
-                            self._storage.save_adaptive_weights(self._engine.weights)
+                        # Opportunistic TTL sweep on session close. Drops stale resolved
+                        # and already-penalised echo sessions so the store stays bounded
+                        # without a separate cron job.
+                        expired = self._echo.expire()
+                        if self._storage:
+                            session_obj = self._echo.get(sid)
+                            if session_obj:
+                                self._storage.save_echo_session(
+                                    sid,
+                                    session_obj.bundle.centroids,
+                                    session_obj.r_score,
+                                    time.time(),
+                                    fact_weights=session_obj.fact_weights,
+                                    echo_penalty=session_obj.echo_penalty,
+                                )
+                            if expired and hasattr(self._storage, "delete_echo_session"):
+                                for stale_sid in expired:
+                                    self._storage.delete_echo_session(stale_sid)
 
-                    # Counter-triggered collapse. Held inside the lock so the
-                    # collapse counter and the trigger decision are consistent.
-                    self._maybe_trigger_collapse_locked(len(absorbed))
-                    self._bump_mutation_locked()
+                        migrations = self._engine.tick()
+                        absorbed = self._absorb_dead()
 
-                    summary = {
-                        "session_id": sid,
-                        "r": result.r,
-                        "label": result.label,
-                        "migrations": migrations,
-                        "absorbed": absorbed,
-                        # Tells the caller which path resolved R: heuristic
-                        # text scan (the original contract) vs an explicit
-                        # sentiment label vs a direct numeric override.
-                        "scoring_source": scoring_source,
-                    }
-                    self._pop_session_locked(sid)
+                        if self._storage:
+                            self._storage.save_facts(list(self._facts.values()))
+                            if self._meta_facts and hasattr(self._storage, "save_meta_facts"):
+                                self._storage.save_meta_facts(list(self._meta_facts.values()))
 
-            except Exception:
-                # Storage rolled back mid-write; in-memory caches
-                # may be partially mutated (apply_session_resonance,
-                # body.touch, _apply_recent_utility_locked, _echo.record,
-                # _engine.tick, _absorb_dead, weights.update,
-                # _pop_session_locked). Re-anchor every cache to disk
-                # truth before propagating — symmetric with add_fact /
-                # add_facts / query / collapse_singularity.
-                self._reload()
-                # Clear closing flag even on failure so the sid can
-                # be retried on a future session_close (after _reload
-                # restored the live ctx). Without this discard, a
-                # write-side crash would permanently brick the sid
-                # for any future session_message.
+                        # Train the adaptive weights: one regularised SGD step per
+                        # session toward (R + 1) / 2, using the mean of first-resonance
+                        # features as the predictor. One signal in, one step out — the
+                        # weights drift slowly toward what predicts value FOR YOU.
+                        if training_features:
+                            n = len(training_features)
+                            mean_f = sum(f[0] for f in training_features) / n
+                            mean_a = sum(f[1] for f in training_features) / n
+                            mean_g = sum(f[2] for f in training_features) / n
+                            mean_u = sum(f[3] for f in training_features) / n
+                            mean_s = sum(f[4] for f in training_features) / n
+                            target = max(0.0, min(1.0, (result.r + 1.0) / 2.0))
+                            # Multi-process safety: another process may have stepped
+                            # the weights between our boot and this commit. Reload
+                            # the authoritative row UNDER the write txn so our SGD
+                            # step composes on top of their learning, not on top of
+                            # our stale in-memory copy. Without this, the last
+                            # writer silently overwrites every concurrent process's
+                            # train_count.
+                            if (self._storage
+                                    and hasattr(self._storage, "load_adaptive_weights")):
+                                fresh = self._storage.load_adaptive_weights()
+                                if (fresh is not None
+                                        and fresh.train_count
+                                            >= self._engine.weights.train_count):
+                                    self._engine.weights = fresh
+                            self._engine.weights.update(
+                                mean_f, mean_a, mean_g, mean_u, mean_s, target=target,
+                            )
+                            if self._storage and hasattr(self._storage, "save_adaptive_weights"):
+                                self._storage.save_adaptive_weights(self._engine.weights)
+
+                        # Counter-triggered collapse. Held inside the lock so the
+                        # collapse counter and the trigger decision are consistent.
+                        self._maybe_trigger_collapse_locked(len(absorbed))
+                        self._bump_mutation_locked()
+
+                        summary = {
+                            "session_id": sid,
+                            "r": result.r,
+                            "label": result.label,
+                            "migrations": migrations,
+                            "absorbed": absorbed,
+                            # Tells the caller which path resolved R: heuristic
+                            # text scan (the original contract) vs an explicit
+                            # sentiment label vs a direct numeric override.
+                            "scoring_source": scoring_source,
+                        }
+                        self._pop_session_locked(sid)
+
+                except Exception:
+                    # Storage rolled back mid-write; in-memory caches
+                    # may be partially mutated (apply_session_resonance,
+                    # body.touch, _apply_recent_utility_locked, _echo.record,
+                    # _engine.tick, _absorb_dead, weights.update,
+                    # _pop_session_locked). Re-anchor every cache to disk
+                    # truth before propagating — symmetric with add_fact /
+                    # add_facts / query / collapse_singularity.
+                    self._reload()
+                    raise
+            return summary
+        finally:
+            # The outer try/finally guarantees the closing flag clears
+            # on EVERY exit path — successful close, storage-failure
+            # _reload, AND any unexpected exception (including a
+            # KeyboardInterrupt). Without this finally the sid could
+            # be permanently bricked into "session_closing" with no
+            # way to recover short of process restart. Holding the
+            # lock briefly for the discard so the flag clears
+            # atomically with any concurrent session_message check.
+            with self._lock:
                 self._closing_sessions.discard(sid)
-                raise
-            # Successful close: drop the flag now that the ctx is
-            # popped and the writeback committed. session_message
-            # for this sid will now raise "unknown session" (the
-            # honest result) rather than "session closing".
-            self._closing_sessions.discard(sid)
-        return summary
 
     def _pop_session_locked(self, sid: str) -> None:
         """Caller must hold self._lock."""

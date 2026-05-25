@@ -755,6 +755,21 @@ class SQLiteBackend:
                             "vectors must share a single dimension"
                         )
                     coerced_vectors.append(coerced)
+                # Trajectory length invariant: messages and vectors
+                # must align 1:1 because session_close uses
+                # vectors_snapshot[0] / [-1] (and compute_resonance
+                # iterates per message). A corrupted row with
+                # messages=["hi"] but vectors=[] would pass every
+                # check above (both are lists, both individually
+                # well-formed) and crash session_close with IndexError
+                # — bricking the closing flag along the way. Drop
+                # the row at the loader so the in-memory ctx never
+                # carries a mismatched trajectory.
+                if len(messages) != len(coerced_vectors):
+                    raise ValueError(
+                        f"messages and vectors length mismatch "
+                        f"({len(messages)} vs {len(coerced_vectors)})"
+                    )
                 out.append({
                     "session_id": r["session_id"],
                     "messages": messages,

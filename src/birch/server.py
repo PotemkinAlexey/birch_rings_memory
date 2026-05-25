@@ -1588,6 +1588,31 @@ def session_push(text: str, session_id: str) -> dict:
                 "or check the id hasn't been closed."
             ),
         }
+    except RuntimeError as exc:
+        # The closing-session race gate in session_message raises
+        # RuntimeError("session_closing: ...") when a push targets a
+        # sid currently mid-close. Surface that as a structured
+        # response with a clear retry hint instead of a raw
+        # stacktrace; without this catch the new gate would still
+        # do the right thing (reject the push) but the agent would
+        # see an unstructured error and not know to wait or open
+        # a fresh session.
+        msg = str(exc)
+        if "session_closing" in msg:
+            return {
+                "ok": False,
+                "error": "session_closing",
+                "session_id": session_id,
+                "detail": msg,
+                "hint": (
+                    "session_close is in progress for this id. Wait "
+                    "for it to complete (the close pops the sid; a "
+                    "follow-up session_message will then get "
+                    "unknown_session) or open a new session_id for "
+                    "any further messages."
+                ),
+            }
+        raise
     return {
         "session_id": session_id,
         "ok": True,
