@@ -561,6 +561,14 @@ Next natural steps: a persistent similarity index for very large stores
 (FAISS / hnswlib), an LLM-driven `MetaFact.summary` writer that runs async
 after collapse, and recursive collapse (MetaFacts colliding with MetaFacts).
 
+## See also
+
+**[MemoryBricks](https://github.com/PotemkinAlexey/memorybricks)** —
+umbrella architecture combining BirchKM (this repo, the *dynamics*
+layer) with [Vertical Brain](https://github.com/PotemkinAlexey/vertical-brain-for-ai)
+(governance layer) under a unified MCP surface. Pattern is documented
+in [`docs/STRUCTURED_LIVING_MEMORY.md`](docs/STRUCTURED_LIVING_MEMORY.md).
+
 ## License
 
 Apache 2.0
