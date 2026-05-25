@@ -160,6 +160,16 @@ def _load_list(value: Any, cast) -> list:
     if not isinstance(parsed, list):
         return []
     try:
-        return [cast(x) for x in parsed]
+        out = [cast(x) for x in parsed]
     except (TypeError, ValueError):
         return []
+    # NaN / Infinity sneak through float() — they're valid floats per
+    # Python but poison numpy cosine similarity (every comparison
+    # becomes NaN, ranking undefined). FactPassport vectors go through
+    # _safe_vector in the SQLite backend which checks math.isfinite;
+    # MetaFacts used to skip that gate. Symmetric defence here.
+    if cast is float:
+        import math as _math
+        if any(not _math.isfinite(x) for x in out):
+            return []
+    return out

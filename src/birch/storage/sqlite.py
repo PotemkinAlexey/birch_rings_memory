@@ -418,7 +418,7 @@ class SQLiteBackend:
         )
         self._maybe_commit()
 
-    def load_echo_sessions(self) -> list[dict]:
+    def load_echo_sessions(self, *, cleanup: bool = True) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM echo_sessions").fetchall()
         out = []
         for r in rows:
@@ -456,7 +456,8 @@ class SQLiteBackend:
                 )
                 try:
                     if "session_id" in r.keys():
-                        self.delete_echo_session(r["session_id"])
+                        if cleanup:
+                            self.delete_echo_session(r["session_id"])
                 except Exception:   # pragma: no cover — best effort cleanup
                     pass
         return out
@@ -489,7 +490,7 @@ class SQLiteBackend:
         )
         self._maybe_commit()
 
-    def load_open_sessions(self) -> list[dict]:
+    def load_open_sessions(self, *, cleanup: bool = True) -> list[dict]:
         # ORDER BY started_at so _reload restores `_current_session_id`
         # deterministically — without the ORDER BY, the last row from
         # `SELECT *` was driver-dependent and "current" after a cross-
@@ -572,7 +573,8 @@ class SQLiteBackend:
                     r["session_id"] if "session_id" in r.keys() else "?", exc,
                 )
                 try:
-                    self.delete_open_session(r["session_id"])
+                    if cleanup:
+                        self.delete_open_session(r["session_id"])
                 except Exception:   # pragma: no cover — best effort cleanup
                     pass
         return out
@@ -616,7 +618,7 @@ class SQLiteBackend:
         self._conn.execute("DELETE FROM meta_facts WHERE meta_id = ?", (meta_id,))
         self._maybe_commit()
 
-    def load_meta_facts(self) -> list[MetaFact]:
+    def load_meta_facts(self, *, cleanup: bool = True) -> list[MetaFact]:
         rows = self._conn.execute("SELECT * FROM meta_facts").fetchall()
         # Tolerant per row — same robustness contract as load_facts /
         # load_open_sessions / load_echo_sessions: one bad row must not
@@ -684,7 +686,8 @@ class SQLiteBackend:
                 )
                 try:
                     if "meta_id" in r.keys():
-                        self.delete_meta_fact(r["meta_id"])
+                        if cleanup:
+                            self.delete_meta_fact(r["meta_id"])
                 except Exception:   # pragma: no cover — best effort cleanup
                     pass
         return out

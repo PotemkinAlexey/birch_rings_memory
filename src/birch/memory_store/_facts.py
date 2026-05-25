@@ -435,11 +435,26 @@ class FactsMixin:
                         if kind == "dup_in_batch":
                             _, idx, first_idx, sid = plan
                             # Result resolves to the same fact the first
-                            # occurrence created/touched. Touch + attrib
-                            # already happened on first_idx; a second
-                            # touch here would over-count access on a
-                            # single batch's duplicate, so we skip it.
+                            # occurrence created/touched. A second
+                            # `body.touch()` would over-count access for
+                            # a single batch's duplicate, so we skip
+                            # the touch. BUT attribution is per-session
+                            # and the duplicate may carry a DIFFERENT
+                            # per-item session_id than the first
+                            # occurrence — skipping attribution here
+                            # silently drops the second session's
+                            # gravity feedback for this fact. Apply
+                            # attribution explicitly so per-item
+                            # session_id contract holds.
                             results[idx] = results[first_idx]
+                            first_fact = results[first_idx]
+                            if first_fact is not None and sid is not None:
+                                ctx = self._sessions.get(sid)
+                                if ctx is not None:
+                                    self._attribute_to(
+                                        ctx, first_fact.fact_id, 1.0,
+                                    )
+                                    touched_ctxs.add(ctx.session_id)
                         elif kind == "touch":
                             _, idx, existing_id, sid = plan
                             fact = self._facts[existing_id]
@@ -754,10 +769,32 @@ class FactsMixin:
         return facts[:limit]
 
     def link(self, from_id: str, to_id: str) -> None:
+        """Record a graph dependency edge between two live FactPassports.
+
+        Both ids MUST point at currently-live FactPassports — without
+        the existence check a caller could create dangling edges
+        referencing facts that never existed (or already moved to the
+        singularity). Those phantom edges accumulate forever because
+        edge cleanup keys on fact deletion, which the never-existent
+        endpoint can't trigger. Engine degree counter also gets
+        ghost-inflated.
+        """
         with self._lock:
             try:
                 with self._txn():
                     self._sync()
+                    if from_id not in self._facts:
+                        raise KeyError(
+                            f"link(from_id={from_id!r}, ...): from_id is "
+                            f"not a live FactPassport — refusing to "
+                            f"create a dangling edge."
+                        )
+                    if to_id not in self._facts:
+                        raise KeyError(
+                            f"link(..., to_id={to_id!r}): to_id is not "
+                            f"a live FactPassport — refusing to create "
+                            f"a dangling edge."
+                        )
                     self._engine.link(from_id, to_id)
                     if self._storage:
                         self._storage.save_edge(from_id, to_id)

@@ -359,7 +359,7 @@ class MemoryStore(
         # MetaFacts: layer -1 live in the singularity; promoted ones (after
         # Hawking emission) live in the live meta store with the engine.
         if hasattr(self._storage, "load_meta_facts"):
-            for meta in self._storage.load_meta_facts():
+            for meta in self._storage.load_meta_facts(cleanup=prune):
                 if meta.layer == -1:
                     try:
                         self._hole.restore_meta(meta)
@@ -407,7 +407,7 @@ class MemoryStore(
                             and endpoint not in seen):
                         self._storage.delete_edges_for_fact(endpoint)
                         seen.add(endpoint)
-        for row in self._storage.load_echo_sessions():
+        for row in self._storage.load_echo_sessions(cleanup=prune):
             centroids = row["centroids"]
             cb = ClusterBundle(centroids=centroids, k=len(centroids), inertia=0.0)
             self._echo._sessions[row["session_id"]] = StoredSession(
@@ -424,7 +424,7 @@ class MemoryStore(
         _SESSION_TTL = 86_400  # 24 h — discard crashed/orphaned sessions
         if hasattr(self._storage, "load_open_sessions"):
             now = time.time()
-            for row in self._storage.load_open_sessions():
+            for row in self._storage.load_open_sessions(cleanup=prune):
                 if now - row["started_at"] > _SESSION_TTL:
                     if prune:
                         self._storage.delete_open_session(row["session_id"])

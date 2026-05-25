@@ -112,29 +112,37 @@ class QueryMixin:
         """
         prefix = subject_prefix.lower() if subject_prefix else None
         skip = exclude_ids or set()
+        # Keep the lock for the whole scan: reading self._facts after
+        # releasing the lock previously allowed another thread to
+        # delete / supersede / retire a fact between `_sync` and
+        # `self._facts.get(fid)`, surfacing a stale FactPassport (or
+        # missing one) in a read-only API. query() already holds the
+        # lock through its results loop — find_similar_by_vector was
+        # the odd sibling.
+        hits: list[dict] = []
         with self._lock:
             self._sync()
             sims = self._index.all_similarities(vec)
-        hits: list[dict] = []
-        for fid, sim in sims.items():
-            if fid in skip:
-                continue
-            if sim < min_similarity:
-                continue
-            fact = self._facts.get(fid)
-            if fact is None or fact.is_deprecated or fact.is_expired:
-                continue
-            if prefix and not fact.subject.lower().startswith(prefix):
-                continue
-            hits.append({
-                "fact_id": fid,
-                "subject": fact.subject,
-                "predicate": fact.predicate,
-                "object": fact.object,
-                "similarity": round(float(sim), 4),
-                "gravity_score": round(fact.gravity_score, 3),
-                "layer": fact.layer,
-            })
+            for fid, sim in sims.items():
+                if fid in skip:
+                    continue
+                if sim < min_similarity:
+                    continue
+                fact = self._facts.get(fid)
+                if (fact is None or fact.is_deprecated
+                        or fact.is_expired):
+                    continue
+                if prefix and not fact.subject.lower().startswith(prefix):
+                    continue
+                hits.append({
+                    "fact_id": fid,
+                    "subject": fact.subject,
+                    "predicate": fact.predicate,
+                    "object": fact.object,
+                    "similarity": round(float(sim), 4),
+                    "gravity_score": round(fact.gravity_score, 3),
+                    "layer": fact.layer,
+                })
         hits.sort(key=lambda h: h["similarity"], reverse=True)
         return hits[:top_k]
 
@@ -332,22 +340,34 @@ class QueryMixin:
                     # we now hold the authoritative state.
                     self._sync()
 
-                    # Revalidate the pre-sync top: another process may have
-                    # deprecated / retired / deleted bodies that were in our
-                    # snapshot. Drop the vanished ones and replace each
-                    # surviving QueryResult's body with the authoritative
-                    # post-sync object, so the caller never sees a stale ref.
+                    # Revalidate the pre-sync top: another process may
+                    # have deprecated / retired / deleted bodies, OR
+                    # mutated state in a way that breaks our original
+                    # filter predicates (layer migration, gravity drop
+                    # below min_gravity, subject change). Re-run the
+                    # SAME predicates that gated the initial scan so a
+                    # body that no longer matches the caller's scope
+                    # never gets returned (or touched / attributed).
+                    # Backfill already re-applies filters; survivors
+                    # used to be exempt and could return out-of-scope.
                     revalidated_top: list[QueryResult] = []
                     for r in top:
                         if r.fact is not None:
                             live = self._facts.get(r.fact.fact_id)
-                            if live is None or live.is_deprecated or live.is_expired:
+                            if (live is None or live.is_deprecated
+                                    or live.is_expired):
+                                continue
+                            if not _fact_predicate(live):
+                                # Filter no longer holds — caller's
+                                # scope changed under our feet.
                                 continue
                             r.fact = live
                             revalidated_top.append(r)
                         elif r.meta is not None:
                             live_meta = self._meta_facts.get(r.meta.meta_id)
                             if live_meta is None:
+                                continue
+                            if not _meta_predicate(live_meta):
                                 continue
                             r.meta = live_meta
                             revalidated_top.append(r)
