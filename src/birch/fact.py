@@ -8,6 +8,47 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+def _sanitize_float(
+    value, default, *, lo: float | None = None, hi: float | None = None,
+):
+    """Constructor-side scalar sanitiser. Same contract as the SQLite
+    backend's ``_finite_float``; lives here so direct construction
+    (tests, in-memory migrations, library use) gets the same gate."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(out):
+        return default
+    if lo is not None:
+        out = max(lo, out)
+    if hi is not None:
+        out = min(hi, out)
+    return out
+
+
+def _sanitize_nonneg_int(value, default: int) -> int:
+    """Same as the loader's ``_nonnegative_int`` — defaults on
+    non-coercible, clamps negatives to zero."""
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, out)
+
+
+def _sanitize_layer(value, default: int = 1) -> int:
+    """Layer must be one of (-1, 0, 1, 2). Unknown values revert to
+    the default — same contract as the SQLite backend's ``_layer``."""
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    if out not in (-1, 0, 1, 2):
+        return default
+    return out
+
+
 @dataclass
 class FactPassport:
     subject: str
@@ -41,6 +82,45 @@ class FactPassport:
     # Updated by MemoryStore.run_forecast(); not touched per session.
     forecast_stability: float = 0.5
 
+    def __post_init__(self) -> None:
+        """Sanitise direct-construction values.
+
+        Library users build FactPassport directly in tests, migrations,
+        and ad-hoc scripts — bypassing the SQLite loader's
+        ``_finite_float`` / ``_layer`` / ``_nonnegative_int`` gates.
+        Without this hook, ``FactPassport(..., gravity_score=float
+        ("nan"))`` would silently sit in memory until the next save
+        crashes (write-side ``allow_nan=False``) or until the next
+        ``compute_gravity`` returns NaN. Normalise on construction
+        instead of failing late: poisoned scalars revert to defaults,
+        legitimate-but-out-of-range scalars clamp. Strings / None /
+        bool slot through ``float()``-coerce-or-default same as the
+        loader.
+        """
+        self.gravity_score = _sanitize_float(
+            self.gravity_score, 0.5, lo=0.0, hi=1.0,
+        )
+        self.layer = _sanitize_layer(self.layer, 1)
+        self.created_at = _sanitize_float(
+            self.created_at, time.time(),
+        )
+        if self.ttl is not None:
+            self.ttl = _sanitize_float(self.ttl, None)
+        self.access_count = _sanitize_nonneg_int(self.access_count, 0)
+        self.last_accessed = _sanitize_float(
+            self.last_accessed, time.time(),
+        )
+        self.resonance_sum = _sanitize_float(self.resonance_sum, 0.0)
+        self.resonance_count = _sanitize_nonneg_int(
+            self.resonance_count, 0,
+        )
+        self.recent_utility = _sanitize_float(
+            self.recent_utility, 0.5, lo=0.0, hi=1.0,
+        )
+        self.forecast_stability = _sanitize_float(
+            self.forecast_stability, 0.5, lo=0.0, hi=1.0,
+        )
+
     @property
     def is_deprecated(self) -> bool:
         return self.deprecated_by is not None
@@ -51,9 +131,21 @@ class FactPassport:
 
     @property
     def avg_resonance(self) -> float:
-        if self.resonance_count == 0:
+        """Mean session resonance touched by this fact.
+
+        Finite-safe: ``apply_resonance`` self-defends, but library
+        users can mutate ``resonance_sum`` directly between load and
+        first read. A NaN there used to propagate through
+        ``compute_gravity`` into stored gravity_score and freeze the
+        layer ranking. Return the neutral 0.0 on poison so the body
+        ranks as dead-weight rather than nondeterministically.
+        """
+        if self.resonance_count <= 0:
             return 0.0
-        return self.resonance_sum / self.resonance_count
+        avg = self.resonance_sum / self.resonance_count
+        if not math.isfinite(avg):
+            return 0.0
+        return avg
 
     def touch(self) -> None:
         self.access_count += 1

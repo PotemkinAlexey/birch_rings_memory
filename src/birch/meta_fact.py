@@ -44,6 +44,62 @@ class MetaFact:
     recent_utility: float = 0.5
     forecast_stability: float = 0.5
 
+    def __post_init__(self) -> None:
+        """Sanitise direct-construction values.
+
+        Symmetric with ``FactPassport.__post_init__``. MetaFacts get
+        built directly in compactor tests, in migrations, and by
+        library users — bypassing the SQLite loader's gates. A
+        poisoned scalar at construction time would sit in memory
+        until the next save crashes (write-side ``allow_nan=False``)
+        or until ``compute_gravity`` returns NaN. Normalise on
+        construction instead of failing late.
+        """
+        import math as _math
+
+        def _f(v, default, lo=None, hi=None):
+            try:
+                out = float(v)
+            except (TypeError, ValueError):
+                return default
+            if not _math.isfinite(out):
+                return default
+            if lo is not None:
+                out = max(lo, out)
+            if hi is not None:
+                out = min(hi, out)
+            return out
+
+        def _i(v, default):
+            try:
+                return max(0, int(v))
+            except (TypeError, ValueError):
+                return default
+
+        def _layer(v, default=-1):
+            try:
+                out = int(v)
+            except (TypeError, ValueError):
+                return default
+            return out if out in (-1, 0, 1, 2) else default
+
+        self.weight = _i(self.weight, 1)
+        self.gravity_score = _f(
+            self.gravity_score, 0.30, lo=0.0, hi=1.0,
+        )
+        self.created_at = _f(self.created_at, time.time())
+        self.layer = _layer(self.layer, -1)
+        self.access_count = _i(self.access_count, 0)
+        self.last_accessed = _f(self.last_accessed, time.time())
+        self.resonance_sum = _f(self.resonance_sum, 0.0)
+        self.resonance_count = _i(self.resonance_count, 0)
+        self.recent_utility = _f(
+            self.recent_utility, 0.5, lo=0.0, hi=1.0,
+        )
+        self.forecast_stability = _f(
+            self.forecast_stability, 0.5, lo=0.0, hi=1.0,
+        )
+
     # ── Polymorphism shims for code that ducks on FactPassport ──────────────
     # FactPassport carries optional ttl/deprecated_by fields; MetaFacts cannot
     # currently be deprecated or expire, but exposing the same booleans keeps
@@ -63,9 +119,21 @@ class MetaFact:
 
     @property
     def avg_resonance(self) -> float:
-        if self.resonance_count == 0:
+        """Mean session resonance touched by this MetaFact.
+
+        Finite-safe symmetric with ``FactPassport.avg_resonance``.
+        A NaN ``resonance_sum`` injected via direct attribute
+        mutation used to leak into ``compute_gravity`` and freeze
+        the layer ranking. Neutral 0.0 on poison.
+        """
+        import math as _math
+
+        if self.resonance_count <= 0:
             return 0.0
-        return self.resonance_sum / self.resonance_count
+        avg = self.resonance_sum / self.resonance_count
+        if not _math.isfinite(avg):
+            return 0.0
+        return avg
 
     def touch(self) -> None:
         self.access_count += 1

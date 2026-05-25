@@ -147,6 +147,19 @@ def compute_gravity(
         + weights.w_stability * stability
         + _W_RESONANCE * resonance_score
     )
+    # Final finite check: every input is sanitised at storage / engine
+    # / public-method boundaries, but library mode lets a user mutate
+    # ``fact.resonance_sum = float("nan")`` directly between load and
+    # next call here. ``avg_resonance`` would then return NaN, gravity
+    # arithmetic propagates it, and ``min/max(NaN, ...)`` is
+    # platform-dependent — the round trip can end up with NaN gravity
+    # stored back to disk. Defaulting to the neutral 0.0 (= dead-weight
+    # body, eligible for absorption) is the safe failure mode: the
+    # body falls into the singularity instead of poisoning the layer
+    # ranking. Symmetric to _attribute_to's "max/min is not NaN-aware"
+    # fix from the previous round.
+    if not math.isfinite(gravity):
+        return 0.0
     return round(min(1.0, max(0.0, gravity)), 4)
 
 
