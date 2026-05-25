@@ -1,5 +1,7 @@
-"""Six follow-up findings (professor tier — bugs in the just-shipped
-e29dd81 invariant tightening commit):
+"""Six engine-cleanup + rollback-safety contracts across the
+absorption / unregister / add_fact / query / session_close /
+close paths. Bundled because they all share the "in-memory
+state must match disk after any failure" invariant.
 
   1. _absorb_dead unregisters absorbed bodies from GravityEngine —
      previously the body left _facts/_index/_spo_index but stayed

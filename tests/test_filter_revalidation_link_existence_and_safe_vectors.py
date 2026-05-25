@@ -1,8 +1,7 @@
-"""Six findings from a brutal Tier-1 static review pass.
-
-Vendor-neutral name "professor death star" — the reviewer found
-race windows and contract leaks that survived every previous round
-of "100% precision" claims. All six confirmed real, shipped together.
+"""Six contracts around read-path race windows + endpoint guards
++ safe vector loading. Bundled because they all surfaced from the
+same review pass and share the "consistency under concurrent or
+malformed input" theme.
 
   1. query() now revalidates ALL filter predicates after _sync, not
      just exists+not-deprecated. A body whose layer / gravity /
