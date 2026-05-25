@@ -453,7 +453,10 @@ class FactsMixin:
                     # self._facts / _index / _spo_index / fact.touch()
                     # happens in this pass — every raise here aborts the
                     # batch before any state changes.
-                    seen_in_batch: dict[tuple[str, str, str], int] = {}
+                    # MemoryBricks Step 1: key shape matches _spo_index
+                    # — (namespace, s, p, o). Two items with the same SPO
+                    # in different namespaces are NOT in-batch dupes.
+                    seen_in_batch: dict[tuple[str, str, str, str], int] = {}
                     # Each plan entry: ("touch", idx, existing_id, sid)
                     # or ("new", idx, fact, key, vec, sid)
                     # or ("dup_in_batch", idx, first_idx, sid).
