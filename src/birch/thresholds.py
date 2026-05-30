@@ -102,6 +102,17 @@ class Thresholds:
         "FIND_SIMILAR_THRESHOLD", 0.85,
     )
 
+    # Salience / irreplaceability — a live fact with no other live fact in its
+    # namespace at cosine ≥ this is "unique"; losing it loses knowledge no
+    # neighbour can replace, so it earns retention against disuse-absorption.
+    # A cost-of-loss signal orthogonal to frequency.
+    SALIENCE_NEIGHBOR: float = _env_float("SALIENCE_NEIGHBOR_THRESHOLD", 0.85)
+
+    # How much full irreplaceability lowers the absorption floor: a fully
+    # unique fact's effective floor is ABSORPTION·(1 − SALIENCE_PROTECTION).
+    # 0 disables salience retention (flat floor for everyone).
+    SALIENCE_PROTECTION: float = _env_float("SALIENCE_PROTECTION", 0.9)
+
     @classmethod
     def as_dict(cls) -> dict[str, float]:
         """Snapshot for diagnostics / memory_stats. Lets an operator
@@ -114,4 +125,6 @@ class Thresholds:
             "collapse": cls.COLLAPSE,
             "echo": cls.ECHO,
             "find_similar_default": cls.FIND_SIMILAR_DEFAULT,
+            "salience_neighbor": cls.SALIENCE_NEIGHBOR,
+            "salience_protection": cls.SALIENCE_PROTECTION,
         }

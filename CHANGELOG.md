@@ -10,6 +10,17 @@ Resonance feedback loop made evidence-gated and self-damping, so a noisy,
 self-derived R cannot compound through the loop.
 
 ### Added
+- **Salience / irreplaceability retention.** A frequency-orthogonal cost-of-loss
+  signal: a fact that is *both* unique in its namespace (no live neighbour at
+  cosine ≥ `BIRCH_SALIENCE_NEIGHBOR_THRESHOLD`) *and* has proven useful
+  (`avg_resonance > 0`) earns a lowered disuse-absorption floor —
+  `ABSORPTION·(1 − SALIENCE_PROTECTION·irreplaceability·value)` — so a
+  rare-but-critical fact (used once a year, decisive each time, no substitute)
+  is not forgotten just for being rarely touched. Uniqueness alone is NOT
+  enough (almost every fact is unique → would halt absorption); coupling to
+  proven value targets the genuinely critical and lets junk decay. Both factors
+  are frequency-orthogonal. `BIRCH_SALIENCE_PROTECTION=0` disables it; new
+  `stats.salience_retained` counts distinct facts kept this way.
 - **Confidence-damped gravity step.** `compute_resonance` now emits a
   `confidence` in `[0, 1]` (`agreement × corroboration`: do the three signals
   pull the same way, and is the verdict backed by more than one signal).

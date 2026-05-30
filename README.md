@@ -177,6 +177,19 @@ core below 0.30, kinetic between — so a fact stranded in the core climbs
 back out once its gravity recovers. Below 0.10 it is absorbed by the
 black hole.
 
+**Salience (irreplaceability) raises that floor for rare-but-critical facts.**
+Gravity is mostly frequency-coupled (access, recency, utility), so a fact used
+once a year would decay and be absorbed before its next use. The absorption
+floor is therefore lowered for a fact that is *both* unique in its namespace
+(no live neighbour at cosine ≥ `0.85`) *and* has proven useful
+(`avg_resonance > 0`): `floor = 0.10 · (1 − protection · irreplaceability · value)`.
+A once-a-year fact that was decisive each time and has no substitute is kept;
+a redundant fact decays normally (the knowledge survives in its neighbours);
+an unproven unique fact also decays (uniqueness alone isn't criticality — almost
+everything is unique). Both factors are frequency-orthogonal — this is the
+cost-of-loss signal the frequency terms can't see. `BIRCH_SALIENCE_PROTECTION=0`
+disables it; `stats.salience_retained` counts what it kept.
+
 ### Hawking emission
 
 Facts in the black hole are not permanently lost. A query with cosine

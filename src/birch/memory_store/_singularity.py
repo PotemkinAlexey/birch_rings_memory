@@ -23,8 +23,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from ..storage import StorageBackend
     from ..vector_index import VectorIndex
 
-# Module-level alias for the absorption gate — read at import time.
+# Module-level aliases — read at import time.
 _ABSORPTION_THRESHOLD = Thresholds.ABSORPTION
+_SALIENCE_NEIGHBOR = Thresholds.SALIENCE_NEIGHBOR
+_SALIENCE_PROTECTION = Thresholds.SALIENCE_PROTECTION
 
 
 class SingularityMixin:
@@ -51,6 +53,7 @@ class SingularityMixin:
     _total_collapse_attempts: int
     _mutation_version: int
     _data_version: int
+    _salience_retained_ids: "set[str]"
     _forecast_cache: "Optional[tuple[tuple[int, int, int, int], dict]]"
     COLLAPSE_FACT_MASS_TRIGGER: int
     COLLAPSE_DELTA_TRIGGER: int
@@ -63,6 +66,48 @@ class SingularityMixin:
         _bump_mutation_locked: Callable[[], None]
         _data_version_now: Callable[[], int]
 
+    def _irreplaceability(self, fact: FactPassport) -> float:
+        """Salience: 1 / (1 + same-namespace live neighbours at cosine ≥
+        SALIENCE_NEIGHBOR). 1.0 = unique (no substitute in scope), → 0 as
+        near-duplicates accumulate. Frequency-orthogonal — it reads only the
+        semantic neighbourhood, so a rare fact can still be irreplaceable."""
+        if not fact.vector or _SALIENCE_PROTECTION <= 0.0:
+            return 0.0
+        ns = fact.namespace or ""
+        neighbours = 0
+        for other_fid, sim in self._index.all_similarities(fact.vector).items():
+            if other_fid == fact.fact_id or sim < _SALIENCE_NEIGHBOR:
+                continue
+            other = self._facts.get(other_fid)
+            if other is None or other.is_deprecated:
+                continue
+            if (other.namespace or "") != ns:
+                continue  # uniqueness is within-scope (MemoryBricks)
+            neighbours += 1
+        return 1.0 / (1.0 + neighbours)
+
+    def _absorption_floor(self, fact: FactPassport) -> float:
+        """Disuse-absorption floor, lowered for facts that are *both* unique and
+        proven useful — "rare-but-critical".
+
+            salience = irreplaceability · clamp(avg_resonance, 0, 1)
+            floor    = ABSORPTION · (1 − SALIENCE_PROTECTION · salience)
+
+        Uniqueness alone is NOT enough: in a real store almost every fact is
+        unique, so protecting on uniqueness alone would halt absorption entirely
+        and hoard junk. Coupling to proven value (avg_resonance) targets the
+        fact that has *demonstrated* it matters and that nothing else covers —
+        and both factors are frequency-orthogonal (avg_resonance is a mean,
+        frozen on disuse), so a once-a-year fact still qualifies. An unproven
+        unique fact decays normally."""
+        if _SALIENCE_PROTECTION <= 0.0 or fact.resonance_count <= 0:
+            return _ABSORPTION_THRESHOLD
+        value = min(1.0, fact.avg_resonance)
+        if value <= 0.0:
+            return _ABSORPTION_THRESHOLD  # never proven useful → no protection
+        salience = self._irreplaceability(fact) * value
+        return _ABSORPTION_THRESHOLD * (1.0 - _SALIENCE_PROTECTION * salience)
+
     def _absorb_dead(self) -> list[str]:
         """Send facts and live MetaFacts below the threshold back into the hole.
 
@@ -74,10 +119,16 @@ class SingularityMixin:
         """
         absorbed = []
         for fid, fact in list(self._facts.items()):
-            falls_to_hole = (
-                fact.is_deprecated or fact.is_expired
-                or fact.gravity_score < _ABSORPTION_THRESHOLD
-            )
+            if fact.is_deprecated or fact.is_expired:
+                falls_to_hole = True  # lifecycle exit — salience does not apply
+            elif fact.gravity_score >= _ABSORPTION_THRESHOLD:
+                falls_to_hole = False  # safe; skip the salience computation
+            else:
+                # Below the flat floor — keep it only if it's irreplaceable
+                # enough that its salience-adjusted floor is below its gravity.
+                falls_to_hole = fact.gravity_score < self._absorption_floor(fact)
+                if not falls_to_hole:
+                    self._salience_retained_ids.add(fid)
             if not falls_to_hole:
                 continue
             # BlackHole.absorb is atomic and rolls back the fact's

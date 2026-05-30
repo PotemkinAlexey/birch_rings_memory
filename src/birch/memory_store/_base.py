@@ -175,6 +175,9 @@ class MemoryStore(
         # Bumped by every method that mutates _facts / _meta_facts /
         # _hole — see _bump_mutation calls below.
         self._mutation_version: int = 0
+        # Process-life set of fact_ids that salience (irreplaceability) kept
+        # from disuse-absorption at least once. Surfaced as a count in stats.
+        self._salience_retained_ids: set[str] = set()
 
     # ── Cross-process cache coherence ────────────────────────────────────────
 

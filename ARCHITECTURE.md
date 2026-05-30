@@ -517,9 +517,30 @@ A body crosses the event horizon when **one** of these is true:
 
 | Trigger | Set by | Intent |
 |---|---|---|
-| `gravity_score < 0.10` | natural decay (the `tick()` formula) | the body proved itself unhelpful |
+| `gravity_score < floor(fact)` | natural decay (the `tick()` formula) | the body proved itself unhelpful |
 | `is_deprecated` (`deprecated_by` is set) | `supersede_fact(old, new)` | newer fact replaces this one |
 | `is_expired` (`ttl <= now()`) | `retire_fact(fact_id)` | topic is over, no replacement |
+
+The decay floor is normally `0.10`, but **salience (irreplaceability)** lowers
+it for a fact that is *both* unique in its namespace and proven useful:
+
+```
+irreplaceability = 1 / (1 + same-namespace live neighbours at cosine ≥ SALIENCE_NEIGHBOR)
+salience         = irreplaceability · clamp(avg_resonance, 0, 1)
+floor(fact)      = ABSORPTION · (1 − SALIENCE_PROTECTION · salience)
+```
+
+Gravity is frequency-coupled (access, recency, utility), so a rare-but-critical
+fact — used once a year, decisive each time, no substitute — would otherwise
+decay below `0.10` and be lost before its next use. Salience is the
+frequency-orthogonal cost-of-loss counter-signal: both factors are means /
+neighbourhood properties, frozen on disuse. Uniqueness alone is deliberately
+NOT enough (almost every fact is unique → absorption would halt and junk would
+accumulate); coupling to proven value targets the genuinely critical. The
+`is_deprecated` / `is_expired` lifecycle exits ignore salience — a superseded
+fact is replaced regardless. `SALIENCE_PROTECTION=0` reverts to the flat floor.
+This is the retention half of salience; ranking-boost (salience as a gravity
+term, not just an absorption floor) is a possible follow-up.
 
 `MemoryStore.delete_fact` is **not** an intake — it removes the row
 from storage entirely, bypassing the singularity, losing the body to

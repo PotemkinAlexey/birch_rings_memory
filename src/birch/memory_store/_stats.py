@@ -25,6 +25,7 @@ class StatsMixin:
     _engine: "GravityEngine"
     _echo: "EchoStore"
     _sessions: "dict[str, SessionContext]"
+    _salience_retained_ids: "set[str]"
     _collapse_counter: int
     _total_collapses: int
     _total_collapse_attempts: int
@@ -74,6 +75,8 @@ class StatsMixin:
                 "total_echoes_cancelled": self._echo.total_echoes_cancelled,
                 # impulses the contrastive rule shrank for contradicting history
                 "contrastive_attenuations": self._engine.contrastive_attenuations,
+                # distinct facts salience (irreplaceability) kept from absorption
+                "salience_retained": len(self._salience_retained_ids),
                 # Diagnostics: which thresholds the process actually
                 # picked up. Operator can confirm BIRCH_* env vars
                 # took effect without reading the process environment.
