@@ -156,6 +156,62 @@ class SessionsMixin:
                 (1.0 - alpha) * body.recent_utility + alpha * target
             )
 
+    def _apply_echo_gravity_locked(self, result) -> list[str]:
+        """Caller must hold self._lock AND be inside a write transaction.
+
+        Propagate an echo's retroactive penalty into gravity: drop the
+        resonance of every body the matched past session touched, mirror the
+        EWMA recent_utility, and persist the affected bodies plus the matched
+        echo-session row. Returns the list of penalised body ids.
+
+        Shared by the immediate path (``check_echo`` / one-shot
+        ``record_session``) and the deferred path (``session_close`` after the
+        current session's outcome confirms the revisit was a return-to-failure)
+        so both routes mutate and persist identically. A no-op (returns ``[]``)
+        when the result carries no applicable penalty.
+        """
+        if not (result.label == "echo" and result.penalty != 0.0
+                and result.fact_weights):
+            return []
+        # engine.apply_session_resonance is polymorphic over FactPassport and
+        # MetaFact — both are registered in the engine.
+        self._engine.apply_session_resonance(result.fact_weights, result.penalty)
+        # An echo penalty is retroactive realised-negative-utility; mirror it
+        # into the EWMA so the gravity formula does not see contradictory
+        # signals (resonance dropped, utility unchanged). Same helper
+        # session_close uses for the forward signal.
+        self._apply_recent_utility_locked(result.fact_weights, result.penalty)
+        penalized_body_ids = list(result.fact_weights.keys())
+        if self._storage:
+            affected_facts = [
+                self._facts[bid] for bid in penalized_body_ids
+                if bid in self._facts
+            ]
+            affected_metas = [
+                self._meta_facts[bid] for bid in penalized_body_ids
+                if bid in self._meta_facts
+            ]
+            if affected_facts:
+                self._storage.save_facts(affected_facts)
+            if affected_metas and hasattr(self._storage, "save_meta_facts"):
+                self._storage.save_meta_facts(affected_metas)
+            past = (
+                self._echo.get(result.matched_session_id)
+                if result.matched_session_id
+                else None
+            )
+            if past:
+                self._storage.save_echo_session(
+                    past.session_id,
+                    past.bundle.centroids,
+                    past.r_score,
+                    time.time(),
+                    fact_weights=past.fact_weights,
+                    echo_penalty=past.echo_penalty,
+                )
+        self._bump_mutation_locked()
+        return penalized_body_ids
+
     def _persist_session_locked(self, ctx: Optional[SessionContext]) -> None:
         """Caller must hold self._lock AND be inside a write transaction.
 
@@ -415,6 +471,10 @@ class SessionsMixin:
             messages_snapshot = list(ctx.messages)
             vectors_snapshot = list(ctx.vectors)
             facts_snapshot = dict(ctx.facts)
+            # Deferred-echo marker peeked at session_open (in-memory on ctx,
+            # not reloaded from disk). Snapshot it here under the same lock as
+            # the rest of the session state; resolved after R is known below.
+            pending_echo = ctx.pending_echo
             # Trajectory invariant check BEFORE marking closing:
             # messages_snapshot is non-empty here (the empty case
             # returned above), so vectors_snapshot[0] / [-1] will
@@ -531,9 +591,22 @@ class SessionsMixin:
                                     now=now_ts,
                                 ))
 
+                        # Confidence-damped resonance. The gravity step moves by
+                        # effective_r = R · confidence, not raw R: when the three
+                        # signals disagree (low confidence) the session barely
+                        # nudges gravity, so a noisy/misclassified R can't compound
+                        # through the feedback loop. r_override / sentiment paths
+                        # carry confidence 1.0 (explicit caller signal = trusted),
+                        # so they are unaffected. The summary still reports the raw
+                        # r / label for transparency; only the gravity-moving
+                        # operations below — resonance impulse, EWMA, echo prior,
+                        # and the weight-training target — use effective_r.
+                        confidence = getattr(result, "confidence", 1.0)
+                        effective_r = result.r * confidence
+
                         # Propagate R to facts used in this session, weighted by how
                         # relevant each fact was to the session's queries.
-                        self._engine.apply_session_resonance(facts_snapshot, result.r)
+                        self._engine.apply_session_resonance(facts_snapshot, effective_r)
 
                         # Touch every body the session actually consulted (so
                         # access_count / last_accessed reflect the read), then
@@ -545,12 +618,44 @@ class SessionsMixin:
                                     or self._meta_facts.get(fid))
                             if body is not None:
                                 body.touch()
-                        self._apply_recent_utility_locked(facts_snapshot, result.r)
+                        self._apply_recent_utility_locked(facts_snapshot, effective_r)
+
+                        # ── Deferred echo: the open→close decision ───────────
+                        # A pending echo was peeked at session_open. Now that
+                        # this session's own outcome is known, decide:
+                        #   - this session ended RESONANT  → the revisit was
+                        #     productive (the thing got used / a fix stuck), so
+                        #     CANCEL — penalising the past session would be the
+                        #     exact false-positive the old apply-on-open path
+                        #     produced. Record the save in a counter.
+                        #   - this session ended neutral/toxic → the user
+                        #     returned and we still didn't resolve it: a real
+                        #     false closure. APPLY the retroactive penalty to
+                        #     the matched past session's facts (same gravity/
+                        #     EWMA/persist path the immediate check_echo uses).
+                        # Runs before tick() so the migration sees the penalty.
+                        echo_outcome = "none"
+                        if pending_echo:
+                            matched_id = pending_echo.get("matched_session_id")
+                            if result.label == "resonant":
+                                self._echo.total_echoes_cancelled += 1
+                                echo_outcome = "cancelled"
+                            elif matched_id:
+                                echo_result = self._echo.apply_echo(matched_id)
+                                applied_ids = self._apply_echo_gravity_locked(
+                                    echo_result)
+                                echo_outcome = (
+                                    "applied" if applied_ids else "noop"
+                                )
 
                         self._echo.record(
                             sid,
                             vectors_snapshot,
-                            result.r,
+                            # Store the confidence-damped value as the echo prior:
+                            # a low-confidence "resonant" session should not later
+                            # earn a strong echo-suppression as if it were a
+                            # confident win.
+                            effective_r,
                             fact_weights=facts_snapshot,
                         )
                         # Opportunistic TTL sweep on session close. Drops stale resolved
@@ -591,7 +696,7 @@ class SessionsMixin:
                             mean_g = sum(f[2] for f in training_features) / n
                             mean_u = sum(f[3] for f in training_features) / n
                             mean_s = sum(f[4] for f in training_features) / n
-                            target = max(0.0, min(1.0, (result.r + 1.0) / 2.0))
+                            target = max(0.0, min(1.0, (effective_r + 1.0) / 2.0))
                             # Multi-process safety: another process may have stepped
                             # the weights between our boot and this commit. Reload
                             # the authoritative row UNDER the write txn so our SGD
@@ -627,6 +732,21 @@ class SessionsMixin:
                             # text scan (the original contract) vs an explicit
                             # sentiment label vs a direct numeric override.
                             "scoring_source": scoring_source,
+                            # Deferred-echo resolution for this close:
+                            #   "none"      — no pending echo was peeked at open
+                            #   "applied"   — revisit confirmed a false closure;
+                            #                 past session penalised
+                            #   "cancelled" — revisit was productive (resonant);
+                            #                 penalty withheld
+                            #   "noop"      — pending echo, but the match was
+                            #                 gone or already penalised
+                            "echo_outcome": echo_outcome,
+                            # Signal agreement in [0, 1] and the confidence-
+                            # damped value (R · confidence) that actually moved
+                            # gravity. raw r/label above are unchanged for
+                            # transparency; these expose the damping.
+                            "confidence": round(confidence, 3),
+                            "effective_r": round(effective_r, 3),
                         }
                         self._pop_session_locked(sid)
 

@@ -15,6 +15,14 @@ class ResonanceResult:
     repetition_score: float     # -1.0 … 0.0
     r: float                    # final resonance index -1.0 … +1.0
     label: str                  # "resonant" | "neutral" | "toxic"
+    # Agreement among the three signals, in [0, 1]. 1.0 = they all pull the
+    # same way (trust R fully); near 0 = they cancel (e.g. behavioral reads
+    # toxic on grumpy tech vocabulary while semantic reads productive). The
+    # gravity step is scaled by this so conflicted sessions barely move
+    # gravity and a noisy signal can't compound through the feedback loop.
+    # Defaults to 1.0 so explicit caller signals (r_override / sentiment),
+    # which construct ResonanceResult directly, are treated as fully trusted.
+    confidence: float = 1.0
 
 
 # Weights
@@ -57,8 +65,23 @@ def compute_resonance(
     repetition_result: RepetitionScore = score_repetition(all_vectors or [])
     repetition = repetition_result.score
 
-    r = _W_BEHAVIORAL * behavioral + _W_SEMANTIC * semantic + _W_REPETITION * repetition
-    r = max(-1.0, min(1.0, r))
+    contributions = [
+        _W_BEHAVIORAL * behavioral,
+        _W_SEMANTIC * semantic,
+        _W_REPETITION * repetition,
+    ]
+    r_raw = sum(contributions)
+    r = max(-1.0, min(1.0, r_raw))
+
+    # Confidence = signal agreement. |Σ contributions| / Σ|contributions| is 1.0
+    # when every signal pulls the same direction and falls toward 0 as they
+    # cancel. This is exactly the "declarative grumpy tech summary" guard: a
+    # behavioral score of -0.8 (matched "error"/"broken" in a happy summary)
+    # against a +0.6 semantic score yields a low agreement ratio, so the
+    # session moves gravity only weakly instead of confidently mislabelling.
+    abs_total = sum(abs(c) for c in contributions)
+    confidence = abs(r_raw) / abs_total if abs_total > 1e-9 else 1.0
+    confidence = max(0.0, min(1.0, confidence))
 
     if r > 0.35:
         label = "resonant"
@@ -73,4 +96,5 @@ def compute_resonance(
         repetition_score=repetition,
         r=round(r, 3),
         label=label,
+        confidence=round(confidence, 3),
     )

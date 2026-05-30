@@ -70,6 +70,11 @@ class StatsMixin:
                 "total_echoes_detected": self._echo.total_echoes_detected,
                 "total_echoes_applied": self._echo.total_echoes_applied,
                 "total_echoes_ignored": self._echo.total_echoes_ignored,
+                # Deferred-echo saves: candidates peeked at open that close
+                # cancelled because the revisit ended resonant. A high
+                # cancelled:applied ratio is evidence the old apply-on-open
+                # heuristic was firing on continued use, not false closure.
+                "total_echoes_cancelled": self._echo.total_echoes_cancelled,
                 # Diagnostics: which thresholds the process actually
                 # picked up. Operator can confirm BIRCH_* env vars
                 # took effect without reading the process environment.

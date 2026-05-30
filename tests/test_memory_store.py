@@ -57,6 +57,82 @@ def test_echo_detected_after_toxic_session():
     assert echo["similarity"] > 0.60
 
 
+# ── Deferred, outcome-gated echo (open → close decision) ─────────────────────
+# These run under the mock embedder (overlapping-word topics clear the 0.68
+# echo threshold, same property test_echo_detected_after_toxic_session relies
+# on). They cover the #1 behaviour: peek a candidate at open, decide at close.
+
+def _close_past_with_fact(mem):
+    """Open a 'past' session that leans on one fact and closes non-resonant,
+    so it becomes an echo candidate whose fact can be penalised later."""
+    mem.session_start("past")
+    f = mem.add_fact("deploy pipeline", "fails on", "migrations")  # attributed
+    mem.session_message("the deploy pipeline keeps failing on migrations")
+    mem.session_message("still failing, same error")
+    mem.session_close("past")
+    return f
+
+
+def test_deferred_echo_pending_marker_set_at_open_not_applied():
+    """peek_echo arms a pending marker but applies nothing at open."""
+    mem = MemoryStore()
+    _close_past_with_fact(mem)
+    applied_before = mem._echo.total_echoes_applied
+
+    mem.session_start("cur")
+    resp = mem.peek_echo(
+        "the deploy pipeline keeps failing on migrations", session_id="cur")
+    assert resp["pending"] is True, resp
+    assert resp["echo"] is False, "open must not apply a penalty"
+    assert resp["penalized_fact_ids"] == []
+    # Nothing applied to gravity yet — the marker only lives on the context.
+    assert mem._echo.total_echoes_applied == applied_before
+    assert mem._sessions["cur"].pending_echo is not None
+
+
+def test_deferred_echo_cancelled_when_revisit_resonates():
+    """A productive revisit (session ends resonant) cancels the pending echo —
+    the exact false positive the old apply-on-open path produced."""
+    mem = MemoryStore()
+    f = _close_past_with_fact(mem)
+    applied_before = mem._echo.total_echoes_applied
+    cancelled_before = mem._echo.total_echoes_cancelled
+    rsum_before = f.resonance_sum
+
+    mem.session_start("cur")
+    mem.peek_echo(
+        "the deploy pipeline keeps failing on migrations", session_id="cur")
+    mem.session_message("perfect, that fixed it, thanks!", session_id="cur")
+    summary = mem.session_close("cur")
+
+    assert summary["label"] == "resonant"
+    assert summary["echo_outcome"] == "cancelled"
+    assert mem._echo.total_echoes_applied == applied_before, "no penalty on cancel"
+    assert mem._echo.total_echoes_cancelled == cancelled_before + 1
+    assert f.resonance_sum == rsum_before, "past fact must be untouched on cancel"
+
+
+def test_deferred_echo_applied_when_revisit_also_fails():
+    """An unproductive revisit (session ends non-resonant) confirms the false
+    closure and applies the retroactive penalty to the past session's facts."""
+    mem = MemoryStore()
+    f = _close_past_with_fact(mem)
+    applied_before = mem._echo.total_echoes_applied
+    rsum_before = f.resonance_sum
+
+    mem.session_start("cur")
+    resp = mem.peek_echo(
+        "the deploy pipeline keeps failing on migrations", session_id="cur")
+    assert resp["pending"] is True
+    mem.session_message("still not working, same error again", session_id="cur")
+    summary = mem.session_close("cur")
+
+    assert summary["label"] in ("toxic", "neutral")
+    assert summary["echo_outcome"] == "applied"
+    assert mem._echo.total_echoes_applied == applied_before + 1
+    assert f.resonance_sum < rsum_before, "echo penalty must pull resonance down"
+
+
 def test_hawking_emission():
     mem, _, _, _ = _build_store()
     f_dead = mem.add_fact("expired token", "expired at", "2024-01-01")

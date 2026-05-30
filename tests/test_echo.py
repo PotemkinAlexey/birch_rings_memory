@@ -2,10 +2,49 @@
 import pytest
 
 from birch.resonance.detector import compute_resonance
-from birch.resonance.echo import EchoStore
+from birch.resonance.echo import EchoStore, echo_penalty_for
 from birch.resonance.embeddings import embed, embed_batch
 from tests.conftest import needs_real_embeddings
 from tests.fixtures.echo_sessions import ECHO_PAIRS
+
+# ── Penalty magnitude (prior_R gate) — pure function, no embeddings ──────────
+
+def test_echo_penalty_suppressed_for_strongly_resonant_prior():
+    """A revisit to a strongly-resonant past topic is ambiguous (continued
+    use vs. false closure) — penalty must be near zero, never the flat -0.8."""
+    p = echo_penalty_for(0.9)
+    assert -0.1 < p <= 0.0, f"strong-resonant prior should barely penalise, got {p}"
+
+
+def test_echo_penalty_full_for_toxic_prior():
+    """A revisit to an already-failing topic is unambiguous — full penalty."""
+    assert echo_penalty_for(-0.5) == -0.6
+    assert echo_penalty_for(0.0) == -0.6
+
+
+def test_echo_penalty_monotonic_in_prior():
+    """Higher prior_r ⇒ weaker (closer-to-zero) penalty. The gate is a
+    monotone confidence ramp, not a step function."""
+    grid = [-0.5, 0.0, 0.4, 0.7, 0.9, 1.0]
+    penalties = [echo_penalty_for(r) for r in grid]
+    # Penalties are negative; "weaker" means larger (closer to 0).
+    assert all(a <= b for a, b in zip(penalties, penalties[1:])), penalties
+    assert penalties[-1] == 0.0  # prior_r == 1.0 ⇒ zero confidence in failure
+
+
+def test_echo_penalty_no_forced_toxic_floor():
+    """Applying a suppressed penalty to a resonant prior must NOT force the
+    score into the toxic zone (regression on the old min(-0.2, …) floor)."""
+    store = EchoStore()
+    dim = 8
+    vec = [1.0] + [0.0] * (dim - 1)
+    store.record("past", [vec, vec], r_score=0.9)
+    res = store.detect_echo(vec)  # identical topic ⇒ guaranteed echo
+    assert res.label == "echo"
+    past = store.get("past")
+    assert past.r_score > 0.35, (
+        f"resonant prior must survive an ambiguous echo, got {past.r_score}"
+    )
 
 
 def _run_pair(pair):

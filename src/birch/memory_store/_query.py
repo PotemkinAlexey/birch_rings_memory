@@ -54,6 +54,7 @@ class QueryMixin:
         _namespace_matches_prefix: Callable[[str, str], bool]
         _attribute_to: Callable[["SessionContext", str, float], None]
         _apply_recent_utility_locked: Callable[[dict[str, float], float], None]
+        _apply_echo_gravity_locked: Callable[[Any], list[str]]
         _bump_mutation_locked: Callable[[], None]
 
     def find_similar(
@@ -719,54 +720,10 @@ class QueryMixin:
                     self._sync()
                     result = self._echo.detect_echo(
                         vec, exclude_session_id=session_id)
-                    penalized_body_ids: list[str] = []
-                    if result.label == "echo" and result.penalty != 0.0 and result.fact_weights:
-                        # engine.apply_session_resonance is polymorphic over
-                        # FactPassport and MetaFact — both are registered in
-                        # the engine. Previously we only persisted the
-                        # FactPassport changes, losing MetaFact penalty
-                        # updates on restart.
-                        self._engine.apply_session_resonance(
-                            result.fact_weights, result.penalty)
-                        # Mirror the EWMA update too: an echo penalty is
-                        # retroactive realised-negative-utility, so leaving
-                        # recent_utility unchanged would make the gravity
-                        # formula see contradictory signals (resonance got
-                        # worse, utility stayed where it was). Same helper
-                        # session_close uses.
-                        self._apply_recent_utility_locked(
-                            result.fact_weights, result.penalty)
-                        penalized_body_ids = list(result.fact_weights.keys())
-
-                        if self._storage:
-                            affected_facts = [
-                                self._facts[bid] for bid in penalized_body_ids
-                                if bid in self._facts
-                            ]
-                            affected_metas = [
-                                self._meta_facts[bid] for bid in penalized_body_ids
-                                if bid in self._meta_facts
-                            ]
-                            if affected_facts:
-                                self._storage.save_facts(affected_facts)
-                            if (affected_metas
-                                    and hasattr(self._storage, "save_meta_facts")):
-                                self._storage.save_meta_facts(affected_metas)
-                            past = (
-                                self._echo.get(result.matched_session_id)
-                                if result.matched_session_id
-                                else None
-                            )
-                            if past:
-                                self._storage.save_echo_session(
-                                    past.session_id,
-                                    past.bundle.centroids,
-                                    past.r_score,
-                                    time.time(),
-                                    fact_weights=past.fact_weights,
-                                    echo_penalty=past.echo_penalty,
-                                )
-                        self._bump_mutation_locked()
+                    # Gravity/EWMA propagation + persistence is shared with the
+                    # deferred session_close path via this helper, so both
+                    # routes mutate identically (incl. MetaFact penalties).
+                    penalized_body_ids = self._apply_echo_gravity_locked(result)
 
                     return {
                         "echo": result.label == "echo",
@@ -785,5 +742,62 @@ class QueryMixin:
                 # pops / engine state). Re-anchor every cache to
                 # disk truth before propagating — symmetric with
                 # add_fact / add_facts / query / collapse_singularity.
+                self._reload()
+                raise
+
+    def peek_echo(self, first_message: str, session_id: str) -> dict:
+        """
+        Read-only echo detection for the streaming (open → close) path.
+
+        Detects whether ``first_message`` echoes a past session's topic and,
+        if so, records a *pending* echo marker on the named session's context
+        — WITHOUT applying any penalty or touching gravity. The decision is
+        deferred to ``session_close``, which:
+
+          - applies the retroactive penalty only if THIS session also ends
+            non-resonant (a genuine return-to-failure), or
+          - cancels it if this session ends resonant (a productive revisit /
+            continued use of what the past session built).
+
+        This replaces the old apply-on-open behaviour, which guessed
+        "returned ⇒ unresolved" and penalised immediately — firing on
+        continued use as often as on real false closure. ``session_id`` is
+        excluded from the match pool so a just-opened session can't echo
+        itself.
+
+        Returns a dict with ``pending`` (whether a marker was stored) rather
+        than ``echo`` (nothing is applied here). The marker is in-memory only;
+        a cross-process reload between open and close simply drops it.
+        """
+        # Embed outside the lock — slow HTTP call, must not serialise agents.
+        vec = embed(first_message)
+        with self._lock:
+            try:
+                with self._txn():
+                    self._sync()
+                    result = self._echo.peek_echo(
+                        vec, exclude_session_id=session_id)
+                    ctx = self._sessions.get(session_id)
+                    pending = (
+                        result.label == "echo"
+                        and ctx is not None
+                        and result.matched_session_id is not None
+                    )
+                    if pending and ctx is not None:
+                        ctx.pending_echo = {
+                            "matched_session_id": result.matched_session_id,
+                            "similarity": result.similarity,
+                        }
+                    return {
+                        # Nothing is applied at open — only a marker is set.
+                        "echo": False,
+                        "pending": pending,
+                        "matched_session": result.matched_session_id,
+                        "similarity": result.similarity,
+                        # The would-be penalty, for transparency; not applied.
+                        "would_be_penalty": result.penalty,
+                        "penalized_fact_ids": [],
+                    }
+            except Exception:
                 self._reload()
                 raise

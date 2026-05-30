@@ -1494,11 +1494,16 @@ def session_open(
     session before the first ``query_memory`` so retrieved facts get
     attributed to this session's outcome.
 
-    Pass ``first_message`` (the user's opening text) to trigger echo
-    detection on the same call: if the topic matches a past unresolved
-    problem at cosine ≥ 0.68, the past session's R is pulled into toxic
-    territory and the penalty propagates to the facts that misled it. The
-    echo result is returned in the response under ``echo``.
+    Pass ``first_message`` (the user's opening text) to arm *deferred* echo
+    detection: if the topic matches a past session at cosine ≥ 0.68, a pending
+    echo marker is recorded on this session — but NO penalty is applied yet.
+    The decision waits for ``session_close``: if this conversation also ends
+    non-resonant (you returned and still didn't resolve it) the past session's
+    facts are penalised then; if it ends resonant (the revisit was productive)
+    the echo is cancelled. This replaces the old apply-on-open behaviour, which
+    couldn't tell "still broken" from "still using it" and penalised both. The
+    response reports ``echo.pending`` (a marker was set) and ``echo.matched_session``;
+    the realised outcome shows up in ``session_close``'s ``echo_outcome``.
 
     ``record_first_message`` (default True) also pushes the first message
     into the session's trajectory so the resonance engine sees it on close
@@ -1565,7 +1570,11 @@ def session_open(
         # agent which state it's in so it can't assume the message
         # already landed in the trajectory.
         try:
-            response["echo"] = _store.check_echo(
+            # Deferred echo: peek and arm a pending marker now; the penalty
+            # decision is taken at session_close against this session's actual
+            # outcome (see peek_echo). The explicit check_echo tool remains the
+            # immediate path for callers that want apply-now semantics.
+            response["echo"] = _store.peek_echo(
                 first_message, session_id=sid,
             )
             if record_first_message:

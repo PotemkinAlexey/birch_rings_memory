@@ -87,3 +87,12 @@ class SessionContext:
     vectors: list[list[float]] = field(default_factory=list)
     # fact_id → relevance weight in [0, 1] for this session.
     facts: dict[str, float] = field(default_factory=dict)
+    # Deferred-echo marker. Set at session_open when the opening message
+    # echoes a past session's topic; resolved at session_close (apply the
+    # retroactive penalty iff THIS session also ended non-resonant, else
+    # cancel). {"matched_session_id": str, "similarity": float} or None.
+    # Intentionally NOT persisted to open_sessions — a mid-session process
+    # restart simply drops the pending marker, so the echo won't fire for
+    # that one revisit. A safe degradation: echo is a best-effort delayed
+    # signal, never a correctness invariant.
+    pending_echo: Optional[dict] = None
