@@ -178,3 +178,22 @@ def test_encode_salience_round_trips(tmp_path):
     mem.pin_fact(f.fact_id)
     mem2 = MemoryStore(db_path=str(tmp_path / "m.db"))
     assert mem2._facts[f.fact_id].encode_salience == 1.0
+
+
+def test_explain_fact_exposes_salience_audit():
+    """explain_fact must surface encode_salience AND the computed absorption
+    floor, so a pin is auditable on a live store — not just creatable. This is
+    the observability the live cold-start check needs."""
+    mem = MemoryStore()
+    f = mem.add_fact("failover", "requires", "manual step X")
+    mem.pin_fact(f.fact_id)
+    s = mem.explain_fact(f.fact_id)["salience"]
+    assert s["encode_salience"] == 1.0
+    # A pin lowers the floor below the flat 0.10.
+    assert s["effective_absorption_floor"] < s["flat_absorption_floor"]
+    # Fresh fact rides high → salience isn't the reason it's alive yet.
+    assert s["protecting_now"] is False
+    # Once it decays below the flat floor, the audit shows salience is now the
+    # ONLY thing keeping it — the proof the pin works, visible without waiting.
+    mem._facts[f.fact_id].gravity_score = 0.05
+    assert mem.explain_fact(f.fact_id)["salience"]["protecting_now"] is True

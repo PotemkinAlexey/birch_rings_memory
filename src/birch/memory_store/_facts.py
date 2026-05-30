@@ -90,6 +90,8 @@ class FactsMixin:
         _attribute_to: Callable[["SessionContext", str, float], None]
         _persist_session_locked: Callable[["Optional[SessionContext]"], None]
         _absorb_dead: Callable[[], list[str]]
+        _absorption_floor: Callable[["FactPassport"], float]
+        _irreplaceability: Callable[["FactPassport"], float]
 
     @staticmethod
     def _namespace_matches_prefix(namespace: str, prefix: str) -> bool:
@@ -771,6 +773,33 @@ class FactsMixin:
                 response["weight"] = fact.weight
                 response["source_fact_ids"] = list(fact.source_fact_ids)
                 response["source_texts"] = list(fact.source_texts)
+            if kind == "fact":
+                # Salience audit — makes the cost-of-loss machinery observable
+                # on a live store, not just in CI: declared pin, earned
+                # (irreplaceability·value), the resulting absorption floor, and
+                # whether salience is actively saving THIS fact right now. Only
+                # for live FactPassports (a singularity body is already absorbed;
+                # _irreplaceability reads the live index).
+                from ..thresholds import Thresholds
+                flat = Thresholds.ABSORPTION
+                declared = max(0.0, min(1.0, fact.encode_salience))
+                irr = self._irreplaceability(fact)
+                earned = (irr * max(0.0, min(1.0, fact.avg_resonance))
+                          if fact.resonance_count > 0 else 0.0)
+                floor = self._absorption_floor(fact)
+                g = fact.gravity_score
+                response["salience"] = {
+                    "encode_salience": round(declared, 4),     # declared pin
+                    "irreplaceability": round(irr, 4),
+                    "earned": round(earned, 4),                 # bottom-up
+                    "effective": round(max(declared, earned), 4),
+                    "flat_absorption_floor": round(flat, 4),
+                    "effective_absorption_floor": round(floor, 4),
+                    # True when gravity is below the flat floor but above the
+                    # salience-lowered one — i.e. salience is the only reason
+                    # this fact has not been absorbed.
+                    "protecting_now": bool(g < flat and g >= floor),
+                }
             return response
 
     def delete_fact(self, fact_id: str) -> bool:
