@@ -731,13 +731,20 @@ class SQLiteBackend:
                 out.append({
                     "session_id": r["session_id"],
                     "centroids": centroids,
-                    "r_score": r["r_score"],
+                    # Read-side clamp, symmetric with the write path: a
+                    # hand-edited / corrupted row could carry r_score outside
+                    # [-1, 1] or — the one that actually changes behaviour — a
+                    # POSITIVE echo_penalty, which apply_echo would read as
+                    # "already penalised" and turn into a silent no-op. Clamp
+                    # both to their domains so a bad row degrades to neutral,
+                    # never to a logic flip.
+                    "r_score": _finite_float(
+                        r["r_score"], 0.0, lo=-1.0, hi=1.0),
                     "recorded_at": r["recorded_at"],
                     "fact_weights": fact_weights,
-                    "echo_penalty": (
-                        r["echo_penalty"]
-                        if "echo_penalty" in r.keys() else 0.0
-                    ),
+                    "echo_penalty": _finite_float(
+                        r["echo_penalty"] if "echo_penalty" in r.keys() else 0.0,
+                        0.0, lo=-1.0, hi=0.0),
                 })
             except Exception as exc:
                 _logger.warning(

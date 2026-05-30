@@ -466,3 +466,32 @@ def test_echo_penalty_survives_store_restart_and_stays_idempotent(tmp_path):
     # Idempotent: a re-apply on the reloaded (already-penalised) session is a no-op.
     again = mem2._echo.apply_echo("past")
     assert again.penalty == 0.0, "re-apply after restart must not double-penalise"
+
+
+def test_load_echo_session_clamps_corrupted_values(tmp_path):
+    """Read-side defence (storage symmetry): a hand-edited / corrupted row with
+    a POSITIVE echo_penalty must not load as 'already penalised' (which would
+    make apply_echo a silent no-op), and an out-of-range r_score must clamp.
+    A bad row degrades to neutral, never to a logic flip."""
+    import sqlite3
+
+    from birch.storage.sqlite import SQLiteBackend
+
+    db = str(tmp_path / "echo.db")
+    b = SQLiteBackend(db)
+    b.save_echo_session("s", [[1.0, 0.0]], r_score=0.5, recorded_at=1.0,
+                        echo_penalty=-0.3)
+    b.close()
+
+    c = sqlite3.connect(db)
+    c.execute(
+        "UPDATE echo_sessions SET echo_penalty=0.8, r_score=5.0 "
+        "WHERE session_id='s'")
+    c.commit()
+    c.close()
+
+    b2 = SQLiteBackend(db)
+    row = {r["session_id"]: r for r in b2.load_echo_sessions(cleanup=False)}["s"]
+    b2.close()
+    assert row["echo_penalty"] == 0.0, "positive penalty must clamp to 0, not load as penalised"
+    assert row["r_score"] == 1.0, "out-of-range r_score must clamp into [-1, 1]"
