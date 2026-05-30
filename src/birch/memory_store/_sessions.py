@@ -39,8 +39,6 @@ class SessionsMixin:
     _current_session_id: "Optional[str]"
     _closing_sessions: "set[str]"
     _mutation_version: int
-    _ever_pinned_ids: "set[str]"
-    _pins_resonated_ids: "set[str]"
 
     if TYPE_CHECKING:
         _sync: Callable[[], None]
@@ -616,8 +614,9 @@ class SessionsMixin:
                                 body = self._facts.get(fid)
                                 if body is None:
                                     continue
-                                if resonated and fid in self._ever_pinned_ids:
-                                    self._pins_resonated_ids.add(fid)
+                                if (resonated and body.was_pinned
+                                        and not body.pin_resonated):
+                                    body.pin_resonated = True  # durable verdict
                                 if decay > 0.0 and body.encode_salience > 0.0:
                                     body.encode_salience = max(
                                         0.0, body.encode_salience - decay)

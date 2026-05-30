@@ -569,7 +569,11 @@ the bottom-up spirit:
   pins_resonated / pins_evicted`): whether the declared channel is worth its
   cost is empirical, not arguable. A near-zero `pins_resonated / pins_created`
   over real traffic means people pin noise — bury the channel and accept the
-  documented cold-start ceiling.
+  documented cold-start ceiling. `pins_created` / `pins_resonated` / `pins_active`
+  are derived from persisted per-fact flags (`was_pinned` / `pin_resonated` /
+  `encode_salience`), so the verdict accrues across restarts and is
+  multi-process-safe rather than a process-local counter; only `pins_evicted`
+  (an event) is process-local.
 
 Ranking-boost (salience as a gravity term, not just an absorption floor)
 remains a possible follow-up; this is the retention half.

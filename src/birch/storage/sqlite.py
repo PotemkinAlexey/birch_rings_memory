@@ -183,6 +183,9 @@ CREATE TABLE IF NOT EXISTS facts (
     raw_resonance_sum REAL DEFAULT 0.0,
     -- Declared (top-down) encoding salience — "don't forget this".
     encode_salience REAL DEFAULT 0.0,
+    -- Durable pin telemetry (verdict metric survives restart).
+    was_pinned      INTEGER DEFAULT 0,
+    pin_resonated   INTEGER DEFAULT 0,
     recent_utility  REAL DEFAULT 0.5,
     forecast_stability REAL DEFAULT 0.5,
     -- MemoryBricks Step 1: namespace scope (VB path-style). Empty
@@ -276,6 +279,7 @@ class SQLiteBackend:
         self._migrate_namespace()
         self._migrate_raw_resonance()
         self._migrate_encode_salience()
+        self._migrate_pin_telemetry()
         self._conn.commit()
 
     # ── Cross-process coordination ───────────────────────────────────────────
@@ -387,6 +391,18 @@ class SQLiteBackend:
                 "ALTER TABLE facts ADD COLUMN encode_salience REAL DEFAULT 0.0"
             )
 
+    def _migrate_pin_telemetry(self) -> None:
+        """Add was_pinned / pin_resonated (durable pin telemetry) to older DBs.
+        Legacy rows default 0 — no pin history before the feature."""
+        cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(facts)")
+        }
+        for col in ("was_pinned", "pin_resonated"):
+            if col not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE facts ADD COLUMN {col} INTEGER DEFAULT 0"
+                )
+
     def _migrate_forecast_stability(self) -> None:
         """Add forecast_stability / w_stability columns to older DBs."""
         fact_cols = {
@@ -450,8 +466,9 @@ class SQLiteBackend:
         "(fact_id, subject, predicate, object, vector, gravity_score, layer, "
         " created_at, ttl, source_session, deprecated_by, access_count, "
         " last_accessed, resonance_sum, resonance_count, raw_resonance_sum, "
-        " encode_salience, recent_utility, forecast_stability, namespace) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " encode_salience, was_pinned, pin_resonated, recent_utility, "
+        " forecast_stability, namespace) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -482,6 +499,8 @@ class SQLiteBackend:
             _nonnegative_int(fact.resonance_count, 0),
             _finite_float(fact.raw_resonance_sum, 0.0),
             _finite_float(fact.encode_salience, 0.0, lo=0.0, hi=1.0),
+            1 if fact.was_pinned else 0,
+            1 if fact.pin_resonated else 0,
             _finite_float(fact.recent_utility, 0.5, lo=0.0, hi=1.0),
             _finite_float(
                 fact.forecast_stability, 0.5, lo=0.0, hi=1.0,
@@ -568,6 +587,11 @@ class SQLiteBackend:
                         if "encode_salience" in r.keys() else 0.0,
                         0.0, lo=0.0, hi=1.0,
                     ),
+                    was_pinned=bool(
+                        r["was_pinned"] if "was_pinned" in r.keys() else 0),
+                    pin_resonated=bool(
+                        r["pin_resonated"]
+                        if "pin_resonated" in r.keys() else 0),
                     recent_utility=_finite_float(
                         r["recent_utility"]
                         if "recent_utility" in r.keys() else 0.5,

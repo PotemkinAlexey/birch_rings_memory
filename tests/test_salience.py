@@ -167,6 +167,29 @@ def test_pins_resonated_telemetry_counts_the_payoff():
     assert mem.stats["pins_resonated"] == 1
 
 
+def test_pin_telemetry_survives_restart(tmp_path):
+    """The verdict (pins_created / pins_resonated) is derived from persisted
+    per-fact flags, so it accrues across restarts instead of resetting per
+    process — otherwise the 'let a month of traffic decide' plan never works."""
+    db = str(tmp_path / "m.db")
+    mem = MemoryStore(db_path=db)
+    f = mem.add_fact("failover", "requires", "manual step X")
+    mem.pin_fact(f.fact_id)
+    mem.session_start("s")
+    mem.session_message("touching the runbook", session_id="s")
+    mem._session_fact_ids = [f.fact_id]
+    mem.session_close("s", sentiment="resonant")
+    assert mem.stats["pins_created"] == 1
+    assert mem.stats["pins_resonated"] == 1
+    mem.close()
+
+    mem2 = MemoryStore(db_path=db)
+    assert mem2.stats["pins_created"] == 1, "pin history must survive restart"
+    assert mem2.stats["pins_resonated"] == 1, "verdict must survive restart"
+    assert mem2._facts[f.fact_id].was_pinned is True
+    assert mem2._facts[f.fact_id].pin_resonated is True
+
+
 def test_pin_fact_missing_returns_false():
     mem = MemoryStore()
     assert mem.pin_fact("ghost") is False

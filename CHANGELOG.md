@@ -27,6 +27,10 @@ self-derived R cannot compound through the loop.
   pins_resonated / pins_evicted` — a near-zero `pins_resonated/pins_created`
   over real traffic is the signal to bury the channel. New persisted
   `FactPassport.encode_salience` (migrated, legacy rows default 0).
+  `pins_created` / `pins_resonated` / `pins_active` are **derived from
+  persisted per-fact flags** (`was_pinned` / `pin_resonated`, also migrated),
+  so the verdict accrues across restarts and is multi-process-safe rather than
+  resetting per process; only `pins_evicted` (an event) stays process-local.
 - **Salience / irreplaceability retention.** A frequency-orthogonal cost-of-loss
   signal: a fact that is *both* unique in its namespace (no live neighbour at
   cosine ≥ `BIRCH_SALIENCE_NEIGHBOR_THRESHOLD`) *and* has proven useful

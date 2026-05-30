@@ -26,8 +26,6 @@ class StatsMixin:
     _echo: "EchoStore"
     _sessions: "dict[str, SessionContext]"
     _salience_retained_ids: "set[str]"
-    _ever_pinned_ids: "set[str]"
-    _pins_resonated_ids: "set[str]"
     _pins_evicted: int
     _collapse_counter: int
     _total_collapses: int
@@ -51,6 +49,16 @@ class StatsMixin:
             meta_layers = {0: 0, 1: 0, 2: 0}
             for m in self._meta_facts.values():
                 meta_layers[m.layer] = meta_layers.get(m.layer, 0) + 1
+            # Pin telemetry DERIVED from persisted fact state (live + absorbed),
+            # so the verdict survives restart. A pinned fact resists absorption,
+            # so it's almost always live; scanning the singularity too keeps the
+            # count honest for the rare pin that decayed and fell in.
+            pinned_bodies = list(self._facts.values()) + [
+                rec.fact for rec in self._hole._singularity.values()
+            ]
+            pins_created = sum(1 for f in pinned_bodies if f.was_pinned)
+            pins_resonated = sum(
+                1 for f in pinned_bodies if f.was_pinned and f.pin_resonated)
             return {
                 "surface": layers[0],
                 "kinetic": layers[1],
@@ -85,8 +93,8 @@ class StatsMixin:
                 # people pin noise, the channel isn't earning its keep.
                 "pins_active": sum(
                     1 for f in self._facts.values() if f.encode_salience > 0.0),
-                "pins_created": len(self._ever_pinned_ids),
-                "pins_resonated": len(self._pins_resonated_ids),
+                "pins_created": pins_created,
+                "pins_resonated": pins_resonated,
                 "pins_evicted": self._pins_evicted,
                 # Diagnostics: which thresholds the process actually
                 # picked up. Operator can confirm BIRCH_* env vars

@@ -109,6 +109,14 @@ class FactPassport:
     # lose-it (eroded only when the fact surfaces into a non-positive session).
     # 0 = not pinned (the default; the system stays preponderantly inferential).
     encode_salience: float = 0.0
+    # Durable pin telemetry (the channel's verdict metric, survives restart).
+    # was_pinned: this fact was declared salient at least once (monotonic, never
+    # cleared — distinct from encode_salience, which decays). pin_resonated: an
+    # ever-pinned fact later rode a resonant session — declaration predicting
+    # criticality. pins_created / pins_resonated in stats DERIVE from these, so
+    # the verdict accrues across restarts instead of resetting per process.
+    was_pinned: bool = False
+    pin_resonated: bool = False
 
     # EWMA of recent contextual usefulness (closure-weighted resonance).
     # Default 0.5 = Bayesian neutral prior; untouched facts get a soft floor.
@@ -156,6 +164,8 @@ class FactPassport:
         self.encode_salience = _sanitize_float(
             self.encode_salience, 0.0, lo=0.0, hi=1.0,
         )
+        self.was_pinned = bool(self.was_pinned)
+        self.pin_resonated = bool(self.pin_resonated)
         self.recent_utility = _sanitize_float(
             self.recent_utility, 0.5, lo=0.0, hi=1.0,
         )

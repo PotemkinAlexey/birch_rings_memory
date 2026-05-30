@@ -62,7 +62,6 @@ class FactsMixin:
     _current_session_id: "Optional[str]"
     _auto_link: bool
     _mutation_version: int
-    _ever_pinned_ids: "set[str]"
     _pins_evicted: int
     _forecast_cache: "Optional[tuple[tuple[int, int, int, int], dict]]"
     _collapse_counter: int
@@ -349,7 +348,7 @@ class FactsMixin:
                     if fact is None:
                         return False
                     fact.encode_salience = 1.0
-                    self._ever_pinned_ids.add(fact_id)
+                    fact.was_pinned = True  # durable, monotonic pin history
                     self._enforce_pin_budget_locked(fact.namespace or "", fact_id)
                     if self._storage:
                         self._storage.save_fact(fact)

@@ -203,8 +203,9 @@ surfaces into a non-positive session — a pin that keeps proving useless fades;
 truly dormant one is held), a per-namespace **budget** evicts the *highest-gravity*
 pin under contention (the one needing it least — never the matured low-gravity
 cold-start candidate), and **telemetry** (`pins_created / pins_active /
-pins_resonated`) lets a month of real traffic decide whether the channel earns
-its keep: if pinned facts rarely go on to resonate, it's noise and should be cut.
+pins_resonated`, derived from persisted per-fact flags so it survives restarts)
+lets a month of real traffic decide whether the channel earns its keep: if
+pinned facts rarely go on to resonate, it's noise and should be cut.
 
 ### Hawking emission
 
