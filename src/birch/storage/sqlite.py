@@ -178,6 +178,9 @@ CREATE TABLE IF NOT EXISTS facts (
     last_accessed   REAL,
     resonance_sum   REAL DEFAULT 0.0,
     resonance_count INTEGER DEFAULT 0,
+    -- Un-shrunk resonance history (proposal #5 fix): true track record,
+    -- separate from the contrast-shrunk resonance_sum that feeds gravity.
+    raw_resonance_sum REAL DEFAULT 0.0,
     recent_utility  REAL DEFAULT 0.5,
     forecast_stability REAL DEFAULT 0.5,
     -- MemoryBricks Step 1: namespace scope (VB path-style). Empty
@@ -224,6 +227,8 @@ CREATE TABLE IF NOT EXISTS meta_facts (
     last_accessed   REAL,
     resonance_sum   REAL DEFAULT 0.0,
     resonance_count INTEGER DEFAULT 0,
+    -- Un-shrunk resonance history (proposal #5 fix); see facts table.
+    raw_resonance_sum REAL DEFAULT 0.0,
     recent_utility  REAL DEFAULT 0.5,
     forecast_stability REAL DEFAULT 0.5,
     -- MemoryBricks Step 1: symmetric with facts.namespace.
@@ -267,6 +272,7 @@ class SQLiteBackend:
         self._migrate_recent_utility()
         self._migrate_forecast_stability()
         self._migrate_namespace()
+        self._migrate_raw_resonance()
         self._conn.commit()
 
     # ── Cross-process coordination ───────────────────────────────────────────
@@ -347,6 +353,34 @@ class SQLiteBackend:
                 "ADD COLUMN w_utility REAL NOT NULL DEFAULT 0.10"
             )
 
+    def _migrate_raw_resonance(self) -> None:
+        """Add raw_resonance_sum (proposal #5 fix) to older DBs.
+
+        Backfill is the crux: every row that predates this migration accumulated
+        its resonance_sum BEFORE the contrastive rule existed, so no shrinking
+        was ever applied to it — its resonance_sum *is* its raw history.
+        Backfilling raw_resonance_sum := resonance_sum is therefore exact for
+        legacy data, not an approximation. New sessions then diverge the two
+        correctly (raw stays un-shrunk, resonance_sum takes the shrunk impulse).
+        """
+        for table in ("facts", "meta_facts"):
+            cols = {
+                row["name"]
+                for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            if "raw_resonance_sum" not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE {table} "
+                    "ADD COLUMN raw_resonance_sum REAL DEFAULT 0.0"
+                )
+                # Exact backfill for pre-#5 rows (see docstring). Guard on the
+                # source column existing — a very old table may predate
+                # resonance_sum entirely, in which case the default 0.0 stands.
+                if "resonance_sum" in cols:
+                    self._conn.execute(
+                        f"UPDATE {table} SET raw_resonance_sum = resonance_sum"
+                    )
+
     def _migrate_forecast_stability(self) -> None:
         """Add forecast_stability / w_stability columns to older DBs."""
         fact_cols = {
@@ -409,9 +443,9 @@ class SQLiteBackend:
         "INSERT OR REPLACE INTO facts "
         "(fact_id, subject, predicate, object, vector, gravity_score, layer, "
         " created_at, ttl, source_session, deprecated_by, access_count, "
-        " last_accessed, resonance_sum, resonance_count, recent_utility, "
-        " forecast_stability, namespace) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " last_accessed, resonance_sum, resonance_count, raw_resonance_sum, "
+        " recent_utility, forecast_stability, namespace) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -440,6 +474,7 @@ class SQLiteBackend:
             _finite_float(fact.last_accessed, time.time()),
             _finite_float(fact.resonance_sum, 0.0),
             _nonnegative_int(fact.resonance_count, 0),
+            _finite_float(fact.raw_resonance_sum, 0.0),
             _finite_float(fact.recent_utility, 0.5, lo=0.0, hi=1.0),
             _finite_float(
                 fact.forecast_stability, 0.5, lo=0.0, hi=1.0,
@@ -512,6 +547,14 @@ class SQLiteBackend:
                     resonance_sum=_finite_float(r["resonance_sum"], 0.0),
                     resonance_count=_nonnegative_int(
                         r["resonance_count"], 0,
+                    ),
+                    # Tolerant: pre-migration rows lack the column — fall back
+                    # to resonance_sum, which for pre-#5 data IS the raw history.
+                    raw_resonance_sum=_finite_float(
+                        r["raw_resonance_sum"]
+                        if "raw_resonance_sum" in r.keys()
+                        else r["resonance_sum"],
+                        0.0,
                     ),
                     recent_utility=_finite_float(
                         r["recent_utility"]
@@ -850,9 +893,9 @@ class SQLiteBackend:
         "INSERT OR REPLACE INTO meta_facts "
         "(meta_id, vector, weight, source_texts, source_fact_ids, summary, "
         " gravity_score, created_at, layer, access_count, last_accessed, "
-        " resonance_sum, resonance_count, recent_utility, "
+        " resonance_sum, resonance_count, raw_resonance_sum, recent_utility, "
         " forecast_stability, namespace) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -875,6 +918,9 @@ class SQLiteBackend:
             _finite_float(d["last_accessed"], time.time()),
             _finite_float(d["resonance_sum"], 0.0),
             _nonnegative_int(d["resonance_count"], 0),
+            _finite_float(
+                d.get("raw_resonance_sum", d["resonance_sum"]), 0.0,
+            ),
             _finite_float(
                 d["recent_utility"], 0.5, lo=0.0, hi=1.0,
             ),

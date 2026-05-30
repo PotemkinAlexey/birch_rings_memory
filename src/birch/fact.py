@@ -97,8 +97,15 @@ class FactPassport:
 
     access_count: int = 0
     last_accessed: float = field(default_factory=time.time)
-    resonance_sum: float = 0.0      # cumulative R from sessions that used this
+    resonance_sum: float = 0.0      # cumulative (contrast-shrunk) R → gravity
     resonance_count: int = 0        # how many sessions contributed
+    # Un-shrunk cumulative R, the fact's TRUE track record. Kept separate from
+    # resonance_sum so the contrastive rule's "how much to trust a contradicting
+    # session" decision reads an order-independent history rather than one the
+    # rule itself already shaped — otherwise trust is computed from impulses
+    # past trust decisions shrank (self-reference / rich-get-richer). Only
+    # resonance_sum (the gravity input) is shrunk; this stays raw.
+    raw_resonance_sum: float = 0.0
 
     # EWMA of recent contextual usefulness (closure-weighted resonance).
     # Default 0.5 = Bayesian neutral prior; untouched facts get a soft floor.
@@ -142,6 +149,7 @@ class FactPassport:
         self.resonance_count = _sanitize_nonneg_int(
             self.resonance_count, 0,
         )
+        self.raw_resonance_sum = _sanitize_float(self.raw_resonance_sum, 0.0)
         self.recent_utility = _sanitize_float(
             self.recent_utility, 0.5, lo=0.0, hi=1.0,
         )
@@ -160,7 +168,7 @@ class FactPassport:
 
     @property
     def avg_resonance(self) -> float:
-        """Mean session resonance touched by this fact.
+        """Mean (contrast-shrunk) session resonance — the value gravity uses.
 
         Finite-safe: ``apply_resonance`` self-defends, but library
         users can mutate ``resonance_sum`` directly between load and
@@ -176,31 +184,66 @@ class FactPassport:
             return 0.0
         return avg
 
+    @property
+    def raw_avg_resonance(self) -> float:
+        """Mean UN-shrunk session resonance — the fact's true track record.
+
+        This is what the contrastive rule reads to decide how much to trust a
+        contradicting session. It is order-independent (a plain mean of the raw
+        impulses) and never shaped by the rule's own shrink decisions, which is
+        what stops the trust signal from feeding on itself.
+        """
+        if self.resonance_count <= 0:
+            return 0.0
+        avg = self.raw_resonance_sum / self.resonance_count
+        if not math.isfinite(avg):
+            return 0.0
+        return avg
+
     def touch(self) -> None:
         self.access_count += 1
         self.last_accessed = time.time()
 
-    def apply_resonance(self, r: float) -> None:
-        """Record that a session with resonance R used this fact.
-
-        Self-defending: a NaN / Infinity / non-numeric ``r`` would
-        contaminate ``resonance_sum`` forever (every downstream
-        ``avg_resonance``, ``compute_gravity``, sort/filter then
-        returns NaN). External call sites (GravityEngine, MCP
-        boundary) already sanitise, but this is a public object
-        method — library users can call it directly. No-op on bad
-        input, clamp legitimate-but-out-of-range to [-1.0, 1.0]
-        (the contract surface of session resonance).
-        """
+    @staticmethod
+    def _clean_resonance(r: float) -> Optional[float]:
         try:
             value = float(r)
         except (TypeError, ValueError):
-            return
+            return None
         if not math.isfinite(value):
+            return None
+        return max(-1.0, min(1.0, value))
+
+    def record_resonance(self, raw: float, gravity: float) -> None:
+        """Record one session's resonance, tracking the raw track record and
+        the (contrast-shrunk) gravity input separately.
+
+        ``raw`` is the unmodified ``effective_r · weight`` — the fact's true
+        history, used only by the contrastive trust decision. ``gravity`` is
+        the impulse that actually moves gravity (shrunk for contradicting
+        outliers). Both clamp to [-1, 1]; a bad value in either no-ops the
+        whole record so ``resonance_count`` never advances on poison.
+        """
+        raw_v = self._clean_resonance(raw)
+        grav_v = self._clean_resonance(gravity)
+        if raw_v is None or grav_v is None:
             return
-        value = max(-1.0, min(1.0, value))
-        self.resonance_sum += value
+        self.raw_resonance_sum += raw_v
+        self.resonance_sum += grav_v
         self.resonance_count += 1
+
+    def apply_resonance(self, r: float) -> None:
+        """Record a session with resonance R, applied at full strength to both
+        the raw track record and the gravity input (no contrastive shrink).
+
+        Self-defending: a NaN / Infinity / non-numeric ``r`` is a no-op.
+        External call sites (GravityEngine, MCP boundary) already sanitise,
+        but this is a public method — library users can call it directly.
+        The engine uses ``record_resonance`` to apply the shrunk gravity
+        impulse while keeping the raw history intact; direct callers that
+        don't care about contrast keep this simpler entry point.
+        """
+        self.record_resonance(r, r)
 
     def __repr__(self) -> str:
         return (

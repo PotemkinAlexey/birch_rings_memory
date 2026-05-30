@@ -122,7 +122,12 @@ net). A session whose outcome **contradicts** that established history is
 attenuated in proportion to how established the fact is (`trust = n/(n+K)`,
 `K = BIRCH_CONTRAST_K`, default 5): a new fact takes the full hit, a fact with a
 long resonant track record resists a single incidental toxic session, and a
-confirming session always applies in full so real shifts are still learned.
+confirming session always applies in full so real shifts are still learned. The
+trust decision reads a **separate, un-shrunk** track record (`raw_avg_resonance`),
+not the gravity-side mean it has already shrunk — otherwise trust would feed on
+its own past shrinking and freeze a fact's early reputation against later
+decline. The raw mean is order-independent and flips sign the moment a fact
+genuinely turns bad, at which point contradicting sessions stop being shrunk.
 Symmetric — a consistently-toxic fact is not redeemed by one stray resonant
 session — and bounded: it only ever shrinks a contradicting impulse, never
 amplifies. The rule is **inert** on sign-consistent history (it changes nothing

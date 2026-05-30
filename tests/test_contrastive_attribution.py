@@ -130,6 +130,43 @@ def test_contradicting_impulse_shrinks_with_history():
     assert seasoned_imp > raw
 
 
+def test_trust_prior_is_order_independent():
+    """The shrink decision reads the RAW track record, which is an
+    order-independent mean — so two facts given the same multiset of sessions
+    in opposite order end with the identical trust prior. This is the property
+    that breaks the old self-reference (trust read from already-shrunk history,
+    which was order-dependent)."""
+    eng = GravityEngine()
+    a, b = _fact("a"), _fact("b")
+    eng.register(a)
+    eng.register(b)
+    seq = [0.7, 0.7, 0.7, 0.7, -0.7, -0.7, -0.7, -0.7]
+    for r in seq:
+        eng.apply_session_resonance({a.fact_id: 0.9}, r)
+    for r in reversed(seq):
+        eng.apply_session_resonance({b.fact_id: 0.9}, r)
+    assert abs(a.raw_avg_resonance - b.raw_avg_resonance) < 1e-9
+
+
+def test_turned_bad_fact_eventually_lands_full_and_follows_late():
+    """A fact that is resonant then genuinely turns toxic: once enough toxic
+    sessions arrive, the RAW prior flips sign, later toxic sessions stop being
+    shrunk, and the gravity-side resonance follows the late reality instead of
+    freezing on the early reputation (the old self-referential failure)."""
+    eng = GravityEngine()
+    f = _fact("turned")
+    eng.register(f)
+    for _ in range(5):
+        eng.apply_session_resonance({f.fact_id: 0.9}, 0.7)
+    assert f.raw_avg_resonance > 0 and f.avg_resonance > 0
+    for _ in range(15):
+        eng.apply_session_resonance({f.fact_id: 0.9}, -0.7)
+    # True record flipped, and the gravity-side mean followed it negative —
+    # not frozen positive by self-protecting trust.
+    assert f.raw_avg_resonance < 0, f"raw prior did not flip: {f.raw_avg_resonance}"
+    assert f.avg_resonance < 0, f"gravity-side froze on early reputation: {f.avg_resonance}"
+
+
 def test_attenuation_counter_tracks_only_real_shrinks():
     """The engine counts an attenuation only when an impulse was actually
     shrunk (a contradicting session on an established fact), not on confirming

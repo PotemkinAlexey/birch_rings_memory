@@ -22,7 +22,13 @@ self-derived R cannot compound through the loop.
   `K = BIRCH_CONTRAST_K`, default 5) — so a useful fact is not sunk for being
   incidentally on-topic in a session that failed for unrelated reasons. Inert
   on sign-consistent history; bounded (only shrinks, never amplifies). New
-  `stats.contrastive_attenuations` counter.
+  `stats.contrastive_attenuations` counter. The trust decision reads a
+  separate, un-shrunk track record (`raw_resonance_sum` / `raw_avg_resonance`,
+  new persisted field, backfilled `:= resonance_sum` for legacy rows) rather
+  than the gravity-side mean it already shrank — without that split the rule
+  is self-referential and order-dependent (an early "good" reputation freezes
+  against later decline). Only the gravity input is shrunk; the track record
+  stays raw and order-independent.
 - **Adversarial drift detector** (`tests/test_gravity_drift.py`) — synthetic
   facts with fixed ground-truth utility (shuffled vs creation order); asserts
   final gravity correlates with utility, not appearance order. Runs against

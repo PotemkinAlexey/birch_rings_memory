@@ -41,6 +41,8 @@ class MetaFact:
     last_accessed: float = field(default_factory=time.time)
     resonance_sum: float = 0.0
     resonance_count: int = 0
+    # Un-shrunk track record; see FactPassport.raw_resonance_sum.
+    raw_resonance_sum: float = 0.0
     recent_utility: float = 0.5
     forecast_stability: float = 0.5
     # MemoryBricks Step 1: see FactPassport.namespace.
@@ -95,6 +97,7 @@ class MetaFact:
         self.last_accessed = _f(self.last_accessed, time.time())
         self.resonance_sum = _f(self.resonance_sum, 0.0)
         self.resonance_count = _i(self.resonance_count, 0)
+        self.raw_resonance_sum = _f(self.raw_resonance_sum, 0.0)
         self.recent_utility = _f(
             self.recent_utility, 0.5, lo=0.0, hi=1.0,
         )
@@ -150,31 +153,50 @@ class MetaFact:
             return 0.0
         return avg
 
+    @property
+    def raw_avg_resonance(self) -> float:
+        """Mean UN-shrunk session resonance — true track record, read by the
+        contrastive trust decision. Symmetric with FactPassport."""
+        import math as _math
+
+        if self.resonance_count <= 0:
+            return 0.0
+        avg = self.raw_resonance_sum / self.resonance_count
+        if not _math.isfinite(avg):
+            return 0.0
+        return avg
+
     def touch(self) -> None:
         self.access_count += 1
         self.last_accessed = time.time()
 
-    def apply_resonance(self, r: float) -> None:
-        """Record that a session with resonance R used this MetaFact.
-
-        Self-defending: symmetric with ``FactPassport.apply_resonance``.
-        A NaN / Infinity / non-numeric input would poison
-        ``resonance_sum`` (every downstream ``avg_resonance``,
-        ``compute_gravity``, sort/filter then returns NaN). No-op on
-        bad input, clamp legitimate-but-out-of-range values to
-        [-1.0, 1.0].
-        """
+    @staticmethod
+    def _clean_resonance(r: float):
         import math as _math
 
         try:
             value = float(r)
         except (TypeError, ValueError):
-            return
+            return None
         if not _math.isfinite(value):
+            return None
+        return max(-1.0, min(1.0, value))
+
+    def record_resonance(self, raw: float, gravity: float) -> None:
+        """Record one session: raw track record + (shrunk) gravity input,
+        separately. Symmetric with ``FactPassport.record_resonance``."""
+        raw_v = self._clean_resonance(raw)
+        grav_v = self._clean_resonance(gravity)
+        if raw_v is None or grav_v is None:
             return
-        value = max(-1.0, min(1.0, value))
-        self.resonance_sum += value
+        self.raw_resonance_sum += raw_v
+        self.resonance_sum += grav_v
         self.resonance_count += 1
+
+    def apply_resonance(self, r: float) -> None:
+        """Record a session at full strength to both accumulators (no shrink).
+        Self-defending; symmetric with ``FactPassport.apply_resonance``."""
+        self.record_resonance(r, r)
 
     # ── Hawking emission helper ─────────────────────────────────────────────
     def gravity_on_emission(self, base: float = 0.30) -> float:
@@ -223,6 +245,7 @@ class MetaFact:
             "last_accessed": self.last_accessed,
             "resonance_sum": self.resonance_sum,
             "resonance_count": self.resonance_count,
+            "raw_resonance_sum": self.raw_resonance_sum,
             "recent_utility": self.recent_utility,
             "forecast_stability": self.forecast_stability,
             "namespace": self.namespace,
@@ -259,6 +282,11 @@ class MetaFact:
             resonance_sum=_finite(row.get("resonance_sum"), 0.0),
             resonance_count=_finite_nonneg_int(
                 row.get("resonance_count"), 0,
+            ),
+            # Tolerant backfill: pre-#5 rows lack the column; their
+            # resonance_sum was never shrunk, so it IS the raw history.
+            raw_resonance_sum=_finite(
+                row.get("raw_resonance_sum", row.get("resonance_sum")), 0.0,
             ),
             recent_utility=_finite(
                 row.get("recent_utility"), 0.5, lo=0.0, hi=1.0,

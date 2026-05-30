@@ -363,10 +363,32 @@ reasons would absorb a large negative `R × w`. Before applying the impulse,
 ```
 base = R × w
 if resonance_count == 0 or R == 0:        return base      # no history → full
-if sign(avg_resonance) == sign(R):        return base      # confirms history → full
+if sign(raw_avg_resonance) == sign(R):    return base      # confirms history → full
 trust = resonance_count / (resonance_count + K)            # K = BIRCH_CONTRAST_K, default 5
 return base × (1 − trust)                                  # contradicts → shrunk
 ```
+
+**The prior is read from a separate, un-shrunk accumulator.** Each body keeps
+*two* running sums over the same `resonance_count` sessions:
+
+```
+raw_resonance_sum   += R × w                 # true track record (never shrunk)
+resonance_sum       += contrastive_impulse   # gravity input (shrunk)
+avg_resonance     = resonance_sum     / resonance_count   # → gravity
+raw_avg_resonance = raw_resonance_sum / resonance_count   # → trust decision
+```
+
+The shrink decision reads `raw_avg_resonance`, **not** `avg_resonance`. Reading
+the gravity-side mean would make trust depend on impulses the rule itself
+already shrank — a self-reference that turns the rule into an order-dependent
+rich-get-richer attractor: a fact that became "established good" early would
+protect its reputation using a trust score computed from that very protected
+history, so late toxic sessions get shrunk and its real decline is masked. The
+raw mean is order-independent and never shaped by past shrink decisions, so it
+flips sign the moment a fact genuinely turns bad — at which point contradicting
+sessions stop being shrunk and land in full. (Both sums round-trip through
+storage; `_migrate_raw_resonance` backfills `raw := resonance_sum` for pre-fix
+rows, which is exact since they were never shrunk.)
 
 A new fact takes the full hit; a fact with a long resonant track record resists
 a single incidental toxic session (and a consistently-toxic fact is not redeemed

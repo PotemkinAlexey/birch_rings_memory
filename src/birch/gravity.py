@@ -30,10 +30,13 @@ class GravityBody(Protocol):
     @property
     def avg_resonance(self) -> float: ...
     @property
+    def raw_avg_resonance(self) -> float: ...
+    @property
     def is_deprecated(self) -> bool: ...
     @property
     def is_expired(self) -> bool: ...
     def apply_resonance(self, r: float) -> None: ...
+    def record_resonance(self, raw: float, gravity: float) -> None: ...
 
 
 def _finite_clamped(
@@ -111,7 +114,14 @@ def contrastive_impulse(
     n = getattr(fact, "resonance_count", 0)
     if k <= 0.0 or n <= 0 or effective_r == 0.0:
         return base
-    prior = fact.avg_resonance
+    # Prior is the fact's RAW track record — the un-shrunk mean — NOT the
+    # gravity-side avg_resonance. Reading avg_resonance here would make the
+    # trust decision depend on impulses this same rule already shrank
+    # (self-reference / order-dependent rich-get-richer). raw_avg_resonance is
+    # an order-independent mean of the true session outcomes, so it flips sign
+    # the moment a fact genuinely turns bad — at which point contradicting
+    # sessions stop being shrunk and land in full.
+    prior = getattr(fact, "raw_avg_resonance", fact.avg_resonance)
     if prior * effective_r >= 0.0:
         # This session agrees with (or is neutral to) the fact's history —
         # full strength.
@@ -356,12 +366,16 @@ class GravityEngine:
                     continue
                 # Contrastive (proposal #5): anchor on the fact's own history
                 # so an established fact is not sunk by one incidental session
-                # whose outcome contradicts its track record.
+                # whose outcome contradicts its track record. The raw impulse
+                # is recorded to the un-shrunk track record; only the gravity
+                # input is shrunk — so the trust decision never feeds on its
+                # own past shrinking.
                 body = self._facts[fid]
+                base = r_clean * w_clean
                 impulse = contrastive_impulse(body, r_clean, w_clean)
-                if impulse != r_clean * w_clean:
+                if impulse != base:
                     self.contrastive_attenuations += 1
-                body.apply_resonance(impulse)
+                body.record_resonance(base, impulse)
         else:
             for fid in facts:
                 if fid in self._facts:
@@ -369,7 +383,7 @@ class GravityEngine:
                     impulse = contrastive_impulse(body, r_clean, 1.0)
                     if impulse != r_clean:
                         self.contrastive_attenuations += 1
-                    body.apply_resonance(impulse)
+                    body.record_resonance(r_clean, impulse)
 
     def tick(self, now: float | None = None) -> list[tuple[str, int]]:
         """Recompute gravity for all facts using the engine's adaptive weights.

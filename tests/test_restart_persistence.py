@@ -384,3 +384,31 @@ def test_storage_has_layer_minus_one_rows_for_singularity(tmp_path):
     conn.close()
     assert row is not None
     assert row[0] == -1
+
+
+def test_raw_resonance_diverges_from_shrunk_and_survives_restart(tmp_path):
+    """The contrastive fix splits raw history from the gravity-side (shrunk)
+    sum. After a contradicting outlier the two must DIFFER, and both must
+    round-trip through storage so the trust prior is not silently reset to the
+    shrunk value on restart (which would re-introduce the self-reference)."""
+    from birch.memory_store import MemoryStore
+
+    db = str(tmp_path / "m.db")
+    mem = MemoryStore(db_path=db)
+    f = mem.add_fact("contrastive", "round", "trip")
+    # Establish a resonant history, then one contradicting toxic session.
+    for _ in range(8):
+        mem._engine.apply_session_resonance({f.fact_id: 0.9}, 0.7)
+    mem._engine.apply_session_resonance({f.fact_id: 0.9}, -0.7)  # shrunk
+    raw_before = f.raw_resonance_sum
+    sum_before = f.resonance_sum
+    assert raw_before != sum_before, "outlier should have been shrunk for gravity only"
+    mem._engine.tick()
+    if mem._storage:
+        mem._storage.save_facts([f])
+
+    mem2 = MemoryStore(db_path=db)
+    g = mem2._facts[f.fact_id]
+    assert abs(g.raw_resonance_sum - raw_before) < 1e-6, "raw history lost on restart"
+    assert abs(g.resonance_sum - sum_before) < 1e-6, "shrunk sum lost on restart"
+    assert g.raw_resonance_sum != g.resonance_sum

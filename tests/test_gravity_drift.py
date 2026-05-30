@@ -176,3 +176,39 @@ def test_gravity_tracks_utility_through_real_cosine_attribution(embed_provider):
         f"[{embed_provider}] gravity lost the utility signal through real "
         f"attribution: corr={corr:+.3f}, gravity={np.round(gravity, 3)}"
     )
+
+
+def _close_with(mem, sid, fact, sentiment):
+    """One attributed session closed at a known sentiment (sentiment bypasses
+    the heuristic, so the outcome is deterministic and embedding-free)."""
+    mem.session_start(sid)
+    mem.session_message("session", session_id=sid)  # non-empty guard
+    mem._session_fact_ids = [fact.fact_id]
+    mem.session_close(sid, sentiment=sentiment)
+
+
+def test_gravity_follows_late_utility_after_sign_flip(embed_provider):
+    """The order-dependence guard the sign-consistent tests are blind to.
+
+    A fact resonant for several rounds then genuinely toxic for more must end
+    BELOW a fact that stayed resonant — its gravity follows its LATE utility,
+    not its early reputation. Under the old self-referential contrastive rule
+    the early-good fact would freeze its reputation and resist the toxic turn.
+    """
+    mem = MemoryStore()
+    good = mem.add_fact("stable", "stays", "useful")
+    turned = mem.add_fact("turncoat", "was", "useful then not")
+
+    for rnd in range(5):                       # both earn a resonant history
+        _close_with(mem, f"r-good-{rnd}", good, "resonant")
+        _close_with(mem, f"r-turn-{rnd}", turned, "resonant")
+    for rnd in range(15):                      # good stays good, turned goes bad
+        _close_with(mem, f"g-{rnd}", good, "resonant")
+        _close_with(mem, f"t-{rnd}", turned, "toxic")
+
+    assert turned.raw_avg_resonance < 0, "true record should have flipped toxic"
+    assert turned.avg_resonance < good.avg_resonance, "gravity-side did not follow"
+    assert good.gravity_score - turned.gravity_score > 0.1, (
+        f"[{embed_provider}] turned fact did not follow its late utility: "
+        f"good={good.gravity_score:.3f} turned={turned.gravity_score:.3f}"
+    )
