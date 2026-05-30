@@ -193,7 +193,12 @@ class SessionsMixin:
                     past.session_id,
                     past.bundle.centroids,
                     past.r_score,
-                    time.time(),
+                    # Preserve the original recorded_at — this is a retroactive
+                    # penalty on a PAST session, not a fresh write. Using
+                    # time.time() here rejuvenated the session on disk, so after
+                    # a restart its TTL clock reset and a penalised session
+                    # outlived its tier.
+                    past.timestamp,
                     fact_weights=past.fact_weights,
                     echo_penalty=past.echo_penalty,
                 )

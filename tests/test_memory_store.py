@@ -254,7 +254,7 @@ def test_hawking_does_not_resurrect_a_live_spo_duplicate():
     key = mem._normalize_spo("widget", "made of", "steel", "")
 
     # A query that would Hawking-match the old fact at cosine 1.0.
-    mem.query(text, top_k=5, hawking=True)
+    results = mem.query(text, top_k=5, hawking=True)
 
     live_with_spo = [
         fid for fid, f in mem._facts.items()
@@ -267,6 +267,11 @@ def test_hawking_does_not_resurrect_a_live_spo_duplicate():
     )
     assert mem._spo_index[key] == new.fact_id
     assert old.fact_id not in mem._facts, "blocked old fact must stay in the hole"
+    # No phantom: the blocked candidate must not be RETURNED as a hawking hit
+    # either (it was never resurrected).
+    assert not any(
+        r.body_id == old.fact_id and r.source == "hawking" for r in results
+    ), "blocked Hawking candidate leaked into results as a phantom hit"
 
 
 def test_query_attributes_facts_to_active_session():

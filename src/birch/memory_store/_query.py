@@ -57,6 +57,18 @@ class QueryMixin:
         _apply_echo_gravity_locked: Callable[[Any], list[str]]
         _bump_mutation_locked: Callable[[], None]
 
+    def _spo_slot_held_by_other_live(self, f: "FactPassport") -> bool:
+        """True if a DIFFERENT live, non-deprecated fact already owns ``f``'s
+        (namespace, S, P, O) slot. Used to keep a Hawking candidate whose slot
+        was taken while it sat in the singularity from being resurrected as a
+        live duplicate — or even surfaced as a phantom 'hawking' hit."""
+        key = self._normalize_spo(
+            f.subject, f.predicate, f.object, f.namespace)
+        occ = self._spo_index.get(key)
+        return (occ is not None and occ != f.fact_id
+                and occ in self._facts
+                and not self._facts[occ].is_deprecated)
+
     def find_similar(
         self,
         text: str,
@@ -567,6 +579,13 @@ class QueryMixin:
                         for fact, sim in fact_candidates:
                             if sim < min_similarity:
                                 continue
+                            # A newer live fact may already own this SPO slot.
+                            # Such a candidate can't be resurrected (it would be
+                            # a live duplicate), so it must not even appear in
+                            # the result as a phantom "hawking" hit — drop it
+                            # here, before it can rank into top_k or return.
+                            if self._spo_slot_held_by_other_live(fact):
+                                continue
                             top.append(QueryResult(
                                 fact=fact,
                                 similarity=sim,
@@ -589,24 +608,11 @@ class QueryMixin:
                     # Commit: actually emit ONLY the Hawking survivors. Bodies
                     # that fell out of top_k stay in the singularity, untouched.
                     if hawking:
-                        def _spo_slot_held_by_other_live(f) -> bool:
-                            # A newer fact may have taken this (namespace,S,P,O)
-                            # while ``f`` sat in the singularity. Resurrecting f
-                            # would put two live facts in one SPO bucket while
-                            # _spo_index points at only one — broken dedup. Block
-                            # the emission; the live occupant stays canonical and
-                            # f stays in the hole.
-                            key = self._normalize_spo(
-                                f.subject, f.predicate, f.object, f.namespace)
-                            occ = self._spo_index.get(key)
-                            return (occ is not None and occ != f.fact_id
-                                    and occ in self._facts
-                                    and not self._facts[occ].is_deprecated)
-
+                        # Slot-held candidates were already dropped at peek, so
+                        # every hawking-source survivor here is safe to emit.
                         hawking_survivor_fact_ids = {
                             r.fact.fact_id for r in top
                             if r.source == "hawking" and r.fact is not None
-                            and not _spo_slot_held_by_other_live(r.fact)
                         }
                         hawking_survivor_meta_ids = {
                             r.meta.meta_id for r in top

@@ -79,8 +79,8 @@ class SingularityMixin:
             if other_fid == fact.fact_id or sim < _SALIENCE_NEIGHBOR:
                 continue
             other = self._facts.get(other_fid)
-            if other is None or other.is_deprecated:
-                continue
+            if other is None or other.is_deprecated or other.is_expired:
+                continue  # a dying neighbour is no substitute
             if (other.namespace or "") != ns:
                 continue  # uniqueness is within-scope (MemoryBricks)
             neighbours += 1

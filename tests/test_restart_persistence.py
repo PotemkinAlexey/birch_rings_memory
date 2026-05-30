@@ -495,3 +495,27 @@ def test_load_echo_session_clamps_corrupted_values(tmp_path):
     b2.close()
     assert row["echo_penalty"] == 0.0, "positive penalty must clamp to 0, not load as penalised"
     assert row["r_score"] == 1.0, "out-of-range r_score must clamp into [-1, 1]"
+
+
+def test_echo_apply_preserves_past_session_recorded_at(tmp_path):
+    """Applying a retroactive echo penalty to a PAST session must persist it
+    with its ORIGINAL recorded_at, not time.time(). Using 'now' rejuvenated the
+    session on disk, resetting its TTL clock so a penalised session outlived its
+    tier after a restart."""
+    from birch.memory_store import MemoryStore
+
+    db = str(tmp_path / "m.db")
+    mem = MemoryStore(db_path=db)
+    f = mem.add_fact("quux pipeline", "fails on", "migrations")
+    mem._echo.record("past", [f.vector, f.vector], r_score=0.7,
+                     fact_weights={f.fact_id: 1.0})
+    mem._echo.get("past").timestamp = 1000.0  # an OLD recorded_at
+    # Immediate echo path applies the penalty and persists the past session.
+    out = mem.check_echo("quux pipeline fails on migrations")
+    assert out["echo"] is True and out["penalty"] < 0.0
+
+    rows = {r["session_id"]: r
+            for r in mem._storage.load_echo_sessions(cleanup=False)}
+    assert rows["past"]["recorded_at"] == 1000.0, (
+        f"recorded_at must be preserved, got {rows['past']['recorded_at']}"
+    )
