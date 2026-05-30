@@ -51,6 +51,12 @@ self-derived R cannot compound through the loop.
   ~50% protection from a contradicting session; `<= 0` disables contrastive
   attribution.
 
+### License
+- Project license changed from **Apache-2.0** to **PolyForm Noncommercial
+  1.0.0** — free for noncommercial use (personal, research, education,
+  nonprofit, government); commercial use requires a separate license. Added a
+  top-level `LICENSE` file; `pyproject.toml` now points `license` at it.
+
 ## [0.3.0] — 2026-05-25
 
 First tagged release. The project predates this tag — 118 commits of

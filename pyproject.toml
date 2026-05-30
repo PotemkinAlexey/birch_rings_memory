@@ -7,7 +7,7 @@ name = "birch-km"
 version = "0.3.0"
 description = "Kinetic AI memory system inspired by Paul Birch megastructure physics"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = ["mcp[cli]", "numpy>=1.21"]
 

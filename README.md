@@ -625,4 +625,9 @@ in one call. The native Birch tools above stay available alongside.
 
 ## License
 
-Apache 2.0
+[PolyForm Noncommercial License 1.0.0](LICENSE) — free to use, modify, and
+distribute for **noncommercial** purposes (personal, research, education,
+nonprofit, government). **Commercial use is not granted** by this license;
+contact the author for a separate commercial license.
+
+Copyright (c) 2026 Alexey Potemkin.

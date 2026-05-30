@@ -649,7 +649,7 @@ home for the architecture.
 - `docs/STRUCTURED_LIVING_MEMORY.md` mirroring this document
   (initial copy; later this becomes the canonical home and Birch's
   copy becomes a stub linking here).
-- `LICENSE` (Apache 2.0, matching Birch).
+- `LICENSE` (PolyForm Noncommercial 1.0.0, matching Birch).
 - `roadmap/` directory with one markdown file per future Step's
   issue body, ready to file as GitHub issues:
   - `roadmap/step-1-namespace-in-birch.md`
