@@ -190,6 +190,38 @@ def test_pin_telemetry_survives_restart(tmp_path):
     assert mem2._facts[f.fact_id].pin_resonated is True
 
 
+def test_add_fact_salient_pins_atomically():
+    """salient=True threads into add_fact, so write + pin land in one txn — no
+    written-but-unpinned partial success."""
+    mem = MemoryStore()
+    f = mem.add_fact("failover", "requires", "manual step X", salient=True)
+    assert f.encode_salience == 1.0
+    assert f.was_pinned is True
+
+
+def test_declared_pin_survives_earned_protection_disabled(monkeypatch):
+    """SALIENCE_PROTECTION=0 disables the EARNED heuristic only — a declared
+    pin (its own knob, SALIENCE_PIN_PROTECTION) must still protect."""
+    monkeypatch.setattr(sing, "_SALIENCE_PROTECTION", 0.0)
+    mem = MemoryStore()
+    u = _put(mem, "u", [1.0, 0.0, 0.0])
+    mem.pin_fact("u")
+    u.gravity_score = 0.05
+    mem._absorb_dead()
+    assert "u" in mem._facts, "declared pin must survive earned-protection=0"
+
+
+def test_pin_protection_zero_disables_declared(monkeypatch):
+    """SALIENCE_PIN_PROTECTION=0 is the knob that disables declared pins."""
+    monkeypatch.setattr(sing, "_SALIENCE_PIN_PROTECTION", 0.0)
+    mem = MemoryStore()
+    u = _put(mem, "u", [1.0, 0.0, 0.0])
+    mem.pin_fact("u")
+    u.gravity_score = 0.05
+    mem._absorb_dead()
+    assert "u" not in mem._facts, "pin-protection=0 must let a pinned fact absorb"
+
+
 def test_pin_fact_missing_returns_false():
     mem = MemoryStore()
     assert mem.pin_fact("ghost") is False

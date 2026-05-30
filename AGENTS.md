@@ -150,8 +150,9 @@ non-negotiable part of the consumer contract; the advisory exists so
 you do not have to scan every result yourself.
 
 Invisible-bytes payloads (NUL, zero-width Unicode, BOM) are already
-stripped at the write boundary by `_sanitize_for_llm`, so you only see
-the visible-markers case in the wild.
+stripped at the write boundary by `_sanitize_for_llm` — for fact S/P/O
+**and** session text (session_open / session_push / record_session) —
+so you only see the visible-markers case in the wild.
 
 ---
 

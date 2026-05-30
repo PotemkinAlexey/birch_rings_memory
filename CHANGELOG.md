@@ -85,6 +85,28 @@ self-derived R cannot compound through the loop.
   harder than a marginally-worse one.
 
 ### Fixed
+- **`record_fact(salient=True)` is now atomic.** The pin was a second
+  transaction after `add_fact`, so a failed `pin_fact` left the fact written
+  but unpinned — a dangerous partial success for a rare-critical write. `salient`
+  now threads into core `add_fact` and the write + pin commit in one txn.
+- **`SALIENCE_PROTECTION=0` no longer disables declared pins.** It governed both
+  earned irreplaceability and declared pins, so an operator disabling the
+  heuristic silently lost `record_fact(salient=True)` too. Split into a separate
+  `BIRCH_SALIENCE_PIN_PROTECTION` knob; the earned knob is independent.
+- **Session text is now sanitised at the write boundary.** `session_open`
+  (first_message), `session_push`, and `record_session` messages now pass
+  through `_sanitize_for_llm` like fact S/P/O — invisible/zero-width bytes no
+  longer survive into stored sessions and downstream context.
+- **`query_memory` conflicts are namespace-scoped.** Grouping was by
+  (subject, predicate) only, falsely flagging the same SPO in WORK vs PERSONAL
+  as a conflict. Now keyed by (namespace, subject, predicate); the conflict
+  payload carries `namespace`.
+- **`record_session` returns the full close contract** — added `scoring_source`,
+  `confidence`, `effective_r` (it already had `echo_outcome`), so the one-shot
+  path no longer drifts from `session_close`.
+- **Pin budget eviction documented as new-wins.** A fresh explicit pin always
+  takes effect and eviction targets the highest-gravity *existing* pin (the
+  least-at-risk); comment/docs now state this explicitly.
 - **Contrastive armor now scales by consistency, not just tenure.** `trust`
   used only `n/(n+K)`, so a long but near-zero ("mushy") history got the same
   outlier protection as a strongly one-signed one. It is now

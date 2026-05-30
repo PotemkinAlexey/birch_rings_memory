@@ -516,7 +516,7 @@ Claude then has nineteen tools:
 | `session_open` | Open a named session so reads and writes can be attributed to it |
 | `session_push` | Append a user message to an open session |
 | `session_close` | Close a session — score resonance, update gravity, detect echo. Optional `sentiment` / `r_override` to declare R when the heuristic would misclassify (e.g. declarative technical summaries) |
-| `check_echo` | Explicit cross-session topic match against past K-means session bundles; on a hit, retroactive penalty propagates to past session's R and to gravity of every fact that session touched. Usually called automatically via `session_open(first_message=...)` |
+| `check_echo` | Explicit **apply-now** cross-session topic match; on a hit, retroactive penalty propagates to the past session's R and the gravity of every fact it touched. `session_open(first_message=...)` and `record_session` do NOT call this — they peek a deferred marker and let `session_close` decide by outcome; use `check_echo` only when you want detect-and-apply immediately |
 | `record_session` | Score a completed session in one call (open + push messages + close) |
 | `forecast_memory` | Run the galaxy forward and write a per-body stability prediction back into the live store (covers FactPassports + MetaFacts); feeds the adaptive gravity formula via `w_stability` |
 | `memory_stats` | Report layer distribution, black hole status, live adaptive weights, echo counters, thresholds |

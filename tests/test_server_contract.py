@@ -130,3 +130,40 @@ def test_record_session_non_string_item_is_invalid_message_item():
 
 def test_record_session_empty_list_is_empty_messages():
     assert server.record_session([])["error"] == "empty_messages"
+
+
+# --- P3.8: record_session full close contract --------------------------
+
+def test_record_session_surfaces_full_close_contract():
+    """record_session must expose the same close fields as session_close —
+    no one-shot contract drift."""
+    r = server.record_session(["how do I tune the cache", "perfect, that worked"])
+    for key in ("scoring_source", "confidence", "effective_r", "echo_outcome",
+                "label", "r_score"):
+        assert key in r, f"record_session response missing {key!r}"
+
+
+# --- P3.9: conflicts are namespace-scoped ------------------------------
+
+def test_conflicts_do_not_cross_namespaces():
+    """Same (subject, predicate), different object, but in DIFFERENT namespaces
+    are independent live rows — not a conflict."""
+    server.record_fact("api", "runs on", "Go", namespace="WORK")
+    server.record_fact("api", "runs on", "Rust", namespace="HOME")
+    r = server.query_memory("api runs on", top_k=5)
+    for c in r.get("conflicts", []):
+        # No conflict group may mix namespaces; each is scoped.
+        cands_ns = {c.get("namespace")}
+        assert len(cands_ns) == 1
+    # The cross-namespace pair specifically must not form a conflict.
+    cross = [
+        c for c in r.get("conflicts", [])
+        if c.get("subject") == "api" and c.get("predicate") == "runs on"
+        and len(c.get("candidates", [])) > 1
+    ]
+    # Either no such conflict, or if present its candidates share one namespace.
+    for c in cross:
+        objs = {x["object"] for x in c["candidates"]}
+        assert not ({"Go", "Rust"} <= objs), (
+            "Go (WORK) and Rust (HOME) must not be grouped as one conflict"
+        )

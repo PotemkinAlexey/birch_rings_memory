@@ -108,10 +108,18 @@ class Thresholds:
     # A cost-of-loss signal orthogonal to frequency.
     SALIENCE_NEIGHBOR: float = _env_float("SALIENCE_NEIGHBOR_THRESHOLD", 0.85)
 
-    # How much full irreplaceability lowers the absorption floor: a fully
-    # unique fact's effective floor is ABSORPTION·(1 − SALIENCE_PROTECTION).
-    # 0 disables salience retention (flat floor for everyone).
+    # How much full EARNED irreplaceability lowers the absorption floor: a fully
+    # unique, proven fact's floor is ABSORPTION·(1 − SALIENCE_PROTECTION).
+    # 0 disables the bottom-up (earned) half only — declared pins are governed
+    # separately by SALIENCE_PIN_PROTECTION, so this knob does NOT silently turn
+    # off record_fact(salient=True).
     SALIENCE_PROTECTION: float = _env_float("SALIENCE_PROTECTION", 0.9)
+
+    # How much a full declared pin (encode_salience = 1.0) lowers the floor.
+    # Independent of SALIENCE_PROTECTION so an operator can tune / disable the
+    # earned heuristic without losing the explicit top-down channel. 0 disables
+    # declared pins.
+    SALIENCE_PIN_PROTECTION: float = _env_float("SALIENCE_PIN_PROTECTION", 0.9)
 
     # Encoding-salience use-it-or-lose-it decay: a declared pin loses this much
     # (× session confidence) each time the fact is surfaced into a session that
@@ -134,5 +142,6 @@ class Thresholds:
             "find_similar_default": cls.FIND_SIMILAR_DEFAULT,
             "salience_neighbor": cls.SALIENCE_NEIGHBOR,
             "salience_protection": cls.SALIENCE_PROTECTION,
+            "salience_pin_protection": cls.SALIENCE_PIN_PROTECTION,
             "salience_decay": cls.SALIENCE_DECAY,
         }

@@ -27,6 +27,7 @@ if TYPE_CHECKING:  # pragma: no cover
 _ABSORPTION_THRESHOLD = Thresholds.ABSORPTION
 _SALIENCE_NEIGHBOR = Thresholds.SALIENCE_NEIGHBOR
 _SALIENCE_PROTECTION = Thresholds.SALIENCE_PROTECTION
+_SALIENCE_PIN_PROTECTION = Thresholds.SALIENCE_PIN_PROTECTION
 
 
 class SingularityMixin:
@@ -87,35 +88,32 @@ class SingularityMixin:
         return 1.0 / (1.0 + neighbours)
 
     def _absorption_floor(self, fact: FactPassport) -> float:
-        """Disuse-absorption floor, lowered for facts that are *both* unique and
-        proven useful — "rare-but-critical".
+        """Disuse-absorption floor, lowered by two independent salience halves:
 
-            salience = irreplaceability · clamp(avg_resonance, 0, 1)
-            floor    = ABSORPTION · (1 − SALIENCE_PROTECTION · salience)
+            earned  = irreplaceability · clamp(avg_resonance, 0, 1)   # bottom-up
+            declared = encode_salience                                # top-down pin
+            floor = ABSORPTION · (1 − max(SALIENCE_PROTECTION·earned,
+                                          SALIENCE_PIN_PROTECTION·declared))
 
-        Uniqueness alone is NOT enough: in a real store almost every fact is
-        unique, so protecting on uniqueness alone would halt absorption entirely
-        and hoard junk. Coupling to proven value (avg_resonance) targets the
-        fact that has *demonstrated* it matters and that nothing else covers —
-        and both factors are frequency-orthogonal (avg_resonance is a mean,
-        frozen on disuse), so a once-a-year fact still qualifies. An unproven
-        unique fact decays normally."""
-        if _SALIENCE_PROTECTION <= 0.0:
-            return _ABSORPTION_THRESHOLD
-        # Declared (top-down) salience protects from the moment of writing —
-        # the cold-start case that can't be inferred from any outcome. Earned
-        # (bottom-up) salience = irreplaceability · proven value, needs history.
-        # max() — whichever protects more wins.
+        EARNED targets the rare-but-critical fact that has *proven* it matters
+        and that nothing else covers — uniqueness alone is not enough (almost
+        every fact is unique → would halt absorption and hoard junk), so it is
+        coupled to proven value; both factors are frequency-orthogonal, so a
+        once-a-year fact still qualifies. DECLARED is the explicit pin for the
+        cold-start case (critical but not yet exercised). The two protections
+        have SEPARATE knobs: SALIENCE_PROTECTION=0 disables only the earned
+        heuristic, NOT record_fact(salient=True)."""
         declared = max(0.0, min(1.0, getattr(fact, "encode_salience", 0.0)))
         earned = 0.0
-        if fact.resonance_count > 0:
+        if _SALIENCE_PROTECTION > 0.0 and fact.resonance_count > 0:
             value = min(1.0, fact.avg_resonance)
             if value > 0.0:
                 earned = self._irreplaceability(fact) * value
-        salience = max(declared, earned)
-        if salience <= 0.0:
+        reduction = max(_SALIENCE_PIN_PROTECTION * declared,
+                        _SALIENCE_PROTECTION * earned)
+        if reduction <= 0.0:
             return _ABSORPTION_THRESHOLD  # unpinned + unproven → flat floor
-        return _ABSORPTION_THRESHOLD * (1.0 - _SALIENCE_PROTECTION * salience)
+        return _ABSORPTION_THRESHOLD * (1.0 - reduction)
 
     def _absorb_dead(self) -> list[str]:
         """Send facts and live MetaFacts below the threshold back into the hole.

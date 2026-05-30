@@ -194,6 +194,7 @@ class FactsMixin:
         session_id: Optional[str] = ...,
         *,
         namespace: str = ...,
+        salient: bool = ...,
         return_status: Literal[False] = False,
     ) -> FactPassport: ...
 
@@ -207,6 +208,7 @@ class FactsMixin:
         session_id: Optional[str] = ...,
         *,
         namespace: str = ...,
+        salient: bool = ...,
         return_status: Literal[True],
     ) -> tuple[FactPassport, bool]: ...
 
@@ -219,6 +221,7 @@ class FactsMixin:
         session_id: Optional[str] = None,
         *,
         namespace: str = "",
+        salient: bool = False,
         return_status: bool = False,
     ) -> Union[FactPassport, tuple[FactPassport, bool]]:
         """
@@ -263,6 +266,8 @@ class FactsMixin:
                         eid = self._spo_index.get(key)
                         if eid and eid in self._facts:
                             fact = self._touch_existing(eid, session_id)
+                            if salient:
+                                self._pin_locked(fact)
                             return (fact, False) if return_status else fact
                     # Raced away between sync and write lock — fall through.
                 except Exception:
@@ -286,6 +291,8 @@ class FactsMixin:
                     existing_id = self._spo_index.get(key)
                     if existing_id and existing_id in self._facts:
                         fact = self._touch_existing(existing_id, session_id)
+                        if salient:
+                            self._pin_locked(fact)
                         return (fact, False) if return_status else fact
 
                     sid = self._resolve_sid(session_id)
@@ -322,6 +329,10 @@ class FactsMixin:
                         if ctx is not None:
                             self._attribute_to(ctx, fact.fact_id, 1.0)
                             self._persist_session_locked(ctx)
+                    if salient:
+                        # Atomic: the pin lands in the SAME txn as the write, so
+                        # a rare-critical fact is never left written-but-unpinned.
+                        self._pin_locked(fact)
                     self._bump_mutation_locked()
                     return (fact, True) if return_status else fact
         except Exception:
@@ -347,24 +358,36 @@ class FactsMixin:
                     fact = self._facts.get(fact_id)
                     if fact is None:
                         return False
-                    fact.encode_salience = 1.0
-                    fact.was_pinned = True  # durable, monotonic pin history
-                    self._enforce_pin_budget_locked(fact.namespace or "", fact_id)
-                    if self._storage:
-                        self._storage.save_fact(fact)
+                    self._pin_locked(fact)
                     self._bump_mutation_locked()
                     return True
         except Exception:
             self._reload()
             raise
 
+    def _pin_locked(self, fact: FactPassport) -> None:
+        """Caller holds the lock + txn. Apply a declarative pin to a fact and
+        enforce the per-namespace budget, persisting affected rows. Shared by
+        ``pin_fact`` and the atomic ``add_fact(salient=True)`` path so the write
+        and the pin land in ONE transaction (no unpinned-fact partial success)."""
+        fact.encode_salience = 1.0
+        fact.was_pinned = True  # durable, monotonic pin history
+        self._enforce_pin_budget_locked(fact.namespace or "", fact.fact_id)
+        if self._storage:
+            self._storage.save_fact(fact)
+
     def _enforce_pin_budget_locked(self, namespace: str, keep_id: str) -> None:
         """Caller holds the lock + txn. Keep at most ``_pin_budget()`` pinned
-        facts per namespace. When over, evict the pin on the HIGHEST-gravity
-        fact — it needs protection least (it's safe on its own), so dropping its
-        pin costs least. This is also anti-adversarial to the cold-start case: a
-        matured rare-critical fact sits at LOW gravity after months of decay, so
-        it is the last thing this policy evicts."""
+        facts per namespace.
+
+        Policy: the NEW explicit pin (``keep_id``) always takes effect — it is
+        excluded from the eviction candidates. A fresh ``record_fact(salient=
+        True)`` is a deliberate act and should not be silently refused because
+        the budget is full. When over budget, evict the pin on the
+        HIGHEST-gravity EXISTING fact — it needs protection least (it's safe on
+        its own), so dropping its pin costs least. This is also anti-adversarial
+        to the cold-start case: a matured rare-critical fact sits at LOW gravity
+        after months of decay, so it is never the one evicted."""
         budget = _pin_budget()
         if budget <= 0:
             return

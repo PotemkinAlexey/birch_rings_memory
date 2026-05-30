@@ -598,16 +598,19 @@ def query_memory(
             if bid:
                 injection_warnings.append(bid)
 
-    # conflict_hints: same (subject, predicate) with different objects.
+    # conflict_hints: same (namespace, subject, predicate) with different
+    # objects. Namespace is part of the key — the same SPO in WORK/A and
+    # PERSONAL are independent live rows (MemoryBricks scoping), not a conflict.
     conflicts: list[dict] = []
-    by_slot: dict[tuple[str, str], list[dict]] = {}
+    by_slot: dict[tuple[str, str, str], list[dict]] = {}
     for h in hits:
         if h.get("kind") != "fact":
             continue
+        ns = h.get("namespace") or ""
         s = (h.get("subject") or "").strip().lower()
         p = (h.get("predicate") or "").strip().lower()
-        by_slot.setdefault((s, p), []).append(h)
-    for (_, _), group in by_slot.items():
+        by_slot.setdefault((ns, s, p), []).append(h)
+    for _slot, group in by_slot.items():
         if len(group) <= 1:
             continue
         sorted_group = sorted(
@@ -618,6 +621,7 @@ def query_memory(
         conflicts.append({
             "subject": sorted_group[0].get("subject"),
             "predicate": sorted_group[0].get("predicate"),
+            "namespace": sorted_group[0].get("namespace") or "",
             "candidates": [
                 {
                     "fact_id": x.get("fact_id"),
@@ -737,17 +741,17 @@ def record_fact(
     # write txn, so there's no race window between a fact_exists probe and
     # the insert (same pattern set_fact uses).
     try:
+        # salient is threaded into add_fact so the write + pin commit in ONE
+        # transaction — a rare-critical fact is never left written-but-unpinned.
         fact, created = _store.add_fact(
             subject, predicate, object,
             session_id=session_id, return_status=True,
-            namespace=(namespace or ""),
+            namespace=(namespace or ""), salient=salient,
         )
     except EmbeddingError as exc:
         return _embedding_error_response(exc)
     already_existed = not created
-    pinned = False
-    if salient:
-        pinned = _store.pin_fact(fact.fact_id)
+    pinned = bool(salient)
     similar: list[dict] = []
     if created and fact.vector:
         similar = _store.find_similar_by_vector(
@@ -1574,6 +1578,10 @@ def session_open(
             response["partial_open"] = True
             response["first_message_error"] = err
             return response
+        # Strip invisible / control bytes — session text reaches the same
+        # query_memory responses and LLM context as facts, so the same
+        # write-boundary sanitisation applies (it didn't, before).
+        first_message = _sanitize_for_llm(first_message)
     if first_message:
         # Both check_echo and session_message embed the first message.
         # An unreachable provider here would abort session_open after
@@ -1621,9 +1629,11 @@ def check_echo(first_message: str, session_id: Optional[str] = None) -> dict:
     every fact the past session touched (scaled by per-fact relevance).
 
     Idempotent: a second echo on the same matched session returns
-    ``penalty=0``. Usually called automatically via ``session_open(first_message=...)``;
-    this tool is the explicit form when you want the check without opening a
-    new session, or when you've already opened one and want a late check.
+    ``penalty=0``. This is the IMMEDIATE (apply-now) path. ``session_open(
+    first_message=...)`` and ``record_session`` do NOT call it — they
+    ``peek_echo`` (arm a pending marker) and let ``session_close`` decide by
+    the current session's outcome. Use this tool when you deliberately want a
+    detect-and-apply right now, without opening a session.
     """
     err = _validate_text(first_message, "first_message")
     if err is not None:
@@ -1653,6 +1663,7 @@ def session_push(text: str, session_id: str) -> dict:
     err = _validate_id(session_id, "session_id")
     if err is not None:
         return err
+    text = _sanitize_for_llm(text)  # strip invisible/control bytes (write boundary)
     try:
         _store.session_message(text, session_id=session_id)
     except EmbeddingError as exc:
@@ -1871,6 +1882,9 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
             "error": "empty_messages",
             "hint": "messages must contain at least one entry",
         }
+    # Strip invisible/control bytes from every message (write boundary) —
+    # session text reaches the same downstream context as facts.
+    messages = [_sanitize_for_llm(m) for m in messages]
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)
     # Peek the echo (arm a pending marker) and let session_close decide by
@@ -1913,6 +1927,10 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
         "r_score": round(summary.get("r", 0.0), 3),
         "migrations": len(summary.get("migrations", [])),
         "absorbed": len(summary.get("absorbed", [])),
+        # Full close contract, symmetric with session_close (no one-shot drift):
+        "scoring_source": summary.get("scoring_source"),
+        "confidence": summary.get("confidence"),
+        "effective_r": summary.get("effective_r"),
         # none / applied / cancelled / noop
         "echo_outcome": summary.get("echo_outcome"),
         "stats": _store.stats,
