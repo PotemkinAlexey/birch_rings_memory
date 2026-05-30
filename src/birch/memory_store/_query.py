@@ -478,11 +478,8 @@ class QueryMixin:
                                 continue
                             if prefix and not fact.subject.lower().startswith(prefix):
                                 continue
-                            # MemoryBricks scoping: the backfill path must honour
-                            # namespace_prefix exactly like the primary scan and
-                            # revalidation above — otherwise a post-race backfill
-                            # leaks cross-namespace facts, breaking "reputation
-                            # scoped, not global".
+                            # Backfill must honour namespace_prefix like the
+                            # primary scan, else it leaks cross-namespace facts.
                             if namespace_prefix is not None and not ns_match(
                                     fact.namespace or "", namespace_prefix):
                                 continue
@@ -717,13 +714,8 @@ class QueryMixin:
         every fact that the matched past session touched. Affected facts
         are re-persisted.
         """
-        # session_id, when provided, is excluded from the match pool —
-        # so an explicit check_echo() called with a currently-open
-        # session id does not match itself. This used to be ignored
-        # ("currently unused") which was harmless in the normal
-        # session_open(first_message=...) flow but a footgun for any
-        # workflow that calls check_echo after the session was
-        # already recorded.
+        # session_id is excluded from the match pool so a session never
+        # echoes itself.
         vec = embed(first_message)
 
         with self._lock:
@@ -732,9 +724,8 @@ class QueryMixin:
                     self._sync()
                     result = self._echo.detect_echo(
                         vec, exclude_session_id=session_id)
-                    # Gravity/EWMA propagation + persistence is shared with the
-                    # deferred session_close path via this helper, so both
-                    # routes mutate identically (incl. MetaFact penalties).
+                    # Gravity/EWMA/persist shared with session_close's deferred
+                    # path via this helper (handles MetaFacts too).
                     penalized_body_ids = self._apply_echo_gravity_locked(result)
 
                     return {
@@ -759,27 +750,12 @@ class QueryMixin:
 
     def peek_echo(self, first_message: str, session_id: str) -> dict:
         """
-        Read-only echo detection for the streaming (open → close) path.
-
-        Detects whether ``first_message`` echoes a past session's topic and,
-        if so, records a *pending* echo marker on the named session's context
-        — WITHOUT applying any penalty or touching gravity. The decision is
-        deferred to ``session_close``, which:
-
-          - applies the retroactive penalty only if THIS session also ends
-            non-resonant (a genuine return-to-failure), or
-          - cancels it if this session ends resonant (a productive revisit /
-            continued use of what the past session built).
-
-        This replaces the old apply-on-open behaviour, which guessed
-        "returned ⇒ unresolved" and penalised immediately — firing on
-        continued use as often as on real false closure. ``session_id`` is
-        excluded from the match pool so a just-opened session can't echo
-        itself.
-
-        Returns a dict with ``pending`` (whether a marker was stored) rather
-        than ``echo`` (nothing is applied here). The marker is in-memory only;
-        a cross-process reload between open and close simply drops it.
+        Arm a deferred echo for the open→close path: if ``first_message``
+        echoes a past session's topic, record a pending marker on the session
+        context — applying NO penalty. ``session_close`` decides (apply iff this
+        session also ends non-resonant, else cancel). ``session_id`` is excluded
+        so a session can't echo itself. Returns ``pending`` (marker set?), not
+        ``echo``. The marker is in-memory only; a cross-process reload drops it.
         """
         # Embed outside the lock — slow HTTP call, must not serialise agents.
         vec = embed(first_message)

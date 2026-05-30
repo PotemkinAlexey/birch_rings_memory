@@ -52,37 +52,14 @@ TTL_DEFAULT = 30 * 24 * 3600       # everything else older than 30 days
 
 
 def echo_penalty_for(prior_r: float) -> float:
-    """Retroactive penalty for a past session that a new session echoes.
+    """Echo penalty magnitude, scaled by confidence the revisit signals failure.
 
-    The single source of truth for echo penalty *magnitude*, shared by the
-    immediate path (``detect_echo`` / explicit ``check_echo`` / one-shot
-    ``record_session``) and the deferred, outcome-gated path applied at
-    ``session_close``.
+        penalty = -(0.6 + 0.2·clamp(prior_r,0,1)) · clamp(1 - prior_r, 0, 1)
 
-    The penalty is scaled by *confidence that the revisit signals failure*:
-
-        confidence = clamp(1 - prior_r, 0, 1)
-        penalty    = base(prior_r) * confidence
-
-    Rationale (the "prior_R gate"): returning to a topic that previously
-    closed *strongly resonant* is ambiguous — it is at least as likely to be
-    "I'm still using what we built" as "the fix never worked". So a high
-    prior_r yields a near-zero penalty: we do not punish a genuinely useful
-    past session on suspicion alone. A revisit to a topic that closed *weak
-    or toxic* is unambiguous — it was already failing and is failing again —
-    so confidence is ~1 and the penalty lands at full magnitude.
-
-    This is deliberately the cheap, always-on hedge. The principled fix for
-    the streaming case is to wait for the *current* session's outcome before
-    applying anything at all (see session_close's deferred echo path); this
-    function just makes sure that whenever a penalty IS applied, its size is
-    proportional to the evidence rather than a flat -0.8.
-
-    The base ramps 0.6 → 0.8 as the prior looked more resonant (a confident-
-    looking session that turns out false is a stronger correction signal) and
-    is flat 0.6 for non-positive priors. It is *continuous* in prior_r — the
-    old hard step at 0.35 meant a session at R=0.351 drew a harsher penalty
-    than one at R=0.349, punishing the marginally-better session.
+    A strongly-resonant prior is ambiguous (continued use vs false closure) →
+    near-zero penalty; a weak/toxic prior → full penalty. Continuous in prior_r
+    (no step at 0.35). Single source of truth for both the immediate path and
+    the deferred close-time apply. See ARCHITECTURE.md for the rationale.
     """
     p = max(0.0, min(1.0, prior_r))
     base = 0.6 + 0.2 * p
@@ -96,22 +73,14 @@ class EchoStore:
     def __init__(self, default_k: int = 2) -> None:
         self._sessions: dict[str, StoredSession] = {}
         self._k = default_k
-        # Process-lifetime counters surfaced by MemoryStore.stats. They
-        # answer three questions you need to debug an echo system:
-        # "is detect_echo finding anything at all" (detected),
-        # "is the penalty actually being applied" (applied),
-        # "is the second-hit idempotency hot" (ignored). Reset on
-        # process restart by design — stats are per-instance, not
-        # historical, same contract as collapse_counter.
+        # Per-process counters surfaced by MemoryStore.stats (reset on restart):
+        # detected, applied, ignored (idempotent second hit).
         self.total_echoes_detected = 0
         self.total_echoes_applied = 0
         self.total_echoes_ignored = 0
-        # Deferred path only: a candidate echo (peeked at session_open) that
-        # session_close declined to apply because the *current* session ended
-        # resonant — i.e. the revisit was productive, not a return-to-failure.
-        # This is the metric that proves the open→close deferral is earning
-        # its keep: a high cancelled:applied ratio means the old apply-on-open
-        # heuristic was firing on continued-use, not false closure.
+        # Deferred path: peeked echoes session_close withheld because the
+        # current session ended resonant (productive revisit). A high
+        # cancelled:applied ratio = apply-on-open would have fired on reuse.
         self.total_echoes_cancelled = 0
 
     def record(
@@ -159,21 +128,13 @@ class EchoStore:
         exclude_session_id: str | None = None,
     ) -> EchoResult:
         """
-        Read-only echo detection — find a matching past session WITHOUT
-        applying any penalty or mutating any state.
+        Read-only echo detection — find a matching past session, mutate nothing.
 
-        This is the open-time half of the deferred echo path: a new session
-        records the candidate it *might* be echoing, then waits. The penalty
-        decision is taken later, at ``session_close``, once the current
-        session's own outcome is known (see ``apply_echo``). Returning to a
-        topic is not, by itself, evidence the past closure was false — the
-        evidence is whether *this* conversation also ends badly. Peeking lets
-        us hold that judgement until the evidence exists.
-
-        ``penalty`` here is the *would-be* penalty if applied right now; it is
-        informational only (0.0 if the match was already penalised). Matching
-        is against the nearest centroid in each session's bundle, so a
-        multi-topic session won't miss an echo on a drifted sub-topic.
+        Open-time half of the deferred path: record the candidate now, decide at
+        ``session_close`` once this session's own outcome is known (see
+        ``apply_echo``). ``penalty`` is the would-be magnitude (informational;
+        0.0 if already penalised). Matches the nearest centroid in each session's
+        bundle, so a multi-topic session won't miss a drifted sub-topic.
         """
         best_id, best_sim = self._best_match(new_topic_vector, exclude_session_id)
         if best_id is None:
@@ -192,24 +153,12 @@ class EchoStore:
 
     def apply_echo(self, matched_session_id: str, scale: float = 1.0) -> EchoResult:
         """
-        Apply the retroactive penalty to a previously-peeked match.
+        Commit the retroactive penalty to a previously-peeked match.
 
-        The close-time half of the deferred path: the caller (session_close)
-        has decided — based on the *current* session's outcome — that this
-        revisit really does signal a false closure, and now commits the
-        penalty. Idempotent: a session already penalised is a no-op
-        (penalty 0.0), so a re-applied echo never stacks.
-
-        ``scale`` ∈ [0, 1] attenuates the penalty by how strong the
-        return-to-failure evidence is. session_close passes the current
-        session's *severity* (a neutral return is weaker evidence of false
-        closure than a toxic one), so a barely-non-resonant revisit applies
-        only a fraction of the penalty a clearly-toxic one would. The
-        immediate path (detect_echo / explicit check_echo) has no current
-        outcome to weigh and uses the full penalty (scale 1.0).
-
-        No forced toxic floor — the penalty is confidence-scaled in
-        ``echo_penalty_for`` and the score lands wherever the evidence puts it.
+        Close-time half of the deferred path. Idempotent: an already-penalised
+        session is a no-op, so re-applied echoes never stack. ``scale`` ∈ [0, 1]
+        attenuates by the current session's severity (a neutral return penalises
+        less than a toxic one); the immediate path uses 1.0. No toxic floor.
         """
         past = self._sessions.get(matched_session_id)
         if past is None:
@@ -238,11 +187,9 @@ class EchoStore:
         """
         Immediate echo detection — peek and apply in one shot.
 
-        For callers that have no future outcome to wait for: the explicit
-        ``check_echo`` MCP tool, the one-shot ``record_session`` path, and
-        legacy direct callers. The streaming session_open path should use
-        ``peek_echo`` (at open) + ``apply_echo`` (at close) instead, so the
-        penalty is gated on the current session's actual outcome.
+        For the explicit ``check_echo`` tool and legacy direct callers. The
+        streaming and record_session paths use ``peek_echo`` + ``apply_echo``
+        so the penalty is gated on the current session's outcome.
 
         ``exclude_session_id`` skips a known session from the match pool.
         """

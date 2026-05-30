@@ -70,15 +70,9 @@ class StatsMixin:
                 "total_echoes_detected": self._echo.total_echoes_detected,
                 "total_echoes_applied": self._echo.total_echoes_applied,
                 "total_echoes_ignored": self._echo.total_echoes_ignored,
-                # Deferred-echo saves: candidates peeked at open that close
-                # cancelled because the revisit ended resonant. A high
-                # cancelled:applied ratio is evidence the old apply-on-open
-                # heuristic was firing on continued use, not false closure.
+                # echoes session_close withheld (revisit ended resonant)
                 "total_echoes_cancelled": self._echo.total_echoes_cancelled,
-                # Proposal #5: per-fact resonance impulses attenuated because
-                # they contradicted the fact's established history (outlier-
-                # robust contrastive attribution). High ⇒ topical relevance is
-                # often disagreeing with track record; the protection is active.
+                # impulses the contrastive rule shrank for contradicting history
                 "contrastive_attenuations": self._engine.contrastive_attenuations,
                 # Diagnostics: which thresholds the process actually
                 # picked up. Operator can confirm BIRCH_* env vars

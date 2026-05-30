@@ -1496,14 +1496,11 @@ def session_open(
 
     Pass ``first_message`` (the user's opening text) to arm *deferred* echo
     detection: if the topic matches a past session at cosine ≥ 0.68, a pending
-    echo marker is recorded on this session — but NO penalty is applied yet.
-    The decision waits for ``session_close``: if this conversation also ends
-    non-resonant (you returned and still didn't resolve it) the past session's
-    facts are penalised then; if it ends resonant (the revisit was productive)
-    the echo is cancelled. This replaces the old apply-on-open behaviour, which
-    couldn't tell "still broken" from "still using it" and penalised both. The
-    response reports ``echo.pending`` (a marker was set) and ``echo.matched_session``;
-    the realised outcome shows up in ``session_close``'s ``echo_outcome``.
+    marker is recorded — but no penalty is applied yet. ``session_close`` then
+    decides: penalise the past session's facts only if this conversation also
+    ends non-resonant (returned and still unresolved); cancel if it ends
+    resonant (a productive revisit). The response reports ``echo.pending`` and
+    ``echo.matched_session``; the outcome shows up in ``echo_outcome`` at close.
 
     ``record_first_message`` (default True) also pushes the first message
     into the session's trajectory so the resonance engine sees it on close
@@ -1570,10 +1567,8 @@ def session_open(
         # agent which state it's in so it can't assume the message
         # already landed in the trajectory.
         try:
-            # Deferred echo: peek and arm a pending marker now; the penalty
-            # decision is taken at session_close against this session's actual
-            # outcome (see peek_echo). The explicit check_echo tool remains the
-            # immediate path for callers that want apply-now semantics.
+            # Deferred echo: arm a pending marker; session_close decides by
+            # outcome (see peek_echo). check_echo is the apply-now path.
             response["echo"] = _store.peek_echo(
                 first_message, session_id=sid,
             )
@@ -1800,15 +1795,10 @@ def session_close(
         "migrations": len(summary.get("migrations", [])),
         "absorbed": len(summary.get("absorbed", [])),
         "scoring_source": summary.get("scoring_source"),
-        # Confidence-damping transparency (proposal #2): signal agreement in
-        # [0, 1] and the damped value (R · confidence) that actually moved
-        # gravity. r_score above is the raw heuristic read; effective_r is
-        # what gravity saw.
+        # confidence ∈ [0,1] and effective_r = r·confidence (what moved gravity).
         "confidence": summary.get("confidence"),
         "effective_r": summary.get("effective_r"),
-        # Deferred-echo resolution (proposal #1): "none" | "applied" |
-        # "cancelled" | "noop". "cancelled" means a pending echo from
-        # session_open was withheld because this session ended resonant.
+        # none / applied / cancelled / noop
         "echo_outcome": summary.get("echo_outcome"),
         "stats": _store.stats,
     }
@@ -1866,14 +1856,9 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
         }
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)
-    # Symmetric with session_open(first_message=...): PEEK the echo (arm a
-    # pending marker) on the opening message, then let session_close decide.
-    # record_session has the whole conversation up front, so its outcome IS
-    # knowable before applying any penalty — applying immediately (the old
-    # check_echo call here) would penalise a *productive* revisit just as the
-    # streaming path used to. peek_echo + close-time gating makes this
-    # entrypoint consistent: the penalty fires only if THIS session also ends
-    # non-resonant, and is cancelled otherwise.
+    # Peek the echo (arm a pending marker) and let session_close decide by
+    # outcome — record_session has the whole conversation, so applying
+    # immediately would penalise a productive revisit. Like session_open.
     echo = None
     try:
         if messages:
@@ -1911,8 +1896,7 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
         "r_score": round(summary.get("r", 0.0), 3),
         "migrations": len(summary.get("migrations", [])),
         "absorbed": len(summary.get("absorbed", [])),
-        # How the peeked echo resolved against THIS session's outcome
-        # (none / applied / cancelled / noop) — same field session_close emits.
+        # none / applied / cancelled / noop
         "echo_outcome": summary.get("echo_outcome"),
         "stats": _store.stats,
     }

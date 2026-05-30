@@ -354,15 +354,8 @@ class SQLiteBackend:
             )
 
     def _migrate_raw_resonance(self) -> None:
-        """Add raw_resonance_sum (proposal #5 fix) to older DBs.
-
-        Backfill is the crux: every row that predates this migration accumulated
-        its resonance_sum BEFORE the contrastive rule existed, so no shrinking
-        was ever applied to it — its resonance_sum *is* its raw history.
-        Backfilling raw_resonance_sum := resonance_sum is therefore exact for
-        legacy data, not an approximation. New sessions then diverge the two
-        correctly (raw stays un-shrunk, resonance_sum takes the shrunk impulse).
-        """
+        """Add raw_resonance_sum (#5) to older DBs, backfilled from
+        resonance_sum — exact for pre-#5 rows, which were never shrunk."""
         for table in ("facts", "meta_facts"):
             cols = {
                 row["name"]
@@ -373,9 +366,8 @@ class SQLiteBackend:
                     f"ALTER TABLE {table} "
                     "ADD COLUMN raw_resonance_sum REAL DEFAULT 0.0"
                 )
-                # Exact backfill for pre-#5 rows (see docstring). Guard on the
-                # source column existing — a very old table may predate
-                # resonance_sum entirely, in which case the default 0.0 stands.
+                # Guard: a very old table may predate resonance_sum, leaving
+                # the 0.0 default.
                 if "resonance_sum" in cols:
                     self._conn.execute(
                         f"UPDATE {table} SET raw_resonance_sum = resonance_sum"

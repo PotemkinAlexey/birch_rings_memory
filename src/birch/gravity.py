@@ -85,49 +85,27 @@ def _contrast_k() -> float:
 def contrastive_impulse(
     fact: "GravityBody", effective_r: float, weight: float,
 ) -> float:
-    """Outlier-robust, prior-anchored resonance impulse (proposal #5).
+    """Outlier-robust resonance impulse (proposal #5; see ARCHITECTURE.md).
 
-    The plain mechanism adds ``effective_r · weight`` to a fact's resonance
-    every session it was attributed to. That makes a fact's blame/credit
-    proportional to its *topical* relevance (cosine) — but topical relevance
-    is not causal responsibility. A genuinely useful fact that happens to be
-    retrieved into a session that failed for unrelated reasons takes a large
-    negative hit precisely because it was on-topic.
-
-    The contrast: a fact's own resonance history IS its discriminative signal
-    — does it ride resonant or toxic sessions on net. So a session whose
-    outcome *contradicts* that established history is treated as the weaker
-    evidence: it is attenuated in proportion to how well-established the fact
-    is. A fact with no history takes the full hit (we have no reason to doubt
-    the session). A fact with a long resonant track record resists a single
-    toxic session — it is not sunk for incidental co-occurrence. Symmetric:
-    a consistently-toxic fact is likewise not redeemed by one stray resonant
-    session, so misleading facts still sink. Sessions that *confirm* the
-    history apply at full strength, so a real shift in a fact's usefulness is
-    still learned — it just takes more than one contradicting session.
-
-    Bounded: only ever shrinks a contradicting impulse, never amplifies.
-    ``BIRCH_CONTRAST_K <= 0`` disables it (returns the raw impulse).
+    Cosine relevance is topical, not causal: a useful fact on-topic in a
+    session that failed for unrelated reasons shouldn't be sunk for it. So a
+    session whose outcome *contradicts* the fact's track record is shrunk by
+    ``trust = n/(n+K)``; a confirming session applies in full. Symmetric (a
+    toxic fact isn't redeemed by one good session) and bounded (only shrinks).
+    ``BIRCH_CONTRAST_K <= 0`` disables it.
     """
     base = effective_r * weight
     k = _contrast_k()
     n = getattr(fact, "resonance_count", 0)
     if k <= 0.0 or n <= 0 or effective_r == 0.0:
         return base
-    # Prior is the fact's RAW track record — the un-shrunk mean — NOT the
-    # gravity-side avg_resonance. Reading avg_resonance here would make the
-    # trust decision depend on impulses this same rule already shrank
-    # (self-reference / order-dependent rich-get-richer). raw_avg_resonance is
-    # an order-independent mean of the true session outcomes, so it flips sign
-    # the moment a fact genuinely turns bad — at which point contradicting
-    # sessions stop being shrunk and land in full.
+    # Prior is the RAW track record, not the gravity-side avg_resonance:
+    # reading the latter would let the trust decision feed on impulses it
+    # already shrank (self-reference). The raw mean is order-independent and
+    # flips sign when the fact genuinely turns, ending the shrink.
     prior = getattr(fact, "raw_avg_resonance", fact.avg_resonance)
     if prior * effective_r >= 0.0:
-        # This session agrees with (or is neutral to) the fact's history —
-        # full strength.
-        return base
-    # Contradiction. Trust the accumulated history more as it grows
-    # (saturating), and shrink this surprising impulse accordingly.
+        return base  # confirms (or neutral to) history → full strength
     trust = n / (n + k)
     return base * (1.0 - trust)
 
@@ -276,12 +254,8 @@ class GravityEngine:
     def __init__(self, weights: AdaptiveWeights | None = None) -> None:
         self.weights = weights if weights is not None else AdaptiveWeights.from_prior()
         self._facts: dict[str, GravityBody] = {}
-        # Process-lifetime counter (proposal #5): how many per-fact session
-        # impulses the contrastive rule attenuated because they contradicted
-        # the fact's established history. Surfaced in stats — a high count
-        # means topical relevance is regularly disagreeing with track record,
-        # i.e. the protection is doing real work. Per-instance, resets on
-        # restart, same contract as the echo counters.
+        # Per-process count of impulses the contrastive rule shrank (surfaced
+        # in stats; resets on restart). #5.
         self.contrastive_attenuations = 0
         self._degrees: dict[str, int] = {}     # fact_id → graph degree
         # Track which (from, to) pairs already contributed to _degrees
@@ -337,39 +311,21 @@ class GravityEngine:
     def apply_session_resonance(self, facts, r: float) -> None:
         """Propagate a session's R to the facts it touched.
 
-        ``facts`` may be either:
-          - a list[str] of fact_ids (legacy, uniform weight 1.0)
-          - a dict[str, float] of fact_id → relevance weight ∈ [0, 1]
-
-        Engine-boundary sanitisation: a NaN / Infinity in either ``r``
-        or any per-fact weight would call into ``apply_resonance``
-        which now self-defends, but propagating the bad value here
-        means *every* fact in the session gets silently skipped.
-        Cleaner to reject the bad call up front (whole-session no-op
-        on bad ``r``) and per-pair no-op on bad weight, so the agent
-        loop continues with a structured outcome.
+        ``facts`` is a dict[fact_id → weight ∈ [0,1]], or a list[fact_id]
+        (uniform weight 1.0). Rejects a NaN/Inf ``r`` whole-session and a bad
+        per-fact weight per-pair, so one poisoned value can't skip everything.
         """
         r_clean = _finite_clamped(r, -1.0, 1.0)
         if r_clean is None:
-            # Bad session resonance — nothing to propagate. Sessions
-            # with malformed R get skipped entirely rather than
-            # poisoning every touched fact's resonance_sum.
-            return
+            return  # malformed R — skip rather than poison every fact
         if isinstance(facts, dict):
             for fid, weight in facts.items():
                 if fid not in self._facts:
                     continue
                 w_clean = _finite_clamped(weight, 0.0, 1.0)
                 if w_clean is None:
-                    # Bad weight on one fact does not abort the whole
-                    # propagation. Skip the pair, keep going.
-                    continue
-                # Contrastive (proposal #5): anchor on the fact's own history
-                # so an established fact is not sunk by one incidental session
-                # whose outcome contradicts its track record. The raw impulse
-                # is recorded to the un-shrunk track record; only the gravity
-                # input is shrunk — so the trust decision never feeds on its
-                # own past shrinking.
+                    continue  # bad weight — skip this pair only
+                # record raw → track record, contrast-shrunk → gravity (#5).
                 body = self._facts[fid]
                 base = r_clean * w_clean
                 impulse = contrastive_impulse(body, r_clean, w_clean)

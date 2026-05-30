@@ -15,13 +15,8 @@ class ResonanceResult:
     repetition_score: float     # -1.0 … 0.0
     r: float                    # final resonance index -1.0 … +1.0
     label: str                  # "resonant" | "neutral" | "toxic"
-    # Agreement among the three signals, in [0, 1]. 1.0 = they all pull the
-    # same way (trust R fully); near 0 = they cancel (e.g. behavioral reads
-    # toxic on grumpy tech vocabulary while semantic reads productive). The
-    # gravity step is scaled by this so conflicted sessions barely move
-    # gravity and a noisy signal can't compound through the feedback loop.
-    # Defaults to 1.0 so explicit caller signals (r_override / sentiment),
-    # which construct ResonanceResult directly, are treated as fully trusted.
+    # Signal trust in [0, 1]; gravity moves by R·confidence. Defaults to 1.0 so
+    # explicit caller signals (r_override / sentiment) are fully trusted.
     confidence: float = 1.0
 
 
@@ -73,24 +68,13 @@ def compute_resonance(
     r_raw = sum(contributions)
     r = max(-1.0, min(1.0, r_raw))
 
-    # Confidence has two independent dimensions; we need both.
-    #
-    # (a) AGREEMENT — do the voting signals point the same way?
-    #     |Σ contributions| / Σ|contributions|: 1.0 when every signal pulls the
-    #     same direction, → 0 as they cancel. This is the "declarative grumpy
-    #     tech summary" guard: behavioral -0.8 ("error"/"broken" in a happy
-    #     summary) against semantic +0.6 yields a low ratio, so gravity barely
-    #     moves instead of confidently mislabelling.
-    #
-    # (b) CORROBORATION — how broad is the base the verdict rests on?
-    #     Agreement alone is blind to single-signal dominance: behavioral -0.8
-    #     with semantic and repetition both silent gives agreement 1.0, because
-    #     one signal trivially "agrees" with itself. But a verdict carried by a
-    #     lone regex match is exactly where mis-classification hides. We measure
-    #     breadth with the participation ratio PR = 1 / Σ pᵢ² (pᵢ = |cᵢ|/Σ|c|):
-    #     PR≈1 ⇒ one signal does all the work; PR≈2 ⇒ two balanced signals
-    #     corroborate. Floor 0.75 so a lone clear signal still counts for most
-    #     of its weight; full trust once a second balanced signal joins in.
+    # confidence = agreement × corroboration (see ARCHITECTURE.md):
+    #   agreement     = |Σc| / Σ|c|              — 1 when signals align, →0 as
+    #                                              they cancel (toxic-vs-good).
+    #   corroboration = 0.75 + 0.25·(PR − 1),    PR = 1/Σpᵢ², pᵢ = |cᵢ|/Σ|c|
+    #                   capped at 1              — 0.75 for a lone signal, 1.0
+    #                                              once a second one corroborates.
+    # Single-signal and conflicted verdicts move gravity weakly.
     abs_total = sum(abs(c) for c in contributions)
     if abs_total <= 1e-9:
         confidence = 1.0
