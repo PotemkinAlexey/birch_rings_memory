@@ -237,6 +237,27 @@ must genuinely cease to exist.
 If a fact's gravity decays naturally below `0.10`, the runtime absorbs
 it into the singularity on the next tick — no tool call needed.
 
+### Pinning the rare-but-critical — `record_fact(salient=True)`
+
+Gravity is mostly usage-driven, so a fact that is **critical but rarely used**
+(a yearly runbook step, a hard safety constraint, a "never do X" rule) can decay
+and be absorbed *before* its next use. `salient=True` pins it: it floors the
+fact against disuse-absorption from the moment of writing, before it has ever
+proved itself. This is the one thing the system cannot infer — "this will matter
+in eleven months" is not readable from the fact.
+
+Use it **sparingly and only** when *both* hold:
+- losing the fact would be costly / dangerous, **and**
+- it may go a long time between uses (so normal retention can't catch it).
+
+Do **NOT** pin "this is good / useful" — that is inferred automatically from how
+sessions go; pinning it adds nothing. `salient` is for *criticality*, not
+quality. Over-pinning is futile by design: a per-namespace budget evicts the
+least-at-risk pin when full, and a pin that keeps getting retrieved without
+helping decays away on its own. Treat a pin as a scarce, self-policing resource.
+`memory_stats.pins_active / pins_created / pins_resonated` show whether pins are
+actually paying off.
+
 ---
 
 ## Session scoring
