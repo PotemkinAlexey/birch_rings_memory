@@ -190,6 +190,22 @@ everything is unique). Both factors are frequency-orthogonal — this is the
 cost-of-loss signal the frequency terms can't see. `BIRCH_SALIENCE_PROTECTION=0`
 disables it; `stats.salience_retained` counts what it kept.
 
+That covers *proven* rare-critical facts. The **cold-start** case — critical but
+not yet exercised (recorded today, decisive in 11 months) — has no outcome to
+infer from, so it needs a **top-down** signal: `record_fact(salient=True)` pins
+a fact (`encode_salience`), flooring it from the moment of writing regardless of
+resonance. This is the only declared channel in an otherwise inferential system,
+and it doesn't break the thesis — the thesis is "don't make the user *rate*
+usefulness", and criticality-at-encoding is a different, un-inferrable signal
+(the brain tags importance by attention at encoding too, not only by repetition).
+It's kept honest: a pin **decays use-it-or-lose-it** (eroded only when the fact
+surfaces into a non-positive session — a pin that keeps proving useless fades; a
+truly dormant one is held), a per-namespace **budget** evicts the *highest-gravity*
+pin under contention (the one needing it least — never the matured low-gravity
+cold-start candidate), and **telemetry** (`pins_created / pins_active /
+pins_resonated`) lets a month of real traffic decide whether the channel earns
+its keep: if pinned facts rarely go on to resonate, it's noise and should be cut.
+
 ### Hawking emission
 
 Facts in the black hole are not permanently lost. A query with cosine

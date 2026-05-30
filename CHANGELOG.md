@@ -10,6 +10,23 @@ Resonance feedback loop made evidence-gated and self-damping, so a noisy,
 self-derived R cannot compound through the loop.
 
 ### Added
+- **Encoding salience (declarative pin) — the top-down half.** `record_fact(..., salient=True)`
+  marks a fact critical at write time, flooring it against disuse-absorption
+  *independent of resonance* — the one case bottom-up inference can't reach
+  (rare-but-critical that hasn't been exercised yet; the cold-start gap of the
+  retention feature below). It is NOT a utility rating — the thesis stays "don't
+  make the user rate usefulness"; this is an orthogonal, un-inferrable
+  criticality signal, and it is kept honest three ways: (a) **use-it-or-lose-it
+  decay** — a pin erodes by `SALIENCE_DECAY · confidence` only when its fact
+  surfaces into a non-positive session (a pin that never surfaces is never
+  decayed; one that keeps surfacing uselessly fades), (b) a per-namespace
+  **pin budget** (`BIRCH_SALIENCE_PIN_BUDGET`, default 32) that evicts the
+  *highest-gravity* pin under contention — the one needing protection least,
+  which is anti-adversarial to a matured low-gravity cold-start candidate, and
+  (c) **telemetry to earn its keep**: `stats.pins_created / pins_active /
+  pins_resonated / pins_evicted` — a near-zero `pins_resonated/pins_created`
+  over real traffic is the signal to bury the channel. New persisted
+  `FactPassport.encode_salience` (migrated, legacy rows default 0).
 - **Salience / irreplaceability retention.** A frequency-orthogonal cost-of-loss
   signal: a fact that is *both* unique in its namespace (no live neighbour at
   cosine ≥ `BIRCH_SALIENCE_NEIGHBOR_THRESHOLD`) *and* has proven useful

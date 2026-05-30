@@ -10,6 +10,7 @@ from ..fact import FactPassport
 from ..gravity import pre_resonance_features
 from ..meta_fact import MetaFact
 from ..resonance.detector import ResonanceResult, compute_resonance
+from ..thresholds import Thresholds
 from ._embed_proxy import embed
 from ._models import SessionContext
 
@@ -19,6 +20,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from ..storage import StorageBackend
 
 _logger = logging.getLogger(__name__)
+
+# Encoding-salience use-it-or-lose-it decay step (× session confidence),
+# applied when a pinned fact surfaces into a non-positive session.
+_SALIENCE_DECAY = Thresholds.SALIENCE_DECAY
 
 
 class SessionsMixin:
@@ -34,6 +39,8 @@ class SessionsMixin:
     _current_session_id: "Optional[str]"
     _closing_sessions: "set[str]"
     _mutation_version: int
+    _ever_pinned_ids: "set[str]"
+    _pins_resonated_ids: "set[str]"
 
     if TYPE_CHECKING:
         _sync: Callable[[], None]
@@ -590,6 +597,30 @@ class SessionsMixin:
                             if body is not None:
                                 body.touch()
                         self._apply_recent_utility_locked(facts_snapshot, effective_r)
+
+                        # Encoding-salience (declarative pins): telemetry + the
+                        # usage-keyed use-it-or-lose-it decay. A pin erodes ONLY
+                        # when its fact surfaced into a non-positive session
+                        # (it got its chance and didn't resonate), by δ·confidence
+                        # so one low-confidence miss barely touches it — inheriting
+                        # the same noise-robustness as the rest of the loop. A pin
+                        # that never surfaces is never decayed (the budget, not
+                        # decay, backstops never-surfaced junk). Resonant surfacing
+                        # of an ever-pinned fact is the metric that proves the
+                        # channel earned its keep.
+                        resonated = effective_r > 0.35
+                        decay = (_SALIENCE_DECAY * confidence
+                                 if result.r <= 0.0 else 0.0)
+                        if resonated or decay > 0.0:
+                            for fid in facts_snapshot:
+                                body = self._facts.get(fid)
+                                if body is None:
+                                    continue
+                                if resonated and fid in self._ever_pinned_ids:
+                                    self._pins_resonated_ids.add(fid)
+                                if decay > 0.0 and body.encode_salience > 0.0:
+                                    body.encode_salience = max(
+                                        0.0, body.encode_salience - decay)
 
                         # Deferred echo (peeked at open) decided here on this
                         # session's outcome — before tick() so the migration

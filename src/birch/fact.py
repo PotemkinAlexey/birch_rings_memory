@@ -103,6 +103,12 @@ class FactPassport:
     # contrastive trust decision (resonance_sum is shrunk; this is not, so
     # trust never feeds on its own shrinking). See gravity.contrastive_impulse.
     raw_resonance_sum: float = 0.0
+    # Declared (top-down) salience in [0, 1] — the one signal that cannot be
+    # inferred bottom-up: "this is critical, don't forget", set at write time.
+    # Floors absorption regardless of resonance_count, then decays use-it-or-
+    # lose-it (eroded only when the fact surfaces into a non-positive session).
+    # 0 = not pinned (the default; the system stays preponderantly inferential).
+    encode_salience: float = 0.0
 
     # EWMA of recent contextual usefulness (closure-weighted resonance).
     # Default 0.5 = Bayesian neutral prior; untouched facts get a soft floor.
@@ -147,6 +153,9 @@ class FactPassport:
             self.resonance_count, 0,
         )
         self.raw_resonance_sum = _sanitize_float(self.raw_resonance_sum, 0.0)
+        self.encode_salience = _sanitize_float(
+            self.encode_salience, 0.0, lo=0.0, hi=1.0,
+        )
         self.recent_utility = _sanitize_float(
             self.recent_utility, 0.5, lo=0.0, hi=1.0,
         )

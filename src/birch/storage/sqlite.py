@@ -181,6 +181,8 @@ CREATE TABLE IF NOT EXISTS facts (
     -- Un-shrunk resonance history (proposal #5 fix): true track record,
     -- separate from the contrast-shrunk resonance_sum that feeds gravity.
     raw_resonance_sum REAL DEFAULT 0.0,
+    -- Declared (top-down) encoding salience — "don't forget this".
+    encode_salience REAL DEFAULT 0.0,
     recent_utility  REAL DEFAULT 0.5,
     forecast_stability REAL DEFAULT 0.5,
     -- MemoryBricks Step 1: namespace scope (VB path-style). Empty
@@ -273,6 +275,7 @@ class SQLiteBackend:
         self._migrate_forecast_stability()
         self._migrate_namespace()
         self._migrate_raw_resonance()
+        self._migrate_encode_salience()
         self._conn.commit()
 
     # ── Cross-process coordination ───────────────────────────────────────────
@@ -373,6 +376,17 @@ class SQLiteBackend:
                         f"UPDATE {table} SET raw_resonance_sum = resonance_sum"
                     )
 
+    def _migrate_encode_salience(self) -> None:
+        """Add encode_salience (declarative top-down salience) to older DBs.
+        Legacy rows default 0.0 — nothing was pinned before the feature."""
+        cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(facts)")
+        }
+        if "encode_salience" not in cols:
+            self._conn.execute(
+                "ALTER TABLE facts ADD COLUMN encode_salience REAL DEFAULT 0.0"
+            )
+
     def _migrate_forecast_stability(self) -> None:
         """Add forecast_stability / w_stability columns to older DBs."""
         fact_cols = {
@@ -436,8 +450,8 @@ class SQLiteBackend:
         "(fact_id, subject, predicate, object, vector, gravity_score, layer, "
         " created_at, ttl, source_session, deprecated_by, access_count, "
         " last_accessed, resonance_sum, resonance_count, raw_resonance_sum, "
-        " recent_utility, forecast_stability, namespace) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " encode_salience, recent_utility, forecast_stability, namespace) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
 
     @staticmethod
@@ -467,6 +481,7 @@ class SQLiteBackend:
             _finite_float(fact.resonance_sum, 0.0),
             _nonnegative_int(fact.resonance_count, 0),
             _finite_float(fact.raw_resonance_sum, 0.0),
+            _finite_float(fact.encode_salience, 0.0, lo=0.0, hi=1.0),
             _finite_float(fact.recent_utility, 0.5, lo=0.0, hi=1.0),
             _finite_float(
                 fact.forecast_stability, 0.5, lo=0.0, hi=1.0,
@@ -547,6 +562,11 @@ class SQLiteBackend:
                         if "raw_resonance_sum" in r.keys()
                         else r["resonance_sum"],
                         0.0,
+                    ),
+                    encode_salience=_finite_float(
+                        r["encode_salience"]
+                        if "encode_salience" in r.keys() else 0.0,
+                        0.0, lo=0.0, hi=1.0,
                     ),
                     recent_utility=_finite_float(
                         r["recent_utility"]

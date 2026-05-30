@@ -13,6 +13,19 @@ from ..fact import FactPassport
 from ..vector_index import DimensionMismatchError
 from ._embed_proxy import embed, embed_batch
 
+
+def _pin_budget() -> int:
+    """Max live declared-salient (pinned) facts per namespace. Env-overridable.
+    The budget is the only backstop against never-surfaced junk pins (which are
+    indistinguishable from never-surfaced critical ones); size it so the bounded
+    loss is tolerable — it's capacity planning, not a principled threshold.
+    ``<= 0`` means unbounded (no eviction)."""
+    import os
+    try:
+        return int(os.environ.get("BIRCH_SALIENCE_PIN_BUDGET", "32"))
+    except (TypeError, ValueError):
+        return 32
+
 if TYPE_CHECKING:  # pragma: no cover
     from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -49,6 +62,8 @@ class FactsMixin:
     _current_session_id: "Optional[str]"
     _auto_link: bool
     _mutation_version: int
+    _ever_pinned_ids: "set[str]"
+    _pins_evicted: int
     _forecast_cache: "Optional[tuple[tuple[int, int, int, int], dict]]"
     _collapse_counter: int
     _collapse_async: bool
@@ -314,6 +329,58 @@ class FactsMixin:
             # Re-anchor every cache to disk truth before propagating.
             self._reload()
             raise
+
+    def pin_fact(self, fact_id: str) -> bool:
+        """Declare a fact critical (encode_salience = 1.0) — the top-down channel
+        for the one case bottom-up inference can't reach: rare-but-critical that
+        hasn't yet been exercised. Enforces the per-namespace pin budget. Returns
+        True if the fact was pinned, False if it no longer exists.
+
+        Idempotent on an already-pinned fact (re-asserts the full pin, which also
+        resets any use-it-or-lose-it decay). Persists the change.
+        """
+        try:
+            with self._lock:
+                with self._txn():
+                    self._sync()
+                    fact = self._facts.get(fact_id)
+                    if fact is None:
+                        return False
+                    fact.encode_salience = 1.0
+                    self._ever_pinned_ids.add(fact_id)
+                    self._enforce_pin_budget_locked(fact.namespace or "", fact_id)
+                    if self._storage:
+                        self._storage.save_fact(fact)
+                    self._bump_mutation_locked()
+                    return True
+        except Exception:
+            self._reload()
+            raise
+
+    def _enforce_pin_budget_locked(self, namespace: str, keep_id: str) -> None:
+        """Caller holds the lock + txn. Keep at most ``_pin_budget()`` pinned
+        facts per namespace. When over, evict the pin on the HIGHEST-gravity
+        fact — it needs protection least (it's safe on its own), so dropping its
+        pin costs least. This is also anti-adversarial to the cold-start case: a
+        matured rare-critical fact sits at LOW gravity after months of decay, so
+        it is the last thing this policy evicts."""
+        budget = _pin_budget()
+        if budget <= 0:
+            return
+        pinned = [
+            f for f in self._facts.values()
+            if f.fact_id != keep_id
+            and (f.namespace or "") == namespace
+            and f.encode_salience > 0.0
+        ]
+        # +1 for the fact we're keeping.
+        while len(pinned) + 1 > budget and pinned:
+            victim = max(pinned, key=lambda f: f.gravity_score)
+            victim.encode_salience = 0.0
+            if self._storage:
+                self._storage.save_fact(victim)
+            self._pins_evicted += 1
+            pinned.remove(victim)
 
     def _bump_mutation_locked(self) -> None:
         """Caller must hold self._lock. Single source of truth for

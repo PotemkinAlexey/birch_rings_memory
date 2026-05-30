@@ -526,7 +526,8 @@ it for a fact that is *both* unique in its namespace and proven useful:
 
 ```
 irreplaceability = 1 / (1 + same-namespace live neighbours at cosine ≥ SALIENCE_NEIGHBOR)
-salience         = irreplaceability · clamp(avg_resonance, 0, 1)
+earned           = irreplaceability · clamp(avg_resonance, 0, 1)   # bottom-up, needs history
+salience         = max(encode_salience, earned)                   # declared OR earned
 floor(fact)      = ABSORPTION · (1 − SALIENCE_PROTECTION · salience)
 ```
 
@@ -539,8 +540,39 @@ NOT enough (almost every fact is unique → absorption would halt and junk would
 accumulate); coupling to proven value targets the genuinely critical. The
 `is_deprecated` / `is_expired` lifecycle exits ignore salience — a superseded
 fact is replaced regardless. `SALIENCE_PROTECTION=0` reverts to the flat floor.
-This is the retention half of salience; ranking-boost (salience as a gravity
-term, not just an absorption floor) is a possible follow-up.
+
+**`encode_salience` is the top-down half** — the only declared signal in an
+otherwise inferential system. `earned` salience needs an outcome, so it can't
+protect a critical-but-never-yet-exercised fact (the cold-start case); that fact
+is un-inferrable by construction and needs `record_fact(salient=True)`, which
+sets `encode_salience = 1.0` and floors the fact from the moment of writing. The
+thesis survives because the thesis is "don't make the user *rate* usefulness",
+and criticality-at-encoding is an orthogonal, un-inferrable signal — not a
+retrospective rating. Three disciplines keep the seam thin so it can't swallow
+the bottom-up spirit:
+
+- **Use-it-or-lose-it decay** (`session_close`): a pin loses `SALIENCE_DECAY ·
+  confidence` only when its fact surfaced into a non-positive session. Usage-
+  keyed, not wall-clock: a pin that keeps proving useless fades; a dormant one
+  is held (it never got its chance); confidence-scaled so one noisy miss barely
+  touches it. Decay never opens a transfer valley — a resonant surfacing leaves
+  the pin intact while `earned` rises to take over.
+- **Per-namespace budget** (`BIRCH_SALIENCE_PIN_BUDGET`, default 32): the only
+  backstop against never-surfaced junk pins (indistinguishable from never-
+  surfaced critical ones). Under contention it evicts the **highest-gravity**
+  pin — the one needing protection least — which is anti-adversarial: a matured
+  cold-start candidate sits at *low* gravity after months of decay, so it is the
+  last thing evicted. The budget *bounds* hoarding, it doesn't *resolve* it
+  (within the budget, never-surfaced pins are inherently indistinguishable) —
+  size it as capacity planning, not a principled threshold.
+- **Telemetry as the verdict** (`stats.pins_created / pins_active /
+  pins_resonated / pins_evicted`): whether the declared channel is worth its
+  cost is empirical, not arguable. A near-zero `pins_resonated / pins_created`
+  over real traffic means people pin noise — bury the channel and accept the
+  documented cold-start ceiling.
+
+Ranking-boost (salience as a gravity term, not just an absorption floor)
+remains a possible follow-up; this is the retention half.
 
 `MemoryStore.delete_fact` is **not** an intake — it removes the row
 from storage entirely, bypassing the singularity, losing the body to

@@ -665,11 +665,21 @@ def record_fact(
     object: str,
     session_id: Optional[str] = None,
     namespace: Optional[str] = None,
+    salient: bool = False,
 ) -> dict:
     """USE WHEN: storing a new atomic SPO triple where the (subject, predicate)
     can legitimately carry several objects (e.g. "api uses Postgres" AND
     "api uses Redis"). For one-canonical-value slots — HEADs, versions,
     counts — use ``set_fact`` instead so old values auto-supersede.
+
+    Set ``salient=True`` ONLY for rare-but-critical knowledge that would be
+    catastrophic to forget and may not be exercised for a long time (a yearly
+    runbook step, a hard safety constraint). It pins the fact against
+    disuse-absorption from the moment of writing — the one signal the system
+    can't infer bottom-up. It is NOT a "this is good" rating (utility is still
+    inferred); over-pinning is self-defeating (a per-namespace budget evicts
+    the least-at-risk pins, and a pin that keeps surfacing without resonating
+    decays away). Use sparingly.
 
     Identical triples (case-insensitive, whitespace-normalised) are deduplicated:
     the existing fact is touched and returned with ``already_existed=true``.
@@ -698,6 +708,9 @@ def record_fact(
     # MemoryBricks Step 1: namespace is optional text — same shape as
     # subject_prefix. ``None`` means "global root" downstream.
     err = _validate_optional_text(namespace, "namespace")
+    if err is not None:
+        return err
+    err = _validate_bool(salient, "salient")
     if err is not None:
         return err
     # Strip invisible control chars + zero-width Unicode at the write
@@ -732,6 +745,9 @@ def record_fact(
     except EmbeddingError as exc:
         return _embedding_error_response(exc)
     already_existed = not created
+    pinned = False
+    if salient:
+        pinned = _store.pin_fact(fact.fact_id)
     similar: list[dict] = []
     if created and fact.vector:
         similar = _store.find_similar_by_vector(
@@ -752,6 +768,7 @@ def record_fact(
         "already_existed": already_existed,
         "layer": fact.layer,
         "gravity_score": round(fact.gravity_score, 3),
+        "pinned": pinned,
         "similar_existing": similar,
         "_hint": hint,
     }

@@ -113,6 +113,13 @@ class Thresholds:
     # 0 disables salience retention (flat floor for everyone).
     SALIENCE_PROTECTION: float = _env_float("SALIENCE_PROTECTION", 0.9)
 
+    # Encoding-salience use-it-or-lose-it decay: a declared pin loses this much
+    # (× session confidence) each time the fact is surfaced into a session that
+    # ends non-positive. ~3 useless surfacings fully erode a full pin. A pin
+    # that never surfaces is never decayed (it never got its chance) — that is
+    # what the per-namespace pin budget, not decay, backstops.
+    SALIENCE_DECAY: float = _env_float("SALIENCE_DECAY", 0.34)
+
     @classmethod
     def as_dict(cls) -> dict[str, float]:
         """Snapshot for diagnostics / memory_stats. Lets an operator
@@ -127,4 +134,5 @@ class Thresholds:
             "find_similar_default": cls.FIND_SIMILAR_DEFAULT,
             "salience_neighbor": cls.SALIENCE_NEIGHBOR,
             "salience_protection": cls.SALIENCE_PROTECTION,
+            "salience_decay": cls.SALIENCE_DECAY,
         }

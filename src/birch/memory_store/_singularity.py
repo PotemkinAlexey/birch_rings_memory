@@ -100,12 +100,21 @@ class SingularityMixin:
         and both factors are frequency-orthogonal (avg_resonance is a mean,
         frozen on disuse), so a once-a-year fact still qualifies. An unproven
         unique fact decays normally."""
-        if _SALIENCE_PROTECTION <= 0.0 or fact.resonance_count <= 0:
+        if _SALIENCE_PROTECTION <= 0.0:
             return _ABSORPTION_THRESHOLD
-        value = min(1.0, fact.avg_resonance)
-        if value <= 0.0:
-            return _ABSORPTION_THRESHOLD  # never proven useful → no protection
-        salience = self._irreplaceability(fact) * value
+        # Declared (top-down) salience protects from the moment of writing —
+        # the cold-start case that can't be inferred from any outcome. Earned
+        # (bottom-up) salience = irreplaceability · proven value, needs history.
+        # max() — whichever protects more wins.
+        declared = max(0.0, min(1.0, getattr(fact, "encode_salience", 0.0)))
+        earned = 0.0
+        if fact.resonance_count > 0:
+            value = min(1.0, fact.avg_resonance)
+            if value > 0.0:
+                earned = self._irreplaceability(fact) * value
+        salience = max(declared, earned)
+        if salience <= 0.0:
+            return _ABSORPTION_THRESHOLD  # unpinned + unproven → flat floor
         return _ABSORPTION_THRESHOLD * (1.0 - _SALIENCE_PROTECTION * salience)
 
     def _absorb_dead(self) -> list[str]:

@@ -26,6 +26,9 @@ class StatsMixin:
     _echo: "EchoStore"
     _sessions: "dict[str, SessionContext]"
     _salience_retained_ids: "set[str]"
+    _ever_pinned_ids: "set[str]"
+    _pins_resonated_ids: "set[str]"
+    _pins_evicted: int
     _collapse_counter: int
     _total_collapses: int
     _total_collapse_attempts: int
@@ -77,6 +80,14 @@ class StatsMixin:
                 "contrastive_attenuations": self._engine.contrastive_attenuations,
                 # distinct facts salience (irreplaceability) kept from absorption
                 "salience_retained": len(self._salience_retained_ids),
+                # Declarative-pin telemetry — the verdict on the top-down channel.
+                # pins_resonated / pins_created near zero over real traffic ⇒
+                # people pin noise, the channel isn't earning its keep.
+                "pins_active": sum(
+                    1 for f in self._facts.values() if f.encode_salience > 0.0),
+                "pins_created": len(self._ever_pinned_ids),
+                "pins_resonated": len(self._pins_resonated_ids),
+                "pins_evicted": self._pins_evicted,
                 # Diagnostics: which thresholds the process actually
                 # picked up. Operator can confirm BIRCH_* env vars
                 # took effect without reading the process environment.

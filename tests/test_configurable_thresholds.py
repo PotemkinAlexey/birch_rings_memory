@@ -93,7 +93,7 @@ def test_thresholds_as_dict_shape():
     assert set(d) == {
         "absorption", "hawking_fact", "hawking_meta",
         "auto_link", "collapse", "echo", "find_similar_default",
-        "salience_neighbor", "salience_protection",
+        "salience_neighbor", "salience_protection", "salience_decay",
     }
     assert all(isinstance(v, float) for v in d.values())
 

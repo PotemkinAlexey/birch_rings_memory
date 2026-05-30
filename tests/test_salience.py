@@ -91,3 +91,90 @@ def test_salience_protection_zero_reverts_to_flat_floor(monkeypatch):
     mem._absorb_dead()
     assert "u" not in mem._facts, "with protection disabled, unique fact absorbs"
     assert "u" not in mem._salience_retained_ids
+
+
+# ── Encoding salience (declarative top-down pin) ─────────────────────────────
+
+def _toxic_session(mem, fid, sentiment="toxic"):
+    sid = f"s-{fid}-{sentiment}-{mem._mutation_version}"
+    mem.session_start(sid)
+    mem.session_message("session", session_id=sid)
+    mem._session_fact_ids = [fid]
+    mem.session_close(sid, sentiment=sentiment)
+
+
+def test_declared_pin_protects_an_unproven_fact():
+    """The cold-start case: a critical-but-never-yet-exercised fact (resonance
+    count 0) gets NO bottom-up protection, but a declared pin floors it from the
+    moment of writing."""
+    mem = MemoryStore()
+    u = _put(mem, "u", [1.0, 0.0, 0.0])  # unique, but unproven
+    assert mem.pin_fact("u") is True
+    assert u.encode_salience == 1.0
+    u.gravity_score = 0.05
+    mem._absorb_dead()
+    assert "u" in mem._facts, "a declared pin must protect even an unproven fact"
+
+
+def test_pin_decays_use_it_or_lose_it_only_on_non_positive_sessions():
+    """A pin erodes only when the fact surfaces and the session ends
+    non-positive; a resonant surfacing leaves it intact."""
+    mem = MemoryStore()
+    _put(mem, "u", [1.0, 0.0, 0.0])
+    mem.pin_fact("u")
+    # Resonant surfacing: pin untouched (and learned salience takes over).
+    _toxic_session(mem, "u", sentiment="resonant")
+    assert mem._facts["u"].encode_salience == 1.0, "resonant session must not decay a pin"
+    # Three non-positive surfacings (δ=0.34, confidence 1.0) erode it to zero.
+    for _ in range(3):
+        _toxic_session(mem, "u", sentiment="toxic")
+    assert mem._facts["u"].encode_salience == 0.0, "use-it-or-lose-it should erode the pin"
+
+
+def test_pin_budget_evicts_highest_gravity_not_the_cold_start_candidate(monkeypatch):
+    """The adversarial eviction test. Budget full; a new pin arrives. The
+    matured rare-critical candidate (low gravity after long decay) must NOT be
+    the one evicted — the policy drops the pin that needs it least (highest
+    gravity, safe on its own)."""
+    monkeypatch.setenv("BIRCH_SALIENCE_PIN_BUDGET", "2")
+    mem = MemoryStore()
+    yearly = _put(mem, "yearly", [1.0, 0.0, 0.0])   # matured cold-start candidate
+    safe = _put(mem, "safe", [0.0, 1.0, 0.0])       # currently high-gravity
+    yearly.gravity_score = 0.05
+    safe.gravity_score = 0.90
+    mem.pin_fact("yearly")
+    mem.pin_fact("safe")
+    # Budget (2) now full; a third pin forces an eviction.
+    _put(mem, "newcomer", [0.0, 0.0, 1.0])
+    mem.pin_fact("newcomer")
+
+    assert mem._facts["yearly"].encode_salience == 1.0, "cold-start candidate must survive eviction"
+    assert mem._facts["newcomer"].encode_salience == 1.0
+    assert mem._facts["safe"].encode_salience == 0.0, "highest-gravity pin should be evicted"
+    assert mem._pins_evicted == 1
+
+
+def test_pins_resonated_telemetry_counts_the_payoff():
+    """The verdict metric: a pinned fact that later rides a resonant session is
+    counted — that's declaration predicting criticality."""
+    mem = MemoryStore()
+    _put(mem, "u", [1.0, 0.0, 0.0])
+    mem.pin_fact("u")
+    assert mem.stats["pins_created"] == 1
+    assert mem.stats["pins_active"] == 1
+    assert mem.stats["pins_resonated"] == 0
+    _toxic_session(mem, "u", sentiment="resonant")
+    assert mem.stats["pins_resonated"] == 1
+
+
+def test_pin_fact_missing_returns_false():
+    mem = MemoryStore()
+    assert mem.pin_fact("ghost") is False
+
+
+def test_encode_salience_round_trips(tmp_path):
+    mem = MemoryStore(db_path=str(tmp_path / "m.db"))
+    f = mem.add_fact("failover", "requires", "manual step X")
+    mem.pin_fact(f.fact_id)
+    mem2 = MemoryStore(db_path=str(tmp_path / "m.db"))
+    assert mem2._facts[f.fact_id].encode_salience == 1.0

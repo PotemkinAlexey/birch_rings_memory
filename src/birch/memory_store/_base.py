@@ -178,6 +178,14 @@ class MemoryStore(
         # Process-life set of fact_ids that salience (irreplaceability) kept
         # from disuse-absorption at least once. Surfaced as a count in stats.
         self._salience_retained_ids: set[str] = set()
+        # Encoding-salience (declarative pin) telemetry — the metric that earns
+        # the channel the right to exist: every fact ever pinned, those that
+        # later rode a resonant session (declaration predicted criticality),
+        # and budget evictions. A near-zero resonated:created ratio over real
+        # traffic = people pin noise → bury the channel.
+        self._ever_pinned_ids: set[str] = set()
+        self._pins_resonated_ids: set[str] = set()
+        self._pins_evicted: int = 0
 
     # ── Cross-process cache coherence ────────────────────────────────────────
 
