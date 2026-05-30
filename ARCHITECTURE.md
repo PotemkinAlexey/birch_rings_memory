@@ -307,7 +307,29 @@ Thresholds:
 - `R < -0.15` → toxic
 - in between → neutral
 
-R is propagated to all facts accessed during the session via
+### Confidence and the damped step
+
+`compute_resonance` also returns a `confidence` ∈ `[0, 1]`:
+
+```
+agreement     = |Σ contributions| / Σ|contributions|     # signs pull together?
+participation = 1 / Σ pᵢ²   (pᵢ = |cᵢ| / Σ|c|)            # how many signals vote?
+corroboration = min(1, 0.75 + 0.25 · (participation − 1)) # lone signal → 0.75, two → 1.0
+confidence    = agreement × corroboration
+```
+
+`agreement` falls when signals conflict (behavioral toxic vs semantic
+productive); `corroboration` falls when a single signal carries the verdict
+with the others silent (a lone signal trivially "agrees" with itself, so
+`agreement` alone can't see it). Gravity is then moved by
+`effective_r = R · confidence`, not raw `R` — a conflicted or single-signal
+session barely nudges gravity, keeping a noisy self-derived signal from
+compounding through the loop. `effective_r` is what flows into
+`apply_session_resonance`, the `recent_utility` EWMA, the weight-training
+target, and the echo prior; raw `r` / `label` are reported unchanged.
+`sentiment` / `r_override` closes carry `confidence = 1.0` (explicit signal).
+
+R (as `effective_r`) is propagated to all facts accessed during the session via
 `apply_session_resonance()`, which updates `resonance_sum` and
 `resonance_count`.
 
@@ -331,6 +353,32 @@ low-similarity matches: a fact at cosine 0.10 contributes 10× less to
 `resonance_count` by 1. Legacy callers that pass a flat `list[fact_id]`
 still work — every weight defaults to 1.0.
 
+### Contrastive attribution (outlier-robust)
+
+Cosine weight is *topical* relevance, not *causal* responsibility: a useful
+fact retrieved at high similarity into a session that failed for unrelated
+reasons would absorb a large negative `R × w`. Before applying the impulse,
+`contrastive_impulse(fact, R, w)` anchors it on the fact's own history:
+
+```
+base = R × w
+if resonance_count == 0 or R == 0:        return base      # no history → full
+if sign(avg_resonance) == sign(R):        return base      # confirms history → full
+trust = resonance_count / (resonance_count + K)            # K = BIRCH_CONTRAST_K, default 5
+return base × (1 − trust)                                  # contradicts → shrunk
+```
+
+A new fact takes the full hit; a fact with a long resonant track record resists
+a single incidental toxic session (and a consistently-toxic fact is not redeemed
+by one stray resonant session — symmetric). Bounded: it only ever shrinks a
+*contradicting* impulse, never amplifies, and is **inert** when a fact's session
+signs are consistent (so it leaves the common case untouched — the drift
+detector's utility correlation is bit-identical with it on and off). The engine
+counts `contrastive_attenuations`; `K ≤ 0` disables it. This is the
+outlier-robust increment of contrastive attribution; the fuller
+population-baseline discriminative direction (down-weighting facts present in
+every session equally) is future work.
+
 ---
 
 ## Echo validation
@@ -348,30 +396,52 @@ EchoStore
                   echo_penalty:  float
 ```
 
-### Detection
+### Detection — deferred and outcome-gated
 
-When a new session opens, `check_echo(first_message)` computes:
+Echo is split into a read-only **peek** at open and an **apply** at close.
+`similarity = max cosine(new_vector, centroid)` over the matched bundle.
 
 ```
-similarity = max cosine(new_vector, centroid)   for each centroid in bundle
+session_open(first_message):                       # peek_echo — read-only
+    if similarity ≥ 0.68: arm pending marker on the session context
+    apply nothing, mutate no gravity
+
+session_close:                                     # decide on this session's outcome
+    if no pending marker:        echo_outcome = none
+    elif label == resonant:      cancel    (productive revisit) ; cancelled++
+    else (neutral / toxic):      apply_echo(matched, scale = severity)
 ```
 
-If `similarity ≥ 0.68`:
-- Past session seemed resonant (`r_score > 0.35`): `penalty = -0.8`
-- Past session was already weak: `penalty = -0.6`
-- New `r_score = min(-0.2, max(-1.0, old_r + penalty))`
+Returning to a topic is not by itself evidence of false closure — the evidence
+is whether *this* session also failed. So nothing is applied until close, gated
+on the current outcome. The penalty magnitude is evidence-proportional and
+continuous:
+
+```
+base    = 0.6 + 0.2 · clamp(prior_r, 0, 1)         # 0.6 → 0.8, no step at 0.35
+penalty = −base · clamp(1 − prior_r, 0, 1) · scale
+severity = clamp((0.35 − effective_r) / 1.35, 0, 1)  # neutral return < toxic return
+new r_score = clamp(old_r + penalty, −1, 1)          # no forced toxic floor
+```
+
+A revisit to a strongly-resonant prior is barely penalised (ambiguous — likely
+continued use); a weak/toxic prior takes the full hit. There is **no** forced
+toxic floor (the old `min(-0.2, …)` is gone) and no step at `prior_r = 0.35`.
 
 The penalty is **retroactive and idempotent**:
 
 - `EchoStore` records `echo_penalty` per matched session and refuses to
   stack a second hit on the same session.
-- `MemoryStore.check_echo` calls `apply_session_resonance(fact_weights, R')`
-  with the *delta* between new and old `r_score`, so the past session's
-  facts absorb the correction exactly once, weighted by how relevant each
-  fact was to that session.
+- `apply_echo` mutates the matched session's `r_score`; `MemoryStore` then
+  calls `apply_session_resonance(fact_weights, penalty)` so the past session's
+  facts absorb the correction once, weighted by relevance (and passing through
+  the same contrastive-attribution guard as any other impulse).
 
-Facts that looked good because the user appeared satisfied now get a
-negative signal scaled by their actual involvement.
+The explicit `check_echo` MCP tool and the one-shot `record_session` keep the
+**immediate** peek+apply path (`detect_echo`) — they have no future outcome to
+wait for. Facts that looked good because the user appeared satisfied, but whose
+topic genuinely came back unresolved, get a negative signal scaled by their
+actual involvement.
 
 **Idempotency is per-stored-session, not per-recurrence.** A given
 StoredSession can receive an echo penalty at most once. If the user

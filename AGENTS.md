@@ -241,6 +241,23 @@ it into the singularity on the next tick — no tool call needed.
 
 ## Session scoring
 
+### Reading a session_close response
+
+`session_close` returns the raw `label` / `r_score` (heuristic read) plus:
+
+| Field | Meaning |
+|---|---|
+| `scoring_source` | `heuristic` / `sentiment` / `r_override` — which path resolved R |
+| `confidence` | `[0, 1]` agreement+breadth of the three signals; 1.0 for `sentiment`/`r_override` |
+| `effective_r` | `r_score · confidence` — the value that actually moved gravity (≤ \|r_score\|) |
+| `echo_outcome` | `none` / `applied` / `cancelled` / `noop` — how a pending echo resolved |
+
+If `confidence` is low, the signals disagreed or one lone signal carried the
+verdict; gravity moved only weakly on purpose. When you *know* the outcome but
+the message text would mislead the heuristic (a curt or grumpy-sounding summary
+of a successful session), close with `sentiment=` (`resonant`/`neutral`/`toxic`)
+or `r_override=` — those bypass the heuristic and carry full confidence.
+
 ### record_session
 
 Pass **all user messages** from the session in order. Do not include your own
@@ -265,15 +282,30 @@ pattern means the memory itself may be misleading you.
 
 ## Echo signal
 
-The system detects when a user returns to an unresolved problem. Echo is
-checked at `check_echo` time and also implicitly whenever a new session
-opens on a topic close to a closed one (`similarity ≥ 0.68`). On a hit:
+The system detects when a user returns to a past topic *and the return also
+fails*. Echo is **deferred and outcome-gated** — opening a session on a topic
+close to a closed one (`similarity ≥ 0.68`) does **not** penalise anything; it
+only arms a pending marker. The decision is taken at `session_close`:
 
-- The matched past session's R score is pulled into toxic territory.
-- The retroactive penalty is propagated to the gravity of every fact that
-  past session touched, scaled by each fact's per-session relevance weight.
-- The store records that the penalty was applied, so a second echo on the
-  same matched session does not stack penalties.
+- This session ends **resonant** → the revisit was productive (you kept using
+  what worked) → the echo is **cancelled**, nothing is penalised. Surfaced as
+  `echo_outcome: "cancelled"` and counted in `stats.total_echoes_cancelled`.
+- This session ends **neutral / toxic** → a real return-to-failure → the
+  retroactive penalty is **applied** to the gravity of every fact the matched
+  past session touched (scaled by each fact's relevance weight, and by this
+  session's severity — a neutral return penalises less than a toxic one).
+  Surfaced as `echo_outcome: "applied"`.
+
+The penalty magnitude is evidence-proportional (`base · clamp(1 − prior_r, 0, 1)`):
+a revisit to a strongly-resonant past topic is barely penalised (ambiguous —
+likely continued use), a weak/toxic prior takes the full hit. There is no
+forced toxic floor. A matched session is penalised at most once (idempotent).
+
+`session_open(first_message=...)` reports the armed marker under `echo.pending`
+and `echo.matched_session`; the realised decision shows up in
+`session_close`'s `echo_outcome`. The explicit `check_echo` tool and the
+one-shot `record_session` keep **immediate** (apply-on-detect) semantics —
+they have no future outcome to wait for.
 
 When `record_session` returns a `toxic` label on a topic you have seen before,
 treat it as an echo:

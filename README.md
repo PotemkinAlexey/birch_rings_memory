@@ -53,15 +53,46 @@ The combined **R score** lives in `[-1.0, +1.0]`:
 - `R < -0.15` → toxic — facts used get a gravity penalty
 - in between → neutral
 
-### Echo validation (delayed signal)
+**Confidence-damped gravity step.** R is also emitted with a **confidence** in
+`[0, 1]` — how much the three signals agree *and* how broad the base is. It is
+`agreement × corroboration`, where `agreement = |Σ contributions| / Σ|contributions|`
+(1.0 when the signals pull the same way, → 0 as they cancel) and `corroboration`
+rises with the participation ratio of the voting signals (a lone signal floors
+at 0.75; a second balanced signal lifts it to 1.0). Gravity then moves by
+`effective_r = R · confidence`, not raw R — so a session where behavioral reads
+toxic on grumpy tech vocabulary while the semantic trajectory reads productive
+(low agreement), or where one lone regex match carries the verdict (low
+corroboration), barely nudges gravity instead of confidently mislabelling. This
+keeps a noisy self-derived signal from compounding through the feedback loop.
+Explicit caller signals (`sentiment` / `r_override`) carry confidence 1.0.
+`session_close` reports `confidence` and `effective_r` alongside the raw `r`.
+
+### Echo validation (deferred, outcome-gated)
 
 Each closed session is stored as a **K-means bundle** of centroids (not a
 single vector) — so multi-topic sessions don't lose sub-topic structure.
 
-When a new session opens, BirchKM checks: does this look like returning to an
-unresolved problem? If `similarity ≥ 0.68` to any centroid in a past session,
-an **echo penalty** is applied retroactively — the past session's R score drops
-into toxic territory, pulling down the gravity of facts it used.
+When a new session opens with a `first_message`, BirchKM checks: does this look
+like returning to a past topic? If `similarity ≥ 0.68` to any centroid in a
+past session, it **arms a pending echo marker** — but applies *nothing* yet.
+Returning to a topic is not, by itself, evidence the past closure was false; the
+evidence is whether *this* conversation also ends badly. So the decision waits
+for `session_close`:
+
+- this session ends **resonant** → the revisit was productive (continued use /
+  a fix that stuck) → **cancel**, no penalty (tracked as `total_echoes_cancelled`);
+- this session ends **neutral / toxic** → a genuine return-to-failure → **apply**
+  the retroactive penalty to the matched past session's facts, scaled by this
+  session's severity (a neutral return penalises less than a toxic one).
+
+This replaces the old apply-on-open behaviour, which guessed "returned ⇒
+unresolved" and penalised immediately — firing on continued use as often as on
+real false closure. The penalty **magnitude** is itself evidence-proportional:
+`base · clamp(1 − prior_r, 0, 1)`, so a revisit to a *strongly resonant* past
+topic (ambiguous) is barely penalised while a weak/toxic prior takes the full
+hit. There is no forced toxic floor — the score lands where the evidence puts
+it. The one-shot `record_session` and the explicit `check_echo` tool keep
+immediate (apply-now) semantics, since they have no future outcome to wait for.
 
 ### Gravity engine
 
@@ -81,6 +112,23 @@ fact returned by `query_memory` at cosine 0.95 absorbs almost the full
 session R, one returned at 0.10 almost none; facts added or re-confirmed
 via `record_fact` are pinned at weight 1.0. Resonance contributes 0 until a
 session has actually scored the fact.
+
+**Contrastive attribution.** Cosine relevance is *topical*, not *causal*: a
+genuinely useful fact retrieved at high similarity into a session that failed
+for unrelated reasons would absorb a large negative hit just for being
+on-topic. So each session's impulse is anchored on the fact's own resonance
+history — its discriminative signal (does it ride resonant or toxic sessions on
+net). A session whose outcome **contradicts** that established history is
+attenuated in proportion to how established the fact is (`trust = n/(n+K)`,
+`K = BIRCH_CONTRAST_K`, default 5): a new fact takes the full hit, a fact with a
+long resonant track record resists a single incidental toxic session, and a
+confirming session always applies in full so real shifts are still learned.
+Symmetric — a consistently-toxic fact is not redeemed by one stray resonant
+session — and bounded: it only ever shrinks a contradicting impulse, never
+amplifies. The rule is **inert** on sign-consistent history (it changes nothing
+when a fact's sessions agree), so it cannot distort the common case; `stats`
+exposes `contrastive_attenuations` to show how often it actually fires.
+Set `BIRCH_CONTRAST_K=0` to disable.
 
 **`recent_utility`** is an EWMA of closure-weighted resonance updated for
 every fact a session touched: `(1-α)·prev + α·target` with α=0.15 and

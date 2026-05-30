@@ -4,6 +4,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html);
 sub-1.0 minors can include behavioural changes.
 
+## [Unreleased]
+
+Resonance feedback loop made evidence-gated and self-damping, so a noisy,
+self-derived R cannot compound through the loop.
+
+### Added
+- **Confidence-damped gravity step.** `compute_resonance` now emits a
+  `confidence` in `[0, 1]` (`agreement × corroboration`: do the three signals
+  pull the same way, and is the verdict backed by more than one signal).
+  Gravity moves by `effective_r = R · confidence`, so conflicting or
+  single-signal sessions barely nudge gravity. `session_close` reports
+  `confidence` and `effective_r` (raw `r` / `label` unchanged for transparency).
+- **Contrastive / outlier-robust attribution.** A session impulse that
+  contradicts a fact's established resonance history is attenuated in
+  proportion to how established the fact is (`trust = n/(n+K)`,
+  `K = BIRCH_CONTRAST_K`, default 5) — so a useful fact is not sunk for being
+  incidentally on-topic in a session that failed for unrelated reasons. Inert
+  on sign-consistent history; bounded (only shrinks, never amplifies). New
+  `stats.contrastive_attenuations` counter.
+- **Adversarial drift detector** (`tests/test_gravity_drift.py`) — synthetic
+  facts with fixed ground-truth utility (shuffled vs creation order); asserts
+  final gravity correlates with utility, not appearance order. Runs against
+  real Ollama when reachable, mock otherwise (`embed_provider` fixture).
+- `session_close` / `memory_stats` surface `total_echoes_cancelled` and
+  `contrastive_attenuations`; `session_close` surfaces `confidence`,
+  `effective_r`, `echo_outcome`.
+
+### Changed
+- **Echo is now deferred and outcome-gated.** `session_open(first_message=...)`
+  arms a *pending* echo marker instead of applying a penalty immediately; the
+  decision is taken at `session_close` against the current session's outcome —
+  resonant ⇒ cancel (productive revisit), non-resonant ⇒ apply. The applied
+  penalty is scaled by the current session's severity (a neutral return
+  penalises less than a toxic one). The explicit `check_echo` tool and the
+  one-shot `record_session` keep immediate apply-on-detect semantics.
+- **Echo penalty magnitude is evidence-proportional and continuous.**
+  `base · clamp(1 − prior_r, 0, 1)` with `base` ramping 0.6→0.8 over `prior_r`
+  — a revisit to a strongly-resonant prior is barely penalised; a weak/toxic
+  prior takes the full hit. Removed the forced toxic floor (`min(-0.2, …)`) and
+  the hard step at `prior_r = 0.35` that penalised a marginally-better session
+  harder than a marginally-worse one.
+
+### Configuration
+- `BIRCH_CONTRAST_K` (default `5.0`) — agreeing-history a fact needs to earn
+  ~50% protection from a contradicting session; `<= 0` disables contrastive
+  attribution.
+
 ## [0.3.0] — 2026-05-25
 
 First tagged release. The project predates this tag — 118 commits of

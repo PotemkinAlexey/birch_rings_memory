@@ -338,10 +338,13 @@ confidence.
 
 **Mitigations the architecture already provides:**
 
-1. **Echo retroactive penalty** (Birch). If the user returns to the
-   same topic unresolved, the past session's R is pulled into toxic
-   territory and the penalty propagates to the facts that misled it.
-   The wrong-port fact's gravity drops. Already in production.
+1. **Echo retroactive penalty** (Birch), deferred and outcome-gated. If
+   the user returns to the same topic *and that return also fails*, the
+   past session's R is penalised and the correction propagates to the
+   facts that misled it — the wrong-port fact's gravity drops. A
+   *productive* revisit (the return resonates) is recognised as continued
+   use and the penalty is cancelled instead, so the fact is not punished
+   for being reused. Already in production.
 
 2. **Contradiction detection** (Birch `conflicts` hint in
    `query_memory`). When two facts share `(subject, predicate)` with
