@@ -236,6 +236,39 @@ def test_hawking_removes_fact_from_singularity_and_persists():
     assert mem._hole.total_emissions == 1
 
 
+def test_hawking_does_not_resurrect_a_live_spo_duplicate():
+    """If a newer fact took the SPO slot while the old one sat in the black
+    hole, Hawking must NOT resurrect the old one as a second live fact for the
+    same (namespace, S, P, O) — that would leave two live duplicates while
+    _spo_index points at only one."""
+    mem = MemoryStore()
+    text = "widget made of steel"
+    old = mem.add_fact("widget", "made of", "steel")
+    old.gravity_score = 0.05
+    mem._absorb_dead()
+    assert old.fact_id not in mem._facts, "old fact should be in the singularity"
+
+    # A newer fact claims the same SPO slot while the old one is gone.
+    new = mem.add_fact("widget", "made of", "steel")
+    assert new.fact_id != old.fact_id
+    key = mem._normalize_spo("widget", "made of", "steel", "")
+
+    # A query that would Hawking-match the old fact at cosine 1.0.
+    mem.query(text, top_k=5, hawking=True)
+
+    live_with_spo = [
+        fid for fid, f in mem._facts.items()
+        if not f.is_deprecated
+        and (f.subject, f.predicate, f.object, f.namespace)
+        == ("widget", "made of", "steel", "")
+    ]
+    assert live_with_spo == [new.fact_id], (
+        f"exactly one live fact must hold the SPO slot, got {live_with_spo}"
+    )
+    assert mem._spo_index[key] == new.fact_id
+    assert old.fact_id not in mem._facts, "blocked old fact must stay in the hole"
+
+
 def test_query_attributes_facts_to_active_session():
     """Fix #1: facts returned by query() must inherit the session's resonance."""
     mem = MemoryStore()

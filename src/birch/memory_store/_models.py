@@ -63,6 +63,8 @@ class QueryResult:
                 "summary": m.summary or "",
                 "layer": m.layer,
                 "gravity_score": round(m.gravity_score, 3),
+                # MemoryBricks scope — same SPO can live in several namespaces.
+                "namespace": m.namespace or "",
             })
             return base
         if self.fact is not None:
@@ -74,6 +76,9 @@ class QueryResult:
                 "object": f.object,
                 "layer": f.layer,
                 "gravity_score": round(f.gravity_score, 3),
+                # MemoryBricks scope — lets a consumer tell apart the same SPO
+                # retrieved from different namespaces.
+                "namespace": f.namespace or "",
             })
             return base
         return base

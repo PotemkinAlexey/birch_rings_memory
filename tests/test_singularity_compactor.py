@@ -142,6 +142,31 @@ def test_existing_metafacts_are_not_re_collapsed():
     assert "pre" in hole
 
 
+def _absorb_ns(hole, fact_id, vector, namespace):
+    f = FactPassport(subject="api", predicate="runs on", object="Go",
+                     fact_id=fact_id, namespace=namespace)
+    f.vector = vector
+    hole.absorb(f)
+    return f
+
+
+def test_collapse_partitions_by_namespace_and_meta_inherits_it():
+    """MemoryBricks: same-SPO facts from different namespaces have near-identical
+    vectors but must NOT merge into one MetaFact. Each namespace collapses on its
+    own and the MetaFact inherits the group's namespace (never the global root)."""
+    hole = BlackHole()
+    _absorb_ns(hole, "work-1", [1.0, 0.0], "WORK/A")
+    _absorb_ns(hole, "work-2", [0.99, 0.01], "WORK/A")
+    _absorb_ns(hole, "pers-1", [1.0, 0.0], "PERSONAL")
+    _absorb_ns(hole, "pers-2", [0.995, 0.005], "PERSONAL")
+
+    new_metas, _ = collapse_singularity(hole, threshold=0.95)
+
+    assert len(new_metas) == 2, "namespaces must collapse independently"
+    assert {m.namespace for m in new_metas} == {"WORK/A", "PERSONAL"}
+    assert "" not in {m.namespace for m in new_metas}
+
+
 def test_collapse_skips_empty_vectors():
     hole = BlackHole()
     _absorb_with_vector(hole, "a", [1.0, 0.0])

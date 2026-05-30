@@ -129,17 +129,20 @@ def collapse_singularity(
     # Snapshot vectors aligned with fact_ids so similarity can be computed
     # in one matmul. Skip facts with empty vectors — they can't be grouped.
     #
-    # Partition by vector dimension: an embedding-model swap can leave the
-    # singularity with rows from multiple models. numpy would either raise
-    # on a ragged input or, worse, build an object-dtype array silently.
-    # Each dim-group collapses independently — old-model bodies still
-    # compact among themselves, new-model bodies among themselves.
-    dim_groups: dict[int, list[str]] = {}
+    # Partition by (vector dimension, namespace):
+    #  - dimension: an embedding-model swap can leave rows from multiple models;
+    #    numpy would raise on ragged input or silently build object dtype.
+    #  - namespace: MemoryBricks scoping — same-SPO facts from WORK/A and
+    #    PERSONAL have near-identical vectors and would otherwise merge into one
+    #    MetaFact, mixing scopes and losing the namespace. Each partition
+    #    collapses independently and its MetaFact inherits the shared namespace.
+    dim_groups: dict[tuple[int, str], list[str]] = {}
     for fid in fact_ids:
         rec = hole._singularity.get(fid)
         if rec is None or not rec.fact.vector:
             continue
-        dim_groups.setdefault(len(rec.fact.vector), []).append(fid)
+        partition = (len(rec.fact.vector), rec.fact.namespace or "")
+        dim_groups.setdefault(partition, []).append(fid)
 
     valid_ids_all = sum(dim_groups.values(), [])
     if len(valid_ids_all) < min_group_size:
@@ -154,7 +157,7 @@ def collapse_singularity(
 
     # Collect Union-Find roots across all dim groups.
     uf = _UnionFind(valid_ids_all)
-    for _dim, group_ids in dim_groups.items():
+    for _partition, group_ids in dim_groups.items():
         if len(group_ids) < min_group_size:
             continue
         group_vecs = [
@@ -195,6 +198,9 @@ def collapse_singularity(
             weight=len(records),
             source_texts=source_texts,
             source_fact_ids=source_fact_ids,
+            # Union-Find only merges within a (dim, namespace) partition, so the
+            # group is namespace-homogeneous — inherit it from any member.
+            namespace=records[0].fact.namespace or "",
         )
 
         # Drop the originals from the singularity and its dim-bucket

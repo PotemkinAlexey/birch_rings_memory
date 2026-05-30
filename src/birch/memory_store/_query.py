@@ -589,9 +589,24 @@ class QueryMixin:
                     # Commit: actually emit ONLY the Hawking survivors. Bodies
                     # that fell out of top_k stay in the singularity, untouched.
                     if hawking:
+                        def _spo_slot_held_by_other_live(f) -> bool:
+                            # A newer fact may have taken this (namespace,S,P,O)
+                            # while ``f`` sat in the singularity. Resurrecting f
+                            # would put two live facts in one SPO bucket while
+                            # _spo_index points at only one — broken dedup. Block
+                            # the emission; the live occupant stays canonical and
+                            # f stays in the hole.
+                            key = self._normalize_spo(
+                                f.subject, f.predicate, f.object, f.namespace)
+                            occ = self._spo_index.get(key)
+                            return (occ is not None and occ != f.fact_id
+                                    and occ in self._facts
+                                    and not self._facts[occ].is_deprecated)
+
                         hawking_survivor_fact_ids = {
                             r.fact.fact_id for r in top
                             if r.source == "hawking" and r.fact is not None
+                            and not _spo_slot_held_by_other_live(r.fact)
                         }
                         hawking_survivor_meta_ids = {
                             r.meta.meta_id for r in top

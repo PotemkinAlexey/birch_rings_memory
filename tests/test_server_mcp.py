@@ -53,3 +53,30 @@ def test_query_result_meta_payload():
     assert d["source"] == "hawking_meta"
     assert "subject" not in d
     assert "fact_id" not in d
+
+
+def test_query_result_fact_payload_carries_namespace():
+    """MemoryBricks: the MCP payload must expose namespace so a consumer can
+    tell apart the same SPO retrieved from different scopes."""
+    f = FactPassport(
+        fact_id="f-ns", subject="api", predicate="runs on", object="Go",
+        layer=1, gravity_score=0.55, namespace="WORK/A",
+    )
+    d = QueryResult(similarity=0.9, source="kinetic", fact=f).to_mcp_dict()
+    assert d["namespace"] == "WORK/A"
+
+
+def test_query_result_meta_payload_carries_namespace():
+    m = MetaFact(
+        meta_id="m-ns", weight=2, source_texts=["a is b"],
+        source_fact_ids=["x"], summary="hint", layer=-1,
+        gravity_score=0.3, namespace="PERSONAL",
+    )
+    d = QueryResult(similarity=0.9, source="hawking_meta", meta=m).to_mcp_dict()
+    assert d["namespace"] == "PERSONAL"
+
+
+def test_query_result_global_namespace_is_empty_string():
+    f = FactPassport(fact_id="f-g", subject="a", predicate="p", object="o")
+    d = QueryResult(similarity=0.5, source="kinetic", fact=f).to_mcp_dict()
+    assert d["namespace"] == ""
