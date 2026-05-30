@@ -52,6 +52,29 @@ self-derived R cannot compound through the loop.
   the hard step at `prior_r = 0.35` that penalised a marginally-better session
   harder than a marginally-worse one.
 
+### Fixed
+- **`record_session` is now outcome-gated too.** It received the whole
+  conversation up front but still applied echo immediately (via `check_echo`)
+  before scoring it — so a productive one-shot revisit could penalise the past
+  session. It now `peek_echo`s and lets the close decide, consistent with the
+  streaming path. Only the explicit `check_echo` tool stays apply-now.
+- **Echo cancellation keyed on `effective_r`, not the raw label.** A
+  barely-resonant session that confidence damping reduced to ~neutral (e.g.
+  raw 0.36, confidence 0.05 → effective_r ≈ 0.02) used to cancel a pending echo
+  as "resonant". Cancellation now requires `effective_r > 0.35`; the ambiguous
+  middle falls through to apply, where severity (also from effective_r) keeps
+  the penalty tiny — consistent across the whole spectrum.
+- **`query_memory` backfill now honours `namespace_prefix`.** The
+  post-revalidation backfill path applied layer/gravity/subject/similarity
+  filters but not the namespace scope, so a rare post-race backfill could leak
+  cross-namespace facts — breaking MemoryBricks "reputation scoped, not global".
+- **MCP error-contract tests bound to the real server.** `test_mcp_contract.py`
+  replicated validators inline and had silently drifted (asserted `invalid_top_k`
+  while the server returns `invalid_int`; find_similar / list_facts mirrors
+  drifted too). New `test_server_contract.py` calls the real `birch.server` tool
+  functions and pins the envelopes they actually return; the inline file is
+  trimmed to exception-path shape pins plus the source-token guard.
+
 ### Configuration
 - `BIRCH_CONTRAST_K` (default `5.0`) — agreeing-history a fact needs to earn
   ~50% protection from a contradicting session; `<= 0` disables contrastive

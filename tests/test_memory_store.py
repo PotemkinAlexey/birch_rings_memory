@@ -90,9 +90,11 @@ def test_deferred_echo_pending_marker_set_at_open_not_applied():
     assert mem._sessions["cur"].pending_echo is not None
 
 
-def test_deferred_echo_cancelled_when_revisit_resonates():
-    """A productive revisit (session ends resonant) cancels the pending echo —
-    the exact false positive the old apply-on-open path produced."""
+def test_deferred_echo_cancelled_when_revisit_confidently_resonates():
+    """A confidently resonant revisit cancels the pending echo — the exact
+    false positive the old apply-on-open path produced. Closed via
+    sentiment='resonant' so effective_r (0.7, confidence 1.0) is unambiguously
+    above the cancel threshold."""
     mem = MemoryStore()
     f = _close_past_with_fact(mem)
     applied_before = mem._echo.total_echoes_applied
@@ -102,14 +104,39 @@ def test_deferred_echo_cancelled_when_revisit_resonates():
     mem.session_start("cur")
     mem.peek_echo(
         "the deploy pipeline keeps failing on migrations", session_id="cur")
-    mem.session_message("perfect, that fixed it, thanks!", session_id="cur")
-    summary = mem.session_close("cur")
+    mem.session_message("still on the same topic", session_id="cur")
+    summary = mem.session_close("cur", sentiment="resonant")
 
-    assert summary["label"] == "resonant"
     assert summary["echo_outcome"] == "cancelled"
     assert mem._echo.total_echoes_applied == applied_before, "no penalty on cancel"
     assert mem._echo.total_echoes_cancelled == cancelled_before + 1
     assert f.resonance_sum == rsum_before, "past fact must be untouched on cancel"
+
+
+def test_deferred_echo_not_cancelled_when_resonant_but_low_confidence():
+    """P1b: cancellation is keyed on effective_r, not the raw label. A single
+    'thanks, fixed it' close scores a raw 'resonant' label, but confidence
+    damping pulls effective_r below the 0.35 cancel threshold — so it must NOT
+    cancel. It falls through to apply, where severity (also from effective_r)
+    keeps the penalty tiny. A noisy near-neutral outcome can't masquerade as a
+    confident productive revisit."""
+    mem = MemoryStore()
+    _close_past_with_fact(mem)
+    cancelled_before = mem._echo.total_echoes_cancelled
+
+    mem.session_start("cur")
+    mem.peek_echo(
+        "the deploy pipeline keeps failing on migrations", session_id="cur")
+    mem.session_message("perfect, that fixed it, thanks!", session_id="cur")
+    summary = mem.session_close("cur")
+
+    assert summary["label"] == "resonant", "raw label should still read resonant"
+    assert summary["effective_r"] <= 0.35, (
+        f"confidence should have damped it below the cancel threshold, "
+        f"got {summary['effective_r']}"
+    )
+    assert summary["echo_outcome"] != "cancelled", "low-confidence must not cancel"
+    assert mem._echo.total_echoes_cancelled == cancelled_before
 
 
 def _close_resonant_past_with_fact(mem):

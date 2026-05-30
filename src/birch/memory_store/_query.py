@@ -478,6 +478,14 @@ class QueryMixin:
                                 continue
                             if prefix and not fact.subject.lower().startswith(prefix):
                                 continue
+                            # MemoryBricks scoping: the backfill path must honour
+                            # namespace_prefix exactly like the primary scan and
+                            # revalidation above — otherwise a post-race backfill
+                            # leaks cross-namespace facts, breaking "reputation
+                            # scoped, not global".
+                            if namespace_prefix is not None and not ns_match(
+                                    fact.namespace or "", namespace_prefix):
+                                continue
                             if sim < min_similarity:
                                 continue
                             backfill_candidates.append(QueryResult(
@@ -502,6 +510,10 @@ class QueryMixin:
                             if prefix and not any(
                                     (st or "").lower().startswith(prefix)
                                     for st in meta.source_texts):
+                                continue
+                            # Same namespace scoping as the fact backfill above.
+                            if namespace_prefix is not None and not ns_match(
+                                    meta.namespace or "", namespace_prefix):
                                 continue
                             if sim < min_similarity:
                                 continue

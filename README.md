@@ -91,8 +91,10 @@ real false closure. The penalty **magnitude** is itself evidence-proportional:
 `base · clamp(1 − prior_r, 0, 1)`, so a revisit to a *strongly resonant* past
 topic (ambiguous) is barely penalised while a weak/toxic prior takes the full
 hit. There is no forced toxic floor — the score lands where the evidence puts
-it. The one-shot `record_session` and the explicit `check_echo` tool keep
-immediate (apply-now) semantics, since they have no future outcome to wait for.
+it. The one-shot `record_session` is also outcome-gated — it receives the whole
+conversation up front, so it peeks at open and lets the close decide, just like
+the streaming path. Only the explicit `check_echo` tool keeps immediate
+(apply-now) semantics, for callers that deliberately want a detect-and-apply now.
 
 ### Gravity engine
 

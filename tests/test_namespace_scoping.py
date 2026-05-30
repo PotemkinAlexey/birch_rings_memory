@@ -411,3 +411,43 @@ def test_mcp_set_fact_scoped_does_not_supersede_other_namespace(tmp_path):
         row.get("object") == "Postgres" and row.get("namespace") == "WORK/B"
         for row in rows_b
     )
+
+
+def test_namespace_prefix_holds_through_backfill_after_race(tmp_path):
+    """P2a: the post-revalidation backfill path must honour namespace_prefix
+    too. We force the backfill branch by deprecating the in-scope top hit
+    during query()'s in-txn _sync (single-process surrogate for a race), so
+    revalidation drops it and backfill re-runs the live search. A similar fact
+    in a DIFFERENT namespace must NOT leak in — reputation stays scoped."""
+    s = MemoryStore(db_path=str(tmp_path / "ns.db"))
+    in_scope = s.add_fact("alpha service", "runs on", "Go", namespace="WORK")
+    out_of_scope = s.add_fact(
+        "alpha service", "runs on", "Rust", namespace="HOME")
+
+    original_sync = s._sync
+    call_count = {"n": 0}
+
+    def _sync_with_race():
+        original_sync()
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            # Deprecate the in-scope hit between top selection and write lock,
+            # so revalidation drops it and backfill runs.
+            repl = s.add_fact("alpha service", "runs on", "Go 1.22",
+                              namespace="WORK")
+            s._supersede_fact_locked(in_scope.fact_id, repl.fact_id)
+
+    s._sync = _sync_with_race  # type: ignore[method-assign]
+    hits = s.query("alpha service runs on", top_k=5,
+                   min_similarity=0.0, namespace_prefix="WORK")
+    s._sync = original_sync  # type: ignore[method-assign]
+
+    ids = {h.body_id for h in hits}
+    assert out_of_scope.fact_id not in ids, (
+        "backfill leaked a HOME-namespace fact into a WORK-scoped query"
+    )
+    for h in hits:
+        if h.fact is not None:
+            assert (h.fact.namespace or "").startswith("WORK"), (
+                f"out-of-scope namespace {h.fact.namespace!r} in scoped query"
+            )

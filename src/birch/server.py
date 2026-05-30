@@ -1866,15 +1866,18 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
         }
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)
-    # Symmetric with session_open(first_message=...) — if there's an
-    # opening message, run echo detection now so the retroactive penalty
-    # path can fire for this convenience entrypoint too. Without this,
-    # an agent that records a whole session in one call never benefits
-    # from echo, which is the main retroactive correction feature.
+    # Symmetric with session_open(first_message=...): PEEK the echo (arm a
+    # pending marker) on the opening message, then let session_close decide.
+    # record_session has the whole conversation up front, so its outcome IS
+    # knowable before applying any penalty — applying immediately (the old
+    # check_echo call here) would penalise a *productive* revisit just as the
+    # streaming path used to. peek_echo + close-time gating makes this
+    # entrypoint consistent: the penalty fires only if THIS session also ends
+    # non-resonant, and is cancelled otherwise.
     echo = None
     try:
         if messages:
-            echo = _store.check_echo(messages[0], session_id=session_id)
+            echo = _store.peek_echo(messages[0], session_id=session_id)
         for msg in messages:
             _store.session_message(msg, session_id=session_id)
         summary = _store.session_close(session_id=session_id)
@@ -1908,6 +1911,9 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
         "r_score": round(summary.get("r", 0.0), 3),
         "migrations": len(summary.get("migrations", [])),
         "absorbed": len(summary.get("absorbed", [])),
+        # How the peeked echo resolved against THIS session's outcome
+        # (none / applied / cancelled / noop) — same field session_close emits.
+        "echo_outcome": summary.get("echo_outcome"),
         "stats": _store.stats,
     }
     if echo is not None:

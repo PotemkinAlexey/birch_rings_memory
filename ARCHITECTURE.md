@@ -459,10 +459,13 @@ The penalty is **retroactive and idempotent**:
   facts absorb the correction once, weighted by relevance (and passing through
   the same contrastive-attribution guard as any other impulse).
 
-The explicit `check_echo` MCP tool and the one-shot `record_session` keep the
-**immediate** peek+apply path (`detect_echo`) — they have no future outcome to
-wait for. Facts that looked good because the user appeared satisfied, but whose
-topic genuinely came back unresolved, get a negative signal scaled by their
+`record_session` is outcome-gated like the streaming path — it receives the
+whole conversation up front, so it `peek_echo`s at open and lets the close
+decide (resonant ⇒ cancel, else ⇒ apply). Only the explicit `check_echo` MCP
+tool keeps the **immediate** peek+apply path (`detect_echo`), for callers that
+deliberately want detect-and-apply now. Facts that looked good because the user
+appeared satisfied, but whose topic genuinely came back unresolved, get a
+negative signal scaled by their
 actual involvement.
 
 **Idempotency is per-stored-session, not per-recurrence.** A given

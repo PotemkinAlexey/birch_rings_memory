@@ -301,11 +301,12 @@ a revisit to a strongly-resonant past topic is barely penalised (ambiguous —
 likely continued use), a weak/toxic prior takes the full hit. There is no
 forced toxic floor. A matched session is penalised at most once (idempotent).
 
-`session_open(first_message=...)` reports the armed marker under `echo.pending`
-and `echo.matched_session`; the realised decision shows up in
-`session_close`'s `echo_outcome`. The explicit `check_echo` tool and the
-one-shot `record_session` keep **immediate** (apply-on-detect) semantics —
-they have no future outcome to wait for.
+`session_open(first_message=...)` and `record_session(...)` report the armed
+marker under `echo.pending` / `echo.matched_session`; the realised decision
+shows up in `echo_outcome`. `record_session` is outcome-gated too — it gets the
+whole conversation at once, so it peeks and lets the close decide. Only the
+explicit `check_echo` tool keeps **immediate** (apply-on-detect) semantics, for
+callers that want a detect-and-apply right now.
 
 When `record_session` returns a `toxic` label on a topic you have seen before,
 treat it as an echo:

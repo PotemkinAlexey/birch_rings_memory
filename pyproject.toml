@@ -37,6 +37,13 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
+[tool.ruff.lint.per-file-ignores]
+# This module MUST set BIRCH_DB before importing birch.server (the server
+# builds its MemoryStore singleton at import time), so the server import
+# deliberately follows top-level code. E402 = import-not-at-top,
+# I001 = import-block-not-sorted; both are intentional here.
+"tests/test_server_contract.py" = ["E402", "I001"]
+
 [tool.mypy]
 files = ["src/birch"]
 python_version = "3.11"

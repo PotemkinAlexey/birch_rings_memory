@@ -637,7 +637,17 @@ class SessionsMixin:
                         echo_outcome = "none"
                         if pending_echo:
                             matched_id = pending_echo.get("matched_session_id")
-                            if result.label == "resonant":
+                            # Cancel on a CONFIDENTLY resonant outcome — keyed on
+                            # effective_r, not the raw label. A barely-resonant
+                            # session that the confidence damping reduced to
+                            # ~neutral (e.g. raw r=0.36, confidence=0.05 →
+                            # effective_r≈0.02) is NOT evidence the revisit was
+                            # productive, so it must not cancel the echo. It
+                            # falls through to the apply branch, where severity
+                            # (also from effective_r) makes the penalty tiny —
+                            # so the whole spectrum stays consistent on the same
+                            # value gravity actually saw.
+                            if effective_r > 0.35:
                                 self._echo.total_echoes_cancelled += 1
                                 echo_outcome = "cancelled"
                             elif matched_id:
