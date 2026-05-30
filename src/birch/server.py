@@ -1800,6 +1800,16 @@ def session_close(
         "migrations": len(summary.get("migrations", [])),
         "absorbed": len(summary.get("absorbed", [])),
         "scoring_source": summary.get("scoring_source"),
+        # Confidence-damping transparency (proposal #2): signal agreement in
+        # [0, 1] and the damped value (R · confidence) that actually moved
+        # gravity. r_score above is the raw heuristic read; effective_r is
+        # what gravity saw.
+        "confidence": summary.get("confidence"),
+        "effective_r": summary.get("effective_r"),
+        # Deferred-echo resolution (proposal #1): "none" | "applied" |
+        # "cancelled" | "noop". "cancelled" means a pending echo from
+        # session_open was withheld because this session ended resonant.
+        "echo_outcome": summary.get("echo_outcome"),
         "stats": _store.stats,
     }
 
