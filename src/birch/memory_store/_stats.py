@@ -75,6 +75,11 @@ class StatsMixin:
                 # cancelled:applied ratio is evidence the old apply-on-open
                 # heuristic was firing on continued use, not false closure.
                 "total_echoes_cancelled": self._echo.total_echoes_cancelled,
+                # Proposal #5: per-fact resonance impulses attenuated because
+                # they contradicted the fact's established history (outlier-
+                # robust contrastive attribution). High ⇒ topical relevance is
+                # often disagreeing with track record; the protection is active.
+                "contrastive_attenuations": self._engine.contrastive_attenuations,
                 # Diagnostics: which thresholds the process actually
                 # picked up. Operator can confirm BIRCH_* env vars
                 # took effect without reading the process environment.

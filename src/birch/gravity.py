@@ -67,6 +67,60 @@ _LAYER_DOWN = 0.30  # gravity < 0.30 → demote
 # user's actual session feedback.
 _W_RESONANCE = 0.35
 
+
+def _contrast_k() -> float:
+    """Sessions of agreeing history a fact needs to earn ~50% outlier
+    protection. Env-overridable; ``<= 0`` disables contrastive attribution
+    (every impulse applied at full strength — the pre-#5 behaviour)."""
+    import os
+    try:
+        return float(os.environ.get("BIRCH_CONTRAST_K", "5.0"))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def contrastive_impulse(
+    fact: "GravityBody", effective_r: float, weight: float,
+) -> float:
+    """Outlier-robust, prior-anchored resonance impulse (proposal #5).
+
+    The plain mechanism adds ``effective_r · weight`` to a fact's resonance
+    every session it was attributed to. That makes a fact's blame/credit
+    proportional to its *topical* relevance (cosine) — but topical relevance
+    is not causal responsibility. A genuinely useful fact that happens to be
+    retrieved into a session that failed for unrelated reasons takes a large
+    negative hit precisely because it was on-topic.
+
+    The contrast: a fact's own resonance history IS its discriminative signal
+    — does it ride resonant or toxic sessions on net. So a session whose
+    outcome *contradicts* that established history is treated as the weaker
+    evidence: it is attenuated in proportion to how well-established the fact
+    is. A fact with no history takes the full hit (we have no reason to doubt
+    the session). A fact with a long resonant track record resists a single
+    toxic session — it is not sunk for incidental co-occurrence. Symmetric:
+    a consistently-toxic fact is likewise not redeemed by one stray resonant
+    session, so misleading facts still sink. Sessions that *confirm* the
+    history apply at full strength, so a real shift in a fact's usefulness is
+    still learned — it just takes more than one contradicting session.
+
+    Bounded: only ever shrinks a contradicting impulse, never amplifies.
+    ``BIRCH_CONTRAST_K <= 0`` disables it (returns the raw impulse).
+    """
+    base = effective_r * weight
+    k = _contrast_k()
+    n = getattr(fact, "resonance_count", 0)
+    if k <= 0.0 or n <= 0 or effective_r == 0.0:
+        return base
+    prior = fact.avg_resonance
+    if prior * effective_r >= 0.0:
+        # This session agrees with (or is neutral to) the fact's history —
+        # full strength.
+        return base
+    # Contradiction. Trust the accumulated history more as it grows
+    # (saturating), and shrink this surprising impulse accordingly.
+    trust = n / (n + k)
+    return base * (1.0 - trust)
+
 # Freshness half-life — a new fact rides high and sinks as it ages
 # untouched. This is the grace period.
 _FRESHNESS_HALFLIFE_HOURS = 336.0   # ~2 weeks
@@ -212,6 +266,13 @@ class GravityEngine:
     def __init__(self, weights: AdaptiveWeights | None = None) -> None:
         self.weights = weights if weights is not None else AdaptiveWeights.from_prior()
         self._facts: dict[str, GravityBody] = {}
+        # Process-lifetime counter (proposal #5): how many per-fact session
+        # impulses the contrastive rule attenuated because they contradicted
+        # the fact's established history. Surfaced in stats — a high count
+        # means topical relevance is regularly disagreeing with track record,
+        # i.e. the protection is doing real work. Per-instance, resets on
+        # restart, same contract as the echo counters.
+        self.contrastive_attenuations = 0
         self._degrees: dict[str, int] = {}     # fact_id → graph degree
         # Track which (from, to) pairs already contributed to _degrees
         # so a repeated link() call doesn't double-count. Storage
@@ -293,11 +354,22 @@ class GravityEngine:
                     # Bad weight on one fact does not abort the whole
                     # propagation. Skip the pair, keep going.
                     continue
-                self._facts[fid].apply_resonance(r_clean * w_clean)
+                # Contrastive (proposal #5): anchor on the fact's own history
+                # so an established fact is not sunk by one incidental session
+                # whose outcome contradicts its track record.
+                body = self._facts[fid]
+                impulse = contrastive_impulse(body, r_clean, w_clean)
+                if impulse != r_clean * w_clean:
+                    self.contrastive_attenuations += 1
+                body.apply_resonance(impulse)
         else:
             for fid in facts:
                 if fid in self._facts:
-                    self._facts[fid].apply_resonance(r_clean)
+                    body = self._facts[fid]
+                    impulse = contrastive_impulse(body, r_clean, 1.0)
+                    if impulse != r_clean:
+                        self.contrastive_attenuations += 1
+                    body.apply_resonance(impulse)
 
     def tick(self, now: float | None = None) -> list[tuple[str, int]]:
         """Recompute gravity for all facts using the engine's adaptive weights.
