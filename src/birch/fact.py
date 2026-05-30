@@ -161,6 +161,14 @@ class FactPassport:
             self.resonance_count, 0,
         )
         self.raw_resonance_sum = _sanitize_float(self.raw_resonance_sum, 0.0)
+        # Count invariant: every impulse ∈ [-1, 1], so |sum| ≤ count for both
+        # accumulators. A corrupted external row (sum far outside that) would
+        # otherwise skew avg_resonance → trust → gravity. Clamp to the
+        # count-bound — the read-side completion of the storage symmetry. A
+        # no-op for legitimate data, which always satisfies the bound.
+        _bound = float(self.resonance_count)
+        self.resonance_sum = max(-_bound, min(_bound, self.resonance_sum))
+        self.raw_resonance_sum = max(-_bound, min(_bound, self.raw_resonance_sum))
         self.encode_salience = _sanitize_float(
             self.encode_salience, 0.0, lo=0.0, hi=1.0,
         )

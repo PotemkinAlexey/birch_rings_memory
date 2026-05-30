@@ -98,6 +98,12 @@ class MetaFact:
         self.resonance_sum = _f(self.resonance_sum, 0.0)
         self.resonance_count = _i(self.resonance_count, 0)
         self.raw_resonance_sum = _f(self.raw_resonance_sum, 0.0)
+        # Count invariant: |sum| ≤ count for both accumulators (each impulse is
+        # in [-1, 1]). Clamp a corrupted external row to the count-bound so it
+        # can't skew avg_resonance. Symmetric with FactPassport.
+        _bound = float(self.resonance_count)
+        self.resonance_sum = max(-_bound, min(_bound, self.resonance_sum))
+        self.raw_resonance_sum = max(-_bound, min(_bound, self.raw_resonance_sum))
         self.recent_utility = _f(
             self.recent_utility, 0.5, lo=0.0, hi=1.0,
         )

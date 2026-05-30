@@ -134,6 +134,14 @@ self-derived R cannot compound through the loop.
   drifted too). New `test_server_contract.py` calls the real `birch.server` tool
   functions and pins the envelopes they actually return; the inline file is
   trimmed to exception-path shape pins plus the source-token guard.
+- **Resonance accumulators now carry the count invariant on read.** Every
+  impulse ∈ [-1, 1], so `|resonance_sum|` and `|raw_resonance_sum|` must be
+  ≤ `resonance_count`. They were only finitized on load, so a corrupted external
+  row (`sum` ≫ `count`) could push `avg_resonance` / `raw_avg_resonance` past ±1
+  → skewed trust → skewed gravity — the most influential unguarded path.
+  `__post_init__` (FactPassport and MetaFact) now clamps both sums to the
+  count-bound, the read-side completion of the storage symmetry already applied
+  to `echo_penalty` / `r_score`. A no-op for legitimate data.
 
 ### Configuration
 - `BIRCH_CONTRAST_K` (default `5.0`) — agreeing-history a fact needs to earn

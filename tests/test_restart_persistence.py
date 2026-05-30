@@ -519,3 +519,44 @@ def test_echo_apply_preserves_past_session_recorded_at(tmp_path):
     assert rows["past"]["recorded_at"] == 1000.0, (
         f"recorded_at must be preserved, got {rows['past']['recorded_at']}"
     )
+
+
+def test_resonance_sum_clamped_to_count_invariant():
+    """|sum| ≤ count for both accumulators (each impulse ∈ [-1, 1]). A
+    corrupted value far outside that would skew avg_resonance → trust →
+    gravity; __post_init__ clamps it to the count-bound. No-op for legit data."""
+    f = FactPassport(
+        subject="s", predicate="p", object="o",
+        resonance_sum=999.0, resonance_count=2, raw_resonance_sum=-999.0,
+    )
+    assert f.resonance_sum == 2.0 and f.raw_resonance_sum == -2.0
+    assert f.avg_resonance == 1.0 and f.raw_avg_resonance == -1.0
+    # count 0 ⇒ both sums forced to 0.
+    g = FactPassport(subject="s", predicate="p", object="o",
+                     resonance_sum=5.0, raw_resonance_sum=5.0, resonance_count=0)
+    assert g.resonance_sum == 0.0 and g.raw_resonance_sum == 0.0
+
+
+def test_corrupted_resonance_sum_clamps_on_load(tmp_path):
+    """A hand-edited / corrupted resonance_sum row must load bounded by count,
+    so |avg_resonance| can never exceed 1 — completing the read-side symmetry
+    started with echo_penalty / r_score."""
+    db = str(tmp_path / "m.db")
+    mem = MemoryStore(db_path=db)
+    f = mem.add_fact("api", "runs on", "Go")
+    fid = f.fact_id
+    # Pretend it accumulated 3 sessions, then corrupt the sum way out of bound.
+    c = sqlite3.connect(db)
+    c.execute(
+        "UPDATE facts SET resonance_count=3, resonance_sum=999.0, "
+        "raw_resonance_sum=-999.0 WHERE fact_id=?", (fid,))
+    c.commit()
+    c.close()
+
+    again = _reopen(db)
+    g = again._facts[fid]
+    again.close()
+    assert g.resonance_sum == 3.0, g.resonance_sum
+    assert g.raw_resonance_sum == -3.0, g.raw_resonance_sum
+    assert -1.0 <= g.avg_resonance <= 1.0
+    assert -1.0 <= g.raw_avg_resonance <= 1.0
