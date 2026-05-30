@@ -30,12 +30,13 @@ SCOPE — what this does NOT guard. The first test attributes each fact to its
 session deterministically (``mem._session_fact_ids = [...]``), bypassing the
 cosine relevance weighting. That isolates the gravity dynamics on purpose, but
 it means the test proves "given clean attribution, gravity tracks utility" —
-NOT "attribution hands credit to the right facts". The open risk there (a
-genuinely useful fact that happened to ride a failed session sinking with it,
-or credit smeared across co-retrieved facts) is proposal #5 (contrastive
-attribution). It is only partially exercised by the second test below, which
-drives attribution through real ``query_memory`` cosine weighting; full
-contrastive-attribution coverage is still pending #5.
+NOT "attribution hands credit to the right facts". That is exercised by the
+later tests here: one drives credit through real ``query_memory`` cosine
+weighting, and ``test_full_noisy_chain_follows_late_utility`` runs the whole
+stack at once — heuristic R (floating confidence) × cosine attribution ×
+contrastive shrink × sign flip — and asserts gravity follows the late truth.
+The per-fact contrastive mechanism itself is pinned in
+test_contrastive_attribution.py.
 """
 from __future__ import annotations
 
@@ -211,4 +212,43 @@ def test_gravity_follows_late_utility_after_sign_flip(embed_provider):
     assert good.gravity_score - turned.gravity_score > 0.1, (
         f"[{embed_provider}] turned fact did not follow its late utility: "
         f"good={good.gravity_score:.3f} turned={turned.gravity_score:.3f}"
+    )
+
+
+def test_full_noisy_chain_follows_late_utility(embed_provider):
+    """Composition guard: heuristic R (floating confidence) × real query_memory
+    cosine attribution × contrastive shrink × sign flip — all in one run, no
+    sentiment override. A fact driven resonant-then-toxic *through messages*
+    must still end below one that stayed resonant. This is the stack the
+    component tests exercise only in isolation."""
+    mem = MemoryStore()
+    good = mem.add_fact("alpha pipeline", "configured with", "yaml manifests")
+    turned = mem.add_fact("beta deployment", "configured with", "helm charts")
+
+    def drive(fact, topic, utility):
+        sid = f"{topic}-{utility}-{id(fact)}-{drive.n}"
+        drive.n += 1
+        mem.session_start(sid)
+        # Real cosine attribution; top_k=1 so the on-topic fact gets the credit.
+        mem.query(topic, top_k=1, session_id=sid)
+        for msg in _messages_for(utility, topic):
+            mem.session_message(msg, session_id=sid)
+        mem.session_close(sid)  # heuristic — confidence floats
+    drive.n = 0
+
+    for _ in range(4):                          # both earn a resonant history
+        drive(good, "alpha pipeline", 0.9)
+        drive(turned, "beta deployment", 0.9)
+    for _ in range(18):                         # good stays good, turned rots
+        drive(good, "alpha pipeline", 0.9)
+        drive(turned, "beta deployment", 0.0)
+
+    assert turned.raw_avg_resonance < good.raw_avg_resonance
+    assert turned.avg_resonance < good.avg_resonance, (
+        f"[{embed_provider}] gravity-side didn't follow the late toxic turn: "
+        f"good={good.avg_resonance:.3f} turned={turned.avg_resonance:.3f}"
+    )
+    assert good.gravity_score - turned.gravity_score > 0.05, (
+        f"[{embed_provider}] good={good.gravity_score:.3f} "
+        f"turned={turned.gravity_score:.3f}"
     )

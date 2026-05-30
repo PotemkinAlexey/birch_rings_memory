@@ -364,9 +364,17 @@ reasons would absorb a large negative `R × w`. Before applying the impulse,
 base = R × w
 if resonance_count == 0 or R == 0:        return base      # no history → full
 if sign(raw_avg_resonance) == sign(R):    return base      # confirms history → full
-trust = resonance_count / (resonance_count + K)            # K = BIRCH_CONTRAST_K, default 5
+consistency = min(1, |raw_avg_resonance| / 0.35)           # how one-signed
+trust       = (resonance_count / (resonance_count + K)) · consistency
 return base × (1 − trust)                                  # contradicts → shrunk
 ```
+
+Armor scales by **both** tenure and consistency. ``trust = n/(n+K)`` alone
+would armor a long-but-mushy history (``|raw_avg| ≈ 0``, weak evidence of the
+true sign) as hard as a strongly one-signed one — but a contradicting session
+against a near-zero history is more likely the fact's real mixed nature than an
+outlier, so it stays responsive (full armor only once ``|raw_avg|`` reaches the
+resonant band, 0.35). ``K = BIRCH_CONTRAST_K`` (default 5).
 
 **The prior is read from a separate, un-shrunk accumulator.** Each body keeps
 *two* running sums over the same `resonance_count` sessions:

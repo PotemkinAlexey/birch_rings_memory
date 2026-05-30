@@ -53,6 +53,12 @@ self-derived R cannot compound through the loop.
   harder than a marginally-worse one.
 
 ### Fixed
+- **Contrastive armor now scales by consistency, not just tenure.** `trust`
+  used only `n/(n+K)`, so a long but near-zero ("mushy") history got the same
+  outlier protection as a strongly one-signed one. It is now
+  `(n/(n+K)) · min(1, |raw_avg|/0.35)` — a marginal history stays responsive to
+  contradicting sessions (its mixed nature is signal, not noise); full armor
+  only once the track record reaches the resonant band.
 - **`record_session` is now outcome-gated too.** It received the whole
   conversation up front but still applied echo immediately (via `check_echo`)
   before scoring it — so a productive one-shot revisit could penalise the past

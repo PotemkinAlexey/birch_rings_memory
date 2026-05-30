@@ -106,7 +106,14 @@ def contrastive_impulse(
     prior = getattr(fact, "raw_avg_resonance", fact.avg_resonance)
     if prior * effective_r >= 0.0:
         return base  # confirms (or neutral to) history → full strength
-    trust = n / (n + k)
+    # Armor follows consistency, not just tenure. trust scales by both how long
+    # (n/(n+K)) and how *one-signed* the history is (|prior|): a long but mushy
+    # record (|prior|≈0) is weak evidence of the true sign, so a contradicting
+    # session there is more likely the fact's real mixed nature than an outlier
+    # — keep it responsive. Full consistency once |prior| reaches the resonant
+    # band (0.35); linear below.
+    consistency = min(1.0, abs(prior) / 0.35)
+    trust = (n / (n + k)) * consistency
     return base * (1.0 - trust)
 
 # Freshness half-life — a new fact rides high and sinks as it ages

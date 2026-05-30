@@ -167,6 +167,35 @@ def test_turned_bad_fact_eventually_lands_full_and_follows_late():
     assert f.avg_resonance < 0, f"gravity-side froze on early reputation: {f.avg_resonance}"
 
 
+def test_armor_follows_consistency_not_just_tenure():
+    """Two facts with the SAME tenure (n) but different consistency: a strongly
+    one-signed history earns full outlier armor, a mushy near-zero history stays
+    responsive to a contradicting session. Armor must come from "how stably
+    useful", not "how long seen"."""
+    eng = GravityEngine()
+    strong, mushy = _fact("strong"), _fact("mushy")
+    eng.register(strong)
+    eng.register(mushy)
+    for _ in range(40):
+        eng.apply_session_resonance({strong.fact_id: 0.9}, 0.8)   # raw_avg ≈ 0.72
+    for i in range(40):
+        # net slightly positive, but hovering near zero → low consistency
+        eng.apply_session_resonance({mushy.fact_id: 0.9}, 0.1 if i % 2 == 0 else -0.08)
+
+    assert abs(mushy.raw_avg_resonance) < 0.05, mushy.raw_avg_resonance
+    assert strong.raw_avg_resonance > 0.6
+
+    raw = -0.7 * 0.9
+    imp_strong = contrastive_impulse(strong, -0.7, 0.9)   # consistent → armored
+    imp_mushy = contrastive_impulse(mushy, -0.7, 0.9)     # mushy → responsive
+
+    assert imp_strong > imp_mushy, "consistent history should resist more"
+    # Despite identical n=40, the mushy fact takes almost the full hit while the
+    # strong one is heavily shrunk — armor tracks consistency, not tenure.
+    assert imp_mushy < raw * 0.6, f"mushy should stay responsive, got {imp_mushy}"
+    assert imp_strong > raw * 0.4, f"strong should be armored, got {imp_strong}"
+
+
 def test_attenuation_counter_tracks_only_real_shrinks():
     """The engine counts an attenuation only when an impulse was actually
     shrunk (a contradicting session on an established fact), not on confirming
