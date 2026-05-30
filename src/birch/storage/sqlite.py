@@ -675,7 +675,12 @@ class SQLiteBackend:
                 _finite_float(r_score, 0.0, lo=-1.0, hi=1.0),
                 _finite_float(recorded_at, time.time()),
                 json.dumps(payload, allow_nan=False),
-                _finite_float(echo_penalty, 0.0, lo=0.0, hi=1.0),
+                # echo_penalty is a NEGATIVE retroactive correction in [-1, 0].
+                # The old lo=0.0 clamp silently stored every penalty as 0.0, so
+                # after a reload a penalised session looked un-penalised —
+                # breaking apply_echo idempotency (re-applied the penalty) and
+                # the penalised-tier TTL in EchoStore.expire.
+                _finite_float(echo_penalty, 0.0, lo=-1.0, hi=0.0),
             ),
         )
         self._maybe_commit()

@@ -412,3 +412,57 @@ def test_raw_resonance_diverges_from_shrunk_and_survives_restart(tmp_path):
     assert abs(g.raw_resonance_sum - raw_before) < 1e-6, "raw history lost on restart"
     assert abs(g.resonance_sum - sum_before) < 1e-6, "shrunk sum lost on restart"
     assert g.raw_resonance_sum != g.resonance_sum
+
+
+def test_negative_echo_penalty_round_trips(tmp_path):
+    """echo_penalty is a NEGATIVE retroactive correction. A clamp to lo=0.0 in
+    save_echo_session silently stored it as 0.0, so after a reload a penalised
+    session looked un-penalised — re-applying the penalty (idempotency broken)
+    and mis-tiering its TTL. The value must survive the round trip negative."""
+    from birch.storage.sqlite import SQLiteBackend
+
+    db = str(tmp_path / "echo.db")
+    b = SQLiteBackend(db)
+    b.save_echo_session(
+        "s1", [[1.0, 0.0]], r_score=0.7, recorded_at=123.0,
+        fact_weights={"f": 1.0}, echo_penalty=-0.6,
+    )
+    b.close()
+
+    b2 = SQLiteBackend(db)
+    rows = {r["session_id"]: r for r in b2.load_echo_sessions(cleanup=False)}
+    b2.close()
+    assert "s1" in rows
+    assert rows["s1"]["echo_penalty"] == -0.6, (
+        f"negative echo_penalty must persist, got {rows['s1']['echo_penalty']}"
+    )
+
+
+def test_echo_penalty_survives_store_restart_and_stays_idempotent(tmp_path):
+    """End-to-end: an applied echo penalty must persist as non-zero across a
+    MemoryStore reopen, so apply_echo stays idempotent (no double penalty) and
+    EchoStore keeps the session in its penalised TTL tier."""
+    from birch.memory_store import MemoryStore
+
+    db = str(tmp_path / "m.db")
+    mem = MemoryStore(db_path=db)
+    vec = [1.0, 0.0, 0.0]
+    mem._echo.record("past", [vec, vec], r_score=0.7, fact_weights={})
+    res = mem._echo.apply_echo("past")
+    assert res.penalty < 0.0
+    applied = mem._echo.get("past").echo_penalty
+    assert applied < 0.0
+    if mem._storage:
+        past = mem._echo.get("past")
+        mem._storage.save_echo_session(
+            "past", past.bundle.centroids, past.r_score, 1.0,
+            fact_weights=past.fact_weights, echo_penalty=past.echo_penalty,
+        )
+
+    mem2 = MemoryStore(db_path=db)
+    reloaded = mem2._echo.get("past")
+    assert reloaded is not None
+    assert reloaded.echo_penalty < 0.0, "penalty must survive restart as non-zero"
+    # Idempotent: a re-apply on the reloaded (already-penalised) session is a no-op.
+    again = mem2._echo.apply_echo("past")
+    assert again.penalty == 0.0, "re-apply after restart must not double-penalise"
