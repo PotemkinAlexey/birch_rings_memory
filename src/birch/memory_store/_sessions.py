@@ -641,7 +641,17 @@ class SessionsMixin:
                                 self._echo.total_echoes_cancelled += 1
                                 echo_outcome = "cancelled"
                             elif matched_id:
-                                echo_result = self._echo.apply_echo(matched_id)
+                                # Scale the retroactive penalty by how strong
+                                # THIS session's return-to-failure evidence is:
+                                # severity ramps 0 at the resonant threshold to
+                                # 1 at fully toxic. A neutral return still
+                                # applies (you came back unresolved) but weaker
+                                # than a toxic one. Uses effective_r so the
+                                # confidence damping flows through here too.
+                                severity = max(
+                                    0.0, min(1.0, (0.35 - effective_r) / 1.35))
+                                echo_result = self._echo.apply_echo(
+                                    matched_id, scale=severity)
                                 applied_ids = self._apply_echo_gravity_locked(
                                     echo_result)
                                 echo_outcome = (

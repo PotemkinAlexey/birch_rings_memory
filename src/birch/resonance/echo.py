@@ -77,10 +77,17 @@ def echo_penalty_for(prior_r: float) -> float:
     applying anything at all (see session_close's deferred echo path); this
     function just makes sure that whenever a penalty IS applied, its size is
     proportional to the evidence rather than a flat -0.8.
+
+    The base ramps 0.6 → 0.8 as the prior looked more resonant (a confident-
+    looking session that turns out false is a stronger correction signal) and
+    is flat 0.6 for non-positive priors. It is *continuous* in prior_r — the
+    old hard step at 0.35 meant a session at R=0.351 drew a harsher penalty
+    than one at R=0.349, punishing the marginally-better session.
     """
-    base = -0.8 if prior_r > 0.35 else -0.6
+    p = max(0.0, min(1.0, prior_r))
+    base = 0.6 + 0.2 * p
     confidence = max(0.0, min(1.0, 1.0 - prior_r))
-    return round(base * confidence, 4)
+    return round(-base * confidence, 4)
 
 
 class EchoStore:
@@ -183,7 +190,7 @@ class EchoStore:
             fact_weights=dict(past.fact_weights),
         )
 
-    def apply_echo(self, matched_session_id: str) -> EchoResult:
+    def apply_echo(self, matched_session_id: str, scale: float = 1.0) -> EchoResult:
         """
         Apply the retroactive penalty to a previously-peeked match.
 
@@ -192,6 +199,14 @@ class EchoStore:
         revisit really does signal a false closure, and now commits the
         penalty. Idempotent: a session already penalised is a no-op
         (penalty 0.0), so a re-applied echo never stacks.
+
+        ``scale`` ∈ [0, 1] attenuates the penalty by how strong the
+        return-to-failure evidence is. session_close passes the current
+        session's *severity* (a neutral return is weaker evidence of false
+        closure than a toxic one), so a barely-non-resonant revisit applies
+        only a fraction of the penalty a clearly-toxic one would. The
+        immediate path (detect_echo / explicit check_echo) has no current
+        outcome to weigh and uses the full penalty (scale 1.0).
 
         No forced toxic floor — the penalty is confidence-scaled in
         ``echo_penalty_for`` and the score lands wherever the evidence puts it.
@@ -206,7 +221,8 @@ class EchoStore:
             return EchoResult(
                 matched_session_id, 0.0, 0.0, "echo", dict(past.fact_weights),
             )
-        penalty = echo_penalty_for(past.r_score)
+        scale = max(0.0, min(1.0, scale))
+        penalty = round(echo_penalty_for(past.r_score) * scale, 4)
         past.echo_penalty = penalty
         past.r_score = max(-1.0, min(1.0, past.r_score + penalty))
         self.total_echoes_applied += 1

@@ -112,6 +112,48 @@ def test_deferred_echo_cancelled_when_revisit_resonates():
     assert f.resonance_sum == rsum_before, "past fact must be untouched on cancel"
 
 
+def _close_resonant_past_with_fact(mem):
+    """A 'past' session that leans on one fact and closes RESONANT — so a later
+    revisit has a positive prior to penalise (and a fact to drag)."""
+    mem.session_start("past")
+    f = mem.add_fact("deploy pipeline", "fixed by", "reordering migrations")
+    mem.session_message("how do I fix the deploy pipeline migration order")
+    mem.session_message("perfect, that worked, thanks")
+    mem.session_close("past")
+    return f
+
+
+def test_deferred_echo_neutral_return_weaker_than_toxic_return():
+    """A neutral revisit still applies (you came back unresolved) but with a
+    smaller penalty than a toxic revisit — the penalty is scaled by the
+    current session's severity, not just gated."""
+    topic = "how do I fix the deploy pipeline migration order"
+
+    m_neutral = MemoryStore()
+    f_n = _close_resonant_past_with_fact(m_neutral)
+    base_n = f_n.resonance_sum
+    m_neutral.session_start("cur")
+    m_neutral.peek_echo(topic, session_id="cur")
+    m_neutral.session_message("ok, noted", session_id="cur")
+    m_neutral.session_close("cur", sentiment="neutral")
+    drop_neutral = base_n - f_n.resonance_sum
+
+    m_toxic = MemoryStore()
+    f_t = _close_resonant_past_with_fact(m_toxic)
+    base_t = f_t.resonance_sum
+    m_toxic.session_start("cur")
+    m_toxic.peek_echo(topic, session_id="cur")
+    m_toxic.session_message("still broken, same error", session_id="cur")
+    m_toxic.session_close("cur", sentiment="toxic")
+    drop_toxic = base_t - f_t.resonance_sum
+
+    assert drop_neutral > 0, "a neutral return should still apply some penalty"
+    assert drop_toxic > drop_neutral, (
+        f"toxic return {drop_toxic:.3f} should penalise more than neutral "
+        f"{drop_neutral:.3f}"
+    )
+
+
 def test_deferred_echo_applied_when_revisit_also_fails():
     """An unproductive revisit (session ends non-resonant) confirms the false
     closure and applies the retroactive penalty to the past session's facts."""

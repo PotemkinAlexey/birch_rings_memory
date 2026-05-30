@@ -52,12 +52,34 @@ def test_confidence_in_unit_interval():
         assert 0.0 <= c <= 1.0, (msgs, c)
 
 
-def test_confidence_full_when_single_signal():
-    """One message, no vectors: only the behavioral signal fires, so there is
-    nothing to conflict with — confidence must be 1.0 (R fully trusted)."""
+def test_confidence_reduced_for_lone_signal():
+    """One message, no vectors: only the behavioral signal fires. Agreement is
+    trivially 1.0 (a signal agrees with itself), but the verdict rests on a
+    single uncorroborated signal — confidence must be DAMPED (~0.75 floor), not
+    full. This is the single-signal-dominance guard: a lone regex match should
+    not move gravity at full strength, whether it is right or wrong."""
     result = compute_resonance(["perfect, that worked, thanks!"])
     assert result.r > 0.0
-    assert result.confidence == 1.0
+    assert 0.7 <= result.confidence <= 0.85, result.confidence
+
+
+def test_confidence_rises_when_a_second_signal_corroborates():
+    """A verdict backed by two balanced agreeing signals is trusted more than
+    the same verdict from one. Corroboration lifts confidence toward 1.0."""
+    # Lone behavioral negative.
+    lone = compute_resonance(["still broken, same error again"])
+    # Behavioral negative AND repetition negative (tight semantic loop) — two
+    # signals agreeing on toxic.
+    v = [1.0, 0.0, 0.0]
+    corroborated = compute_resonance(
+        ["why is it broken", "still broken, same error again"],
+        all_vectors=[v, v],  # zero dispersion ⇒ repetition fires negative too
+    )
+    assert corroborated.repetition_score < 0.0, "repetition should corroborate"
+    assert corroborated.confidence > lone.confidence, (
+        f"corroborated {corroborated.confidence} should exceed lone "
+        f"{lone.confidence}"
+    )
 
 
 def test_confidence_drops_when_signals_conflict():

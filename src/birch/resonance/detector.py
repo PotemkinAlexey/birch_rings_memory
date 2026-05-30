@@ -73,15 +73,33 @@ def compute_resonance(
     r_raw = sum(contributions)
     r = max(-1.0, min(1.0, r_raw))
 
-    # Confidence = signal agreement. |Σ contributions| / Σ|contributions| is 1.0
-    # when every signal pulls the same direction and falls toward 0 as they
-    # cancel. This is exactly the "declarative grumpy tech summary" guard: a
-    # behavioral score of -0.8 (matched "error"/"broken" in a happy summary)
-    # against a +0.6 semantic score yields a low agreement ratio, so the
-    # session moves gravity only weakly instead of confidently mislabelling.
+    # Confidence has two independent dimensions; we need both.
+    #
+    # (a) AGREEMENT — do the voting signals point the same way?
+    #     |Σ contributions| / Σ|contributions|: 1.0 when every signal pulls the
+    #     same direction, → 0 as they cancel. This is the "declarative grumpy
+    #     tech summary" guard: behavioral -0.8 ("error"/"broken" in a happy
+    #     summary) against semantic +0.6 yields a low ratio, so gravity barely
+    #     moves instead of confidently mislabelling.
+    #
+    # (b) CORROBORATION — how broad is the base the verdict rests on?
+    #     Agreement alone is blind to single-signal dominance: behavioral -0.8
+    #     with semantic and repetition both silent gives agreement 1.0, because
+    #     one signal trivially "agrees" with itself. But a verdict carried by a
+    #     lone regex match is exactly where mis-classification hides. We measure
+    #     breadth with the participation ratio PR = 1 / Σ pᵢ² (pᵢ = |cᵢ|/Σ|c|):
+    #     PR≈1 ⇒ one signal does all the work; PR≈2 ⇒ two balanced signals
+    #     corroborate. Floor 0.75 so a lone clear signal still counts for most
+    #     of its weight; full trust once a second balanced signal joins in.
     abs_total = sum(abs(c) for c in contributions)
-    confidence = abs(r_raw) / abs_total if abs_total > 1e-9 else 1.0
-    confidence = max(0.0, min(1.0, confidence))
+    if abs_total <= 1e-9:
+        confidence = 1.0
+    else:
+        agreement = abs(r_raw) / abs_total
+        sq = sum((abs(c) / abs_total) ** 2 for c in contributions)
+        participation = 1.0 / sq if sq > 1e-9 else 1.0
+        corroboration = min(1.0, 0.75 + 0.25 * (participation - 1.0))
+        confidence = max(0.0, min(1.0, agreement * corroboration))
 
     if r > 0.35:
         label = "resonant"

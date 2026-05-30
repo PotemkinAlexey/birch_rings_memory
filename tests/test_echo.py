@@ -32,6 +32,30 @@ def test_echo_penalty_monotonic_in_prior():
     assert penalties[-1] == 0.0  # prior_r == 1.0 ⇒ zero confidence in failure
 
 
+def test_echo_penalty_continuous_at_old_threshold():
+    """No step at prior_r=0.35: a marginally-better prior must not draw a
+    harsher penalty than a marginally-worse one (the old -0.6→-0.8 base jump)."""
+    below = echo_penalty_for(0.349)
+    above = echo_penalty_for(0.351)
+    # Higher prior ⇒ weaker (closer to zero) penalty, and the gap is tiny.
+    assert above >= below, f"seam reversed: {above} < {below}"
+    assert abs(above - below) < 0.01, f"discontinuity at 0.35: {below} vs {above}"
+
+
+def test_apply_echo_scales_penalty_by_severity():
+    """apply_echo(scale=…) attenuates the penalty linearly — the hook
+    session_close uses to make a neutral return weaker than a toxic one."""
+    dim = 8
+    v = [1.0] + [0.0] * (dim - 1)
+    store = EchoStore()
+    store.record("full", [v, v], r_score=0.5, fact_weights={"f": 1.0})
+    store.record("weak", [v, v], r_score=0.5, fact_weights={"f": 1.0})
+    full = store.apply_echo("full")             # scale 1.0
+    weak = store.apply_echo("weak", scale=0.3)  # neutral-return strength
+    assert weak.penalty > full.penalty          # weaker = closer to 0
+    assert abs(weak.penalty - full.penalty * 0.3) < 1e-3
+
+
 def test_echo_penalty_no_forced_toxic_floor():
     """Applying a suppressed penalty to a resonant prior must NOT force the
     score into the toxic zone (regression on the old min(-0.2, …) floor)."""

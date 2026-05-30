@@ -25,6 +25,17 @@ when an endpoint answers (the ``embed_provider`` fixture probes it), mock
 otherwise. The driving signal is behavioral (regex on message tone), which is
 provider-independent, so the assertion holds either way while the semantic and
 repetition signals exercise the real embedder when present.
+
+SCOPE — what this does NOT guard. The first test attributes each fact to its
+session deterministically (``mem._session_fact_ids = [...]``), bypassing the
+cosine relevance weighting. That isolates the gravity dynamics on purpose, but
+it means the test proves "given clean attribution, gravity tracks utility" —
+NOT "attribution hands credit to the right facts". The open risk there (a
+genuinely useful fact that happened to ride a failed session sinking with it,
+or credit smeared across co-retrieved facts) is proposal #5 (contrastive
+attribution). It is only partially exercised by the second test below, which
+drives attribution through real ``query_memory`` cosine weighting; full
+contrastive-attribution coverage is still pending #5.
 """
 from __future__ import annotations
 
@@ -114,4 +125,54 @@ def test_high_utility_facts_outrank_low_utility_facts(embed_provider):
     assert sum(high) / 3 > sum(low) / 3 + 0.1, (
         f"[{embed_provider}] high-utility mean {sum(high)/3:.3f} did not clear "
         f"low-utility mean {sum(low)/3:.3f} by margin"
+    )
+
+
+# Distinct-vocabulary topics so cosine attribution separates them under both
+# the mock (word-hash) and real (semantic) embedders. Utilities shuffled vs
+# creation order, same as above.
+_DISTINCT = [
+    ("postgres", "index strategy", "use a partial index", 0.10),
+    ("react", "hydration mismatch", "defer non-critical components", 0.90),
+    ("docker", "container networking", "use a user-defined bridge", 0.30),
+    ("kafka", "topic partitioning", "key by tenant id", 0.70),
+    ("redis", "key eviction", "set allkeys-lru policy", 0.00),
+    ("nginx", "tls handshake", "enable ocsp stapling", 1.00),
+]
+
+
+def test_gravity_tracks_utility_through_real_cosine_attribution(embed_provider):
+    """Interim attribution guard (partial #5 coverage).
+
+    Unlike the deterministic tests above, this drives attribution through real
+    ``query_memory`` cosine weighting — credit lands on whatever the query
+    retrieves, co-attribution noise and all. It does NOT isolate the subtle
+    "right fact in a failed session" case (that is full #5), but it removes the
+    "attribution is entirely unguarded" gap: even with real, noisy attribution,
+    gravity must still track assigned utility positively.
+    """
+    mem = MemoryStore()
+    facts, utils = [], []
+    for subj, pred, obj, u in _DISTINCT:
+        facts.append(mem.add_fact(subj, pred, obj))
+        utils.append(u)
+
+    for rnd in range(_ROUNDS):
+        for (subj, pred, _obj, u), f in zip(_DISTINCT, facts):
+            sid = f"q-{subj}-{rnd}"
+            mem.session_start(sid)
+            # Real attribution: whatever cosine retrieves gets the credit.
+            mem.query(f"{subj} {pred}", top_k=2, session_id=sid)
+            for msg in _messages_for(u, f"{subj} {pred}"):
+                mem.session_message(msg, session_id=sid)
+            mem.session_close(sid)
+
+    gravity = np.array([f.gravity_score for f in facts], dtype=float)
+    utility = np.array(utils, dtype=float)
+    corr = float(np.corrcoef(gravity, utility)[0, 1])
+    # Looser than the clean-attribution test: real attribution smears credit
+    # across co-retrieved facts, so we only require a clear positive signal.
+    assert corr > 0.4, (
+        f"[{embed_provider}] gravity lost the utility signal through real "
+        f"attribution: corr={corr:+.3f}, gravity={np.round(gravity, 3)}"
     )
