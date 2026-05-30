@@ -559,7 +559,8 @@ the bottom-up spirit:
   the pin intact while `earned` rises to take over.
 - **Per-namespace budget** (`BIRCH_SALIENCE_PIN_BUDGET`, default 32): the only
   backstop against never-surfaced junk pins (indistinguishable from never-
-  surfaced critical ones). Under contention it evicts the **highest-gravity**
+  surfaced critical ones). Under contention the new explicit pin is always
+  accepted (new-wins) and it evicts the **highest-gravity existing**
   pin — the one needing protection least — which is anti-adversarial: a matured
   cold-start candidate sits at *low* gravity after months of decay, so it is the
   last thing evicted. The budget *bounds* hoarding, it doesn't *resolve* it

@@ -200,8 +200,9 @@ usefulness", and criticality-at-encoding is a different, un-inferrable signal
 (the brain tags importance by attention at encoding too, not only by repetition).
 It's kept honest: a pin **decays use-it-or-lose-it** (eroded only when the fact
 surfaces into a non-positive session — a pin that keeps proving useless fades; a
-truly dormant one is held), a per-namespace **budget** evicts the *highest-gravity*
-pin under contention (the one needing it least — never the matured low-gravity
+truly dormant one is held), a per-namespace **budget** always accepts the new
+explicit pin and evicts the *highest-gravity* **existing** pin under contention
+(new-wins — the one needing it least, never the matured low-gravity
 cold-start candidate), and **telemetry** (`pins_created / pins_active /
 pins_resonated`, derived from persisted per-fact flags so it survives restarts)
 lets a month of real traffic decide whether the channel earns its keep: if

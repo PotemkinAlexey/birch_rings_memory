@@ -142,6 +142,20 @@ self-derived R cannot compound through the loop.
   `__post_init__` (FactPassport and MetaFact) now clamps both sums to the
   count-bound, the read-side completion of the storage symmetry already applied
   to `echo_penalty` / `r_score`. A no-op for legitimate data.
+- **Session text now re-checks empty AFTER sanitisation.** `session_push` and
+  `record_session` sanitise at the write boundary, but `_validate_text` /
+  `invalid_message_item` check non-emptiness *before* sanitise — so a pure
+  zero-width payload (ZWSP/ZWNJ/ZWJ/BOM) passed validation, stripped to `""`,
+  and landed in the scored trajectory as a phantom neutral turn. Both now run
+  the same post-sanitize guard as `record_fact`: `session_push` returns
+  `field_empty_after_sanitization`; `record_session` returns it with the
+  offending `indices`.
+- **`record_facts` docstring corrected re `salient`.** It claimed "same
+  semantics per item as `record_fact`", but batch items cannot be pinned —
+  `salient` is `record_fact`-only. Docstring now states the exception. Pin
+  budget wording in README / AGENTS / ARCHITECTURE clarified to "new-wins:
+  the new explicit pin is always accepted; eviction targets the least-at-risk
+  *existing* pin."
 
 ### Configuration
 - `BIRCH_CONTRAST_K` (default `5.0`) — agreeing-history a fact needs to earn

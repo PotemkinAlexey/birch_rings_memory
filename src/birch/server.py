@@ -786,9 +786,11 @@ def record_facts(
 ) -> dict:
     """USE WHEN: storing several SPO triples at once — one Ollama round-trip
     and one SQLite transaction beats N ``record_fact`` calls. Same semantics
-    per item as ``record_fact``; exact-SPO duplicates are touched and
-    returned with ``already_existed=true``. For mutable-scalar slots use
-    ``set_fact`` per item instead.
+    per item as ``record_fact`` — EXCEPT ``salient``, which is only supported by
+    ``record_fact`` (batch items cannot be pinned; declare criticality with a
+    dedicated ``record_fact(..., salient=True)`` call). Exact-SPO duplicates are
+    touched and returned with ``already_existed=true``. For mutable-scalar slots
+    use ``set_fact`` per item instead.
 
     Each item must have ``subject``, ``predicate``, ``object``; per-item
     ``session_id`` overrides the top-level one. Per-item ``namespace``
@@ -1664,6 +1666,13 @@ def session_push(text: str, session_id: str) -> dict:
     if err is not None:
         return err
     text = _sanitize_for_llm(text)  # strip invisible/control bytes (write boundary)
+    # Post-sanitize empty guard — symmetric with record_fact. _validate_text
+    # checks non-emptiness BEFORE sanitize, so a pure zero-width payload
+    # ("​") passes it, then strips to "" here. Without this re-check an
+    # informationless empty message would land in the scored trajectory.
+    err = _check_non_empty_after_sanitize({"text": text})
+    if err is not None:
+        return err
     try:
         _store.session_message(text, session_id=session_id)
     except EmbeddingError as exc:
@@ -1885,6 +1894,23 @@ def record_session(messages: list[str], agent_id: str = "default") -> dict:
     # Strip invisible/control bytes from every message (write boundary) —
     # session text reaches the same downstream context as facts.
     messages = [_sanitize_for_llm(m) for m in messages]
+    # Post-sanitize empty guard — symmetric with the pre-sanitize
+    # invalid_message_item check above and with record_fact. A pure
+    # zero-width message ("​") passes the .strip() check above, then
+    # strips to "" here; without this re-check it would still land in the
+    # scored trajectory as a phantom neutral turn.
+    emptied = [i for i, m in enumerate(messages) if not m.strip()]
+    if emptied:
+        return {
+            "ok": False,
+            "error": "field_empty_after_sanitization",
+            "indices": emptied,
+            "hint": (
+                "one or more messages contained only invisible control "
+                "characters or zero-width Unicode; after sanitisation they "
+                "are empty. Provide visible non-empty content."
+            ),
+        }
     session_id = f"{agent_id}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     _store.session_start(session_id)
     # Peek the echo (arm a pending marker) and let session_close decide by

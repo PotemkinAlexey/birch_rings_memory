@@ -167,3 +167,35 @@ def test_conflicts_do_not_cross_namespaces():
         assert not ({"Go", "Rust"} <= objs), (
             "Go (WORK) and Rust (HOME) must not be grouped as one conflict"
         )
+
+
+# --- P2: zero-width session text empty-after-sanitize ------------------
+
+ZWSP_ONLY = "​‌‍﻿"  # ZWSP + ZWNJ + ZWJ + BOM, no visible glyph
+
+
+def test_session_push_zero_width_is_empty_after_sanitize():
+    """A pure zero-width push passes _validate_text (str.strip() doesn't strip
+    zero-width) but sanitises to "" — it must be rejected, not written as a
+    phantom empty turn into the scored trajectory."""
+    opened = server.session_open()
+    sid = opened["session_id"]
+    r = server.session_push(ZWSP_ONLY, session_id=sid)
+    assert r["error"] == "field_empty_after_sanitization", r
+    assert r["ok"] is False
+
+
+def test_record_session_zero_width_item_is_empty_after_sanitize():
+    """One zero-width message among valid ones must be caught post-sanitize
+    with its index — symmetric with the pre-sanitize invalid_message_item."""
+    r = server.record_session(["how do I tune the cache", ZWSP_ONLY])
+    assert r["error"] == "field_empty_after_sanitization", r
+    assert r["indices"] == [1]
+
+
+def test_record_session_all_zero_width_is_rejected():
+    """A whole conversation of nothing-but-zero-width must not produce a
+    neutral session indistinguishable from a real one."""
+    r = server.record_session([ZWSP_ONLY])
+    assert r["error"] == "field_empty_after_sanitization", r
+    assert r["indices"] == [0]

@@ -253,8 +253,9 @@ Use it **sparingly and only** when *both* hold:
 
 Do **NOT** pin "this is good / useful" — that is inferred automatically from how
 sessions go; pinning it adds nothing. `salient` is for *criticality*, not
-quality. Over-pinning is futile by design: a per-namespace budget evicts the
-least-at-risk pin when full, and a pin that keeps getting retrieved without
+quality. Over-pinning is futile by design: a per-namespace budget always accepts
+the new explicit pin and evicts the least-at-risk *existing* pin when full
+(new-wins), and a pin that keeps getting retrieved without
 helping decays away on its own. Treat a pin as a scarce, self-policing resource.
 `memory_stats.pins_active / pins_created / pins_resonated` show whether pins are
 actually paying off.
